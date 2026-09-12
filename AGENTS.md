@@ -336,7 +336,8 @@ only — say so rather than implying otherwise.
   behind them.
 - Test artifacts (`*.bin`, `hddscan-*.txt`, `*.md5`, state files) must be
   cleaned up; the repo tracks only `hddscan.c`, `Makefile`, `hddscan.8`,
-  `LICENSE`, `README.md`, `DESIGN.md`, `tests/` and this file.
+  `LICENSE`, `README.md`, `DESIGN.md`, `tests/`, `docs/` (the README's
+  screenshots) and this file.
 - `hddscan.8` and `usage()` document the same options and must not drift.
   `make mancheck` diffs the two option lists and prints nothing when they
   agree; run it after adding or renaming any flag.

@@ -873,6 +873,20 @@ def main():
         s.send(b"q", 0.4)
         s.close()
 
+        # REGRESSION: the grid sized a cell as 27 columns when it is 29, so
+        # a 112-column terminal got four to a line and the last bar was cut
+        # off at the edge.  A complete cell has its percentage and the
+        # closing bracket of its bar on the same line.
+        s = Session(["--attach", "20200202-030405", "--no-color"],
+                    rows=24, cols=112)
+        s.wait(lambda: s.on_screen("to a line"), 5.0)
+        grid = [l for l in s.screen.lines() if "sdz" in l]
+        cut = [l for l in grid if l.count("%") != l.count("]")]
+        check("no grid cell is cut off at the edge of a 112-column terminal",
+              grid and not cut, "\n".join(cut or grid or s.screen.lines()))
+        s.send(b"q", 0.4)
+        s.close()
+
         print("== --no-tui is honoured on a terminal ==")
 
         s = Session(["--no-tui"])

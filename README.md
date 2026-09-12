@@ -26,6 +26,8 @@ Run it on a terminal with no arguments and it opens a picker: choose drives,
 choose what you are doing, watch a live dashboard. When the scan finishes a
 summary holds the verdicts on screen — `n` starts another test, `q` quits. If
 something is already running on the machine, it shows you that first.
+
+![The hddscan dashboard following a 24-drive write test](docs/tui-dashboard.svg)
 `--check-deps` says which
 optional tools are missing and prints the `dnf`/`apt` line that installs them.
 
@@ -65,16 +67,15 @@ twenty-four more being scanned are two runs, and the dashboard swaps between
 them with one keystroke. Start hddscan again on a machine with work in progress
 and it shows you that work before it offers to configure any more.
 
-```
-  RUN               KIND    WHAT                   DRIVES PROGRESS  STATE        ELAPSED
-  20260912-110000   scan    write (predeploy)          24    46.5%  running      2h 10m
-  20260912-100000   format  format 4096B PI type 2     30    47.0%  running      3h 41m
-```
+![hddscan --status listing a scan and a format, then one run's drives](docs/cli-status.svg)
 
 Records live in `/var/lib/hddscan` as root, `~/.local/state/hddscan` otherwise,
 and are plain key-and-value text — `--status-json` if a script wants them, grep
 if you are in a hurry. A drive already in a live run is refused by any other
 run, since two of them on one spindle would time each other's seeks.
+
+The screenshots are from a demo store — a 24-drive write test and a 30-drive
+low level format running side by side — not from a real shelf.
 
 ## Testing
 

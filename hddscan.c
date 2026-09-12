@@ -7029,7 +7029,13 @@ static void tui_dashboard(const run_t *r, const jrec_t *j, int n, int nruns)
 	 * is "how is the batch going".
 	 */
 	if (n > listrows) {
-		int cw = 27, percol = cols / cw, k;
+		/*
+		 * A cell is " name(8) pct(6) " plus a 12-wide bar: 29
+		 * columns, and the line starts with one more.  Sizing it as
+		 * 27 put a fourth cell on a 112-column line and cut its bar
+		 * off at the edge.
+		 */
+		int cw = 29, percol = (cols - 1) / cw, k;
 
 		if (percol < 1)
 			percol = 1;
