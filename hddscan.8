@@ -1,0 +1,715 @@
+.\" Manual page for hddscan.
+.\" Keep in sync with usage() in hddscan.c; the two are checked against each
+.\" other by the test in AGENTS.md.
+.TH HDDSCAN 8 "2026-08-24" "hddscan 1.0" "System Administration Utilities"
+.SH NAME
+hddscan \- per-sector latency and error scanner for rotating disks
+.SH SYNOPSIS
+.B hddscan
+.RI [ options ]
+.RI [ device ...]
+.br
+.B hddscan --list
+.br
+.B hddscan --check-deps
+.br
+.B hddscan --status
+.RI [ run ]
+.SH DESCRIPTION
+.B hddscan
+finds sectors on a rotating disk that return data too slowly or not at all.
+It is aimed at the failure that SMART misses entirely: a drive that still
+reads every sector successfully, but takes tens of milliseconds of internal
+recovery to do it. Those sectors are the ones about to become unreadable.
+.PP
+Run on a terminal with no device named, hddscan opens an interactive form to
+pick drives and settings, then shows a live dashboard while it runs. When
+every drive finishes, a summary holds the verdicts on screen until a key is
+pressed:
+.B n
+returns to the form to start another test,
+.B q
+quits and leaves the last run's full reports in the terminal.
+.PP
+The work itself does not belong to that terminal. Each scan or format is a run
+owned by a supervisor process of its own, so quitting, closing the window or
+losing the connection leaves it going; starting hddscan again shows what is in
+progress before it offers to configure anything, and
+.B \-\-status
+answers the same question in a script. Naming a
+device, or
+.BR --all ,
+or
+.BR --list ,
+is an explicit instruction and is carried out as given, so nothing in a script
+changes.
+.BR --no-tui
+suppresses the form entirely.
+.PP
+Devices may be given as
+.IR /dev/sdb ,
+as
+.IR sdb ,
+or as a regular file to use as a disk image. Image files exercise every code
+path except the ones that need real hardware, which is how most of the tool is
+tested.
+.SS The guarantee
+A chunk is never faster than its slowest sector. hddscan reads in bulk chunks
+and times each one; a chunk that meets its latency budget therefore proves
+every sector inside it did too, and needs no further attention. A chunk that
+misses is re-read one block at a time until the responsible sectors are
+identified, and each of those is retried to separate a sector that was merely
+slow once from one that is consistently sick.
+.PP
+Two things would break that guarantee, and both are handled. The drive's own
+read look-ahead can serve a marginal sector out of DRAM at full speed, so it is
+switched off for the duration of the scan and restored afterwards. And the
+kernel page cache would do the same, so all reads use
+.BR O_DIRECT .
+If look-ahead could not be turned off and the scan order is sequential, the
+report says so rather than presenting a result the tool cannot stand behind.
+.SS Thresholds
+Budgets are calibrated per drive, using the same access pattern the scan will
+use. Timing scattered reads and then scanning sequentially would produce a
+budget inflated by the cost of a seek \(em an order of magnitude on real
+hardware, and far too loose to catch a sector needing 30 ms of recovery.
+.PP
+The budget scales with
+.BR --chunk .
+It is a multiple of the measured median chunk, so a larger chunk is much faster
+but raises the bar a sector must clear before anything looks at it. On a
+7200 rpm drive, 128 KiB calibrates to roughly 44 ms and 4 MiB to roughly
+150 ms; a sector taking 100 ms is found by the first and hidden by the second.
+The scan states the resulting sensitivity before it starts.
+.BR --sector-slow-ms
+pins the sector budget independently, at the cost of drilling into more chunks.
+.SH OPTIONS
+.SS Selection
+.TP
+.BI \-\-profile " NAME"
+What you are about to do with the drive. A profile sets the mode and the
+passes that go with it; any explicit flag overrides what it set, whichever
+order the two appear in. The report names the profile that produced it.
+.RS
+.TP
+.B predeploy
+No data on it yet: write every sector and verify it reads back. The default,
+so a bare invocation stops and asks for
+.B \-\-confirm
+rather than doing anything.
+.TP
+.B inservice
+It holds data you want to keep. Never writes anything.
+.TP
+.B survey
+Quick triage of a shelf: samples the surface, read only.
+.TP
+.B decay
+Weeks after a predeploy run: has the pattern rotted?
+.TP
+.B repair
+predeploy, plus forcing a reallocation of anything unreadable.
+.RE
+.TP
+.BR \-i ", " \-\-tui
+Interactive terminal UI. Implied when nothing to scan was named and both stdin
+and stdout are a terminal. In the drive list,
+.B space
+toggles one drive,
+.B a
+selects every free HDD,
+.B g
+selects every free HDD on the same controller as the one under the cursor, and
+.B n
+clears the selection \(em picking a shelf of two hundred drives one at a time
+is not a workflow. Passing it explicitly opens the form even with
+devices named, which arrive pre-selected.
+.TP
+.B \-\-no\-tui
+Never open the UI, whatever the terminal looks like.
+.TP
+.B \-\-check\-deps
+List the optional tools hddscan can use, whether each is installed, and the
+.BR dnf (8)
+and
+.BR apt (8)
+line that installs what is missing. Then exit.
+.TP
+.B \-\-list
+Show detected drives, their health-relevant facts, and whether each is safe to
+test. Then exit.
+.TP
+.B \-\-all
+Scan every detected rotational, unmounted disk.
+.TP
+.B \-\-include\-ssd
+Allow non-rotational devices. Latency thresholds will be meaningless.
+.TP
+.B \-\-include\-remote
+Allow iSCSI, virtio, FibreChannel and Hyper-V disks. These report themselves as
+rotational, but a clean result from one measures a network and someone else's
+cache rather than a platter.
+.SS Parallelism
+Several drives are always scanned at once, one worker process per drive,
+because separate spindles are genuinely independent. Work is never parallelised
+inside a single drive: a second outstanding request makes the head seek away,
+and the result would be a measurement of the queue rather than of the platter.
+.TP
+.BI \-\-max\-parallel " N"
+Cap concurrent drives. Useful when the HBA, expander or power supply cannot
+feed every drive at full speed, which would otherwise show up as inflated
+latency.
+.TP
+.B \-\-sequential
+One drive at a time, full report straight to stdout.
+.SS Runs that outlive the terminal
+A scan or a low level format is a
+.IR run .
+It belongs to a supervisor process of its own rather than to the window that
+started it, and every drive in it keeps a small text record of where it has
+got to. Quit the program, close the terminal or lose the ssh session and the
+work carries on; come back to it with
+.B \-\-status
+or
+.BR \-\-attach .
+Thirty drives being formatted and twenty-four being scanned are two runs, and
+the dashboard swaps between them.
+.PP
+Records are written under
+.I /var/lib/hddscan
+when running as root and under
+.I ~/.local/state/hddscan
+otherwise. Finished runs are kept for a week, then pruned; a live one is never
+pruned. On the dashboard,
+.B q
+leaves the run going,
+.B d
+returns to the list of runs and
+.B x
+stops it after asking.
+.TP
+.B \-\-detach
+Start the run and return to the shell, printing the run id. Nothing is watched
+and nothing is waited for, so the exit status says only whether the run
+started.
+.TP
+.BI \-\-status " [RUN|DRIVE]"
+Print what every run on this machine is doing. With a run id, a prefix of one,
+or the name of a drive in one, print the drives in that run instead. Needs no
+privileges and nothing left running.
+.TP
+.BI \-\-status\-json " [RUN|DRIVE]"
+The same thing as JSON, for a script or a monitoring check.
+.TP
+.BI \-\-attach " [RUN|DRIVE]"
+Open the dashboard on a run that is already going. With no argument, show the
+list of runs and pick one.
+.TP
+.BI \-\-stop " RUN" |all
+Ask a run to stop. Every drive still writes the report for the part of it that
+was covered, and the report says how much that was. A low level format cannot
+be called back once the drive has begun it: stopping only stops watching, and
+the record says so.
+.TP
+.BI \-\-forget " RUN" |finished
+Drop the records of a finished run. Refuses a live one, and never touches the
+reports themselves.
+.TP
+.BI \-\-state\-dir " DIR"
+Keep run records here instead of in the default location. The environment
+variable
+.B HDDSCAN_STATE_DIR
+does the same thing.
+.SS Test mode
+.TP
+.BI \-\-mode " read"
+Read-only surface scan. The default, and safe.
+.TP
+.BI \-\-mode " verify"
+Non-destructive write test: save the sector, write a pattern, read it back,
+restore the original. Risks data loss on a power cut; see
+.BR \-\-journal .
+.TP
+.BI \-\-mode " write"
+Destructive. Overwrite everything with a pattern and verify it reads back
+correctly.
+.TP
+.BI \-\-mode " check"
+Read-only re-verify of a pattern an earlier
+.BI \-\-mode " write"
+run left behind. Run it days or weeks later to catch sectors that lost their
+charge.
+.TP
+.BI \-\-confirm " STRING"
+Required for verify, write and format. Must equal the device name (for example
+.IR sdb )
+or its serial number.
+.TP
+.B \-\-repair
+Give a drive its best chance at recovering, in one flag. Overwrites every
+sector, which is what refreshes a weakly written one; rewrites anything still
+slow after that; forces a reallocation on anything that will not read at all;
+then re-reads the whole device to prove the repair held. Equivalent to
+.BI \-\-mode " write"
+with
+.BR \-\-rewrite\-weak ,
+.B \-\-force\-remap
+and
+.BR \-\-second\-pass ,
+so it
+.B destroys all data
+and needs
+.BR \-\-confirm .
+It also turns the drive's read cache off, because a repair verified out of the
+drive's own DRAM is not a repair you verified.
+.TP
+.B \-\-second\-pass
+After
+.BI \-\-mode " write" ,
+re-read the whole device and re-verify the pattern, catching slow data decay.
+.TP
+.B \-\-rewrite\-weak
+Rewrite readable-but-slow sectors in place so the drive refreshes or remaps
+them. Needs verify or write mode, or read mode plus this flag for
+read-modify-write. Has no effect unless the drive's automatic reallocation is
+enabled; see
+.BR \-\-awre .
+.TP
+.B \-\-force\-remap
+Overwrite unreadable sectors with zeros to force a reallocation. Destroys the
+contents of those sectors.
+.SS Range and sizing
+.TP
+.BI \-\-start " SIZE"
+First byte to test. Default 0.
+.TP
+.BI \-\-end " SIZE"
+Last byte to test. Default is the end of the device.
+.TP
+.BI \-\-chunk " SIZE"
+Bulk read size, default 128K. The single biggest lever on how long a scan
+takes, and on what it can see; see
+.B Thresholds
+above.
+.TP
+.BI \-\-block " SIZE"
+Drill-down granularity, default 4K.
+.TP
+.BI \-\-sample " N"
+Test only every Nth chunk, for a fast surface survey. The report states the
+resulting coverage.
+.TP
+.BI \-\-order " ORDER"
+.IR sequential " (default), " reverse " or " random .
+Sequential reads at full streaming speed, but the drive is prefetching ahead,
+so a marginal sector can be served from its buffer and look healthy. Random
+defeats that entirely and is far slower; combine it with
+.B \-\-sample
+for a thorough spot check.
+.TP
+.BI \-\-max\-time " SECONDS"
+Stop after this long and report what was covered.
+.TP
+.BI \-\-max\-errors " N"
+Stop after N hard I/O errors. Default: never.
+.SS Latency budget
+.TP
+.BI \-\-chunk\-slow\-ms " MS"
+Chunk budget. Over this, hddscan drills into individual sectors.
+.TP
+.BI \-\-sector\-slow\-ms " MS"
+Sector budget. Over this, the sector is retried. The chunk budget is clamped to
+never exceed this, since a looser chunk budget would let slow sectors hide
+inside chunks that are never examined.
+.TP
+.BI \-\-auto\-factor " F"
+Automatic budget is F times the measured median. Default 5.
+.TP
+.BI \-\-floor\-ms " MS"
+The automatic budget never goes below this. Default 25, plus an allowance for
+the transfer time of a chunk larger than the default.
+.TP
+.BI \-\-retries " N"
+Re-reads of a suspicious sector, default 20. A merely weak sector often reads
+back fine after a few tries; that is the drive recovering, and it is worth
+knowing about.
+.TP
+.BI \-\-retry\-max\-seconds " S"
+Give up retrying one sector after this long. Default 60, 0 for no limit.
+Without it, a drive whose every read hits the SCSI timeout would take minutes
+per sector and never finish.
+.SS Safety and environment
+.TP
+.B \-\-force
+Test even if the drive looks mounted or otherwise in use.
+.TP
+.BI \-\-drive\-lookahead " off|keep"
+.I off
+(the default) tells the drive to stop prefetching into its own DRAM for the
+duration of the scan, so a sequential pass cannot be handed a marginal sector
+at cache speed. Restored on exit, on
+.BR SIGINT ,
+and on error. Needs
+.BR hdparm (8)
+on ATA/SATA and
+.BR sdparm (8)
+on SAS/SCSI; without the right one the scan says so and runs anyway.
+.TP
+.BI \-\-io\-timeout " SEC"
+Lower the kernel's per-command timeout during the scan so a dying sector fails
+fast. Restored afterwards.
+.TP
+.BI \-\-max\-temp " C"
+Abort if the drive gets this hot. Default 58, 0 to disable.
+.TP
+.B \-\-no\-smart
+Do not call
+.BR smartctl (8).
+.TP
+.B \-\-no\-direct
+Do not use
+.BR O_DIRECT .
+Results will include page cache hits and cannot be trusted.
+.TP
+.B \-\-dry\-run
+Show what would be done and touch nothing.
+.SS Low level format
+.TP
+.B \-\-format
+Issue a SCSI FORMAT UNIT to every selected drive, in parallel, with each
+drive's progress tagged by name. This
+.B erases the drive,
+runs for hours, and cannot be undone; losing power partway through can leave a
+drive needing vendor tooling to revive. Requires
+.B \-\-confirm
+and
+.BR sg_format (8),
+refuses any drive that is mounted or claimed, and prints the exact sg_format
+command for every drive before anything starts.
+.B \-\-dry\-run
+prints those commands and stops.
+.TP
+.BI \-\-format\-blocksize " 512|4096|keep"
+Logical block size to format to. Default
+.IR keep .
+.TP
+.B \-\-format\-fast
+Ask for a fast format: the drive does not visit every block, which can turn
+hours into minutes. Only meaningful when the physical sector layout is not
+changing \(em a 512e drive already has 4096-byte physical sectors, so moving
+the logical size to 4096 is a remapping rather than a re-lay-out. Blocks that
+have never been written read without error afterwards. A drive may refuse it,
+which costs nothing: the format simply does not start.
+.TP
+.BI \-\-format\-pi " none|keep|0..3"
+Protection information to format with.
+.I keep
+preserves what the drive already reports and is the default, because sg_format
+itself defaults to stripping it: a bare block size change would otherwise
+remove protection information as a side effect nobody asked for.
+.SS Drive settings
+Settings are applied to every selected drive before anything else happens, not
+when a scan worker eventually reaches its drive. Unless
+.B \-\-persist
+is given they are restored on exit, on
+.BR SIGINT ,
+and on error.
+.TP
+.B \-\-apply\-settings
+Apply the settings below to every selected drive and stop, without scanning.
+.TP
+.B \-\-fix\-config
+Apply the configuration hddscan recommends for a drive going into service:
+automatic reallocation on for both reads and writes, read cache on. Only the
+parts actually wrong are touched, each is printed, and they are saved to the
+drive \(em a fix that reverted when the scan ended would not be a fix.
+.TP
+.BI \-\-awre " on|off|keep"
+Let the drive retire a sector it struggles to write.
+.TP
+.BI \-\-arre " on|off|keep"
+The same on read. With both off the firmware never reallocates, so
+.B \-\-rewrite\-weak
+and
+.B \-\-force\-remap
+rewrite a bad sector straight back onto itself. Filesystem-level self-healing
+does not substitute for this: ZFS repairs data from a redundant copy, but the
+repair is written to the same LBA, and whether that sector is retired to a
+spare is AWRE's decision alone.
+.TP
+.BI \-\-read\-cache " on|off|keep"
+.I off
+stops the drive serving any read from its own DRAM, which is stricter than
+.BI \-\-drive\-lookahead " off" .
+Left off on a drive in service it makes reads crawl; that is the classic
+ex-array fault where a drive writes at full speed and reads like treacle.
+.TP
+.BI \-\-write\-cache " on|off|keep"
+With the cache on, a write returns as soon as the drive has the data in DRAM,
+so a write mode times the cache rather than the platter.
+.I off
+makes it honest and much slower. Default
+.I keep
+touches nothing.
+.TP
+.BI \-\-drive\-read\-retries " N"
+Bound how many times the drive re-reads a sector internally before reporting
+it (the SCSI read retry count, 0 to 255). This is the count-based twin of
+.BR \-\-recovery\-time ,
+which bounds the same thing by time; firmware differs in which of the two it
+actually honours, so setting both is the reliable way to make a drive fail
+fast. Not to be confused with
+.BR \-\-retries ,
+which is how many times
+.I this tool
+re-reads a sector.
+.TP
+.BI \-\-drive\-write\-retries " N"
+The same for writes.
+.TP
+.BI \-\-recovery\-time " MS"
+Bound how long the drive fights one bad sector before reporting it (the SCSI
+recovery time limit; the equivalent of ATA's SCT ERC or TLER). 0 means
+unlimited, which is what makes a dying disk stall for minutes and a ZFS or RAID
+member get faulted for being slow rather than broken. SAS only.
+.TP
+.BI \-\-bms " on|keep"
+.I on
+tells every selected SAS/SCSI drive to run its own background medium scan: the
+firmware sweeps the platters whenever the drive is idle, logs what it finds,
+and reallocates the sectors it can still recover. Unlike every other setting
+here this one is
+.B saved on the drive
+and is not undone afterwards;
+.B sdparm \-\-clear=EN_BMS \-\-save /dev/sdX
+turns it back off.
+.TP
+.B \-\-persist
+Save the settings this run changes to the drive so they survive a power cycle,
+instead of putting them back when the scan ends. Needs a SAS/SCSI drive and
+.BR sdparm (8);
+anything else is applied for the run only and says so. Only settings named
+explicitly are saved \(em the look-ahead default is not, or every scanned drive
+would be left permanently slower at sequential reads.
+.SS Output
+.TP
+.BI \-\-json " FILE"
+Write a machine readable report.
+.TP
+.BI \-\-badblocks\-list " FILE"
+Write bad sectors in
+.BR badblocks (8)
+format, ready for
+.B mke2fs \-l
+so a new filesystem steps around them. Includes bad, corrupt and unstable
+sectors.
+.TP
+.BI \-\-badblocks\-blocksize " N"
+Unit for that list. Default 1024.
+.TP
+.BI \-\-badblocks\-offset " N"
+Subtract a partition's start offset from the block numbers, since
+.BR mke2fs (8)
+runs on the partition rather than the whole disk.
+.TP
+.BI \-\-prometheus " FILE"
+Write metrics for node_exporter's textfile collector.
+.TP
+.BI \-\-journal " FILE"
+Crash journal for
+.BI \-\-mode " verify" .
+The original bytes are fsynced here before the pattern is written, so a power
+cut mid-chunk can be undone by the next run.
+.TP
+.BI \-\-csv " FILE"
+Write every suspect sector as CSV.
+.TP
+.BI \-\-log " FILE"
+Tee the report to a file.
+.TP
+.BI \-\-state " FILE"
+Checkpoint progress here every 15 seconds. With several drives the device name
+is appended, so each gets a file of its own; one file shared by a whole
+parallel run would have every worker overwriting the others. Without this
+option each drive still checkpoints inside its run's directory, which is where
+.B \-\-status
+says the records are.
+.TP
+.B \-\-resume
+Continue from the checkpoint in
+.BR \-\-state .
+Worth having on any multi-day run.
+.TP
+.BI \-\-outdir " DIR"
+Where per-device reports go when several drives are scanned at once.
+.TP
+.BI \-\-map\-width " N"
+Width of the surface map. Default 64.
+.TP
+.B \-\-quiet
+No progress output.
+.TP
+.B \-\-no\-color
+Plain text.
+.TP
+.BR \-h ", " \-\-help
+Print the option summary.
+.TP
+.B \-\-version
+Print the version and exit.
+.SH EXIT STATUS
+.TP
+.B 0
+Healthy. Every sector returned data within the latency budget.
+.TP
+.B 1
+Suspect. Sectors needed retries, or SMART counters moved during the scan.
+.TP
+.B 2
+Failing, or a usage error.
+.TP
+.B 130
+Interrupted.
+.PP
+The exit status reflects the drive, not the coverage. A HEALTHY verdict over
+3% of a drive is not a healthy drive; read the
+.B Coverage
+line of the report.
+.SH PROTECTION INFORMATION
+SAS drives are often formatted with T10 protection information: eight extra
+bytes beside every logical block holding a CRC guard and tags. The kernel then
+reads with RDPROTECT set, so the drive checks that guard on every read.
+.PP
+A block that has never been written since the format has no valid guard. Reading
+it fails immediately with
+.BR EILSEQ ,
+even though the platter under it is perfect. On a freshly formatted drive that
+is most of the device, and a read-only scan will stop at the exact offset the
+last write reached.
+.PP
+hddscan reads the protection type from sysfs, shows it in
+.B \-\-list
+and in the report, counts such refusals separately from bad sectors, and states
+in the verdict that those blocks were never tested. A destructive
+.BI \-\-mode " write"
+pass repairs them: writing a block is what generates its guard tag, so the same
+run that tests the surface also makes it readable.
+.BI \-\-mode " verify"
+cannot do this, because it must read the original bytes before it may write.
+.SH EXAMPLES
+Scan every free rotational disk, read-only:
+.PP
+.RS
+.EX
+hddscan \-\-all
+.EE
+.RE
+.PP
+A quick surface survey of one drive, defeating the drive's prefetch:
+.PP
+.RS
+.EX
+hddscan \-\-sample 64 \-\-order random /dev/sdb
+.EE
+.RE
+.PP
+Full destructive surface test with a checkpoint, on a drive that is not
+carrying data:
+.PP
+.RS
+.EX
+hddscan \-\-mode write \-\-confirm sdb \-\-chunk 4M \e
+        \-\-state /var/tmp/sdb.state \-\-resume /dev/sdb
+.EE
+.RE
+.PP
+Prepare a shelf of ex-array drives without scanning them:
+.PP
+.RS
+.EX
+hddscan \-\-apply\-settings \-\-fix\-config \-\-recovery\-time 7000 \e
+        \-\-bms on /dev/sdb /dev/sdc
+.EE
+.RE
+.PP
+Feed the bad sectors of a partition to a new filesystem:
+.PP
+.RS
+.EX
+hddscan \-\-badblocks\-list bb.txt \-\-badblocks\-offset 1M /dev/sdb
+mke2fs \-l bb.txt /dev/sdb1
+.EE
+.RE
+.SH FILES
+.TP
+.IR ./hddscan- <device>.txt
+Per-device report when several drives are scanned at once. See
+.BR \-\-outdir .
+.TP
+.IR ./hddscan-format- <device>.txt
+Everything sg_format said while formatting that drive.
+.TP
+.I /var/lib/hddscan/runs/<run>/
+One directory per run, holding the run's own record, one
+.I <device>.job
+record per drive, that drive's checkpoint, and
+.I log
+for anything the run had to say on the way past. Under
+.I ~/.local/state/hddscan
+when not running as root, or wherever
+.B \-\-state\-dir
+says. The records are plain key-and-value text, rewritten through a temporary
+file and renamed, so reading one with grep while a scan is running is safe.
+.SH DEPENDENCIES
+hddscan links nothing beyond libc, so the binary works on a rescue system with
+no packages installed. The following are shelled out to when present and done
+without when absent;
+.B \-\-check\-deps
+reports which are missing and how to install them.
+.TP
+.BR smartctl (8)
+SMART health, temperature, and the drive's own error counters.
+.TP
+.BR sdparm (8)
+Every drive setting on SAS/SCSI: look-ahead, caches, reallocation, recovery
+time, background scan.
+.TP
+sg3_utils
+SCSI mode pages, sector reassignment, and reformatting.
+.TP
+.BR hdparm (8)
+Look-ahead and write cache on ATA/SATA drives.
+.SH CAVEATS
+Latency is only meaningful on an otherwise idle drive. Any other I/O to the
+same spindle shows up as slow sectors. The
+.B O_EXCL
+open prevents mounting but not a competing raw reader.
+.PP
+Several code paths have not been exercised on real hardware and are documented
+as such in DESIGN.md rather than glossed over. Do not read a clean result from
+an untested path as evidence that the path works.
+.SH AUTHOR
+Olav Gjerde <olav@intellistream.ai>
+.SH COPYRIGHT
+Copyright \(co 2026 Olav Gjerde.
+.PP
+Distributed under the MIT licence. The full text ships as
+.I LICENSE
+with the source. There is
+.B no warranty,
+to the extent permitted by law \(em which is worth reading literally here
+rather than as boilerplate:
+.B \-\-mode write
+and
+.B \-\-format
+erase a drive outright, and
+.B \-\-mode verify
+rewrites every sector it reads.
+.SH SEE ALSO
+.BR badblocks (8),
+.BR hdparm (8),
+.BR mke2fs (8),
+.BR sdparm (8),
+.BR sg_format (8),
+.BR sg_logs (8),
+.BR smartctl (8)

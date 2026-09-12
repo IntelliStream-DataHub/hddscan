@@ -1,0 +1,24 @@
+Captured from an HGST HUH721010AL4200 (smartctl 7.5) that reports SMART health
+OK while having failed its own long self-test.  Kept as a fixture because the
+report's SAS section is built entirely from these two blocks, and a change to
+smartmontools' layout would silently empty it again.
+
+=== START OF READ SMART DATA SECTION ===
+SMART Health Status: OK
+
+Elements in grown defect list: 1
+
+Error counter log:
+           Errors Corrected by           Total   Correction     Gigabytes    Total
+               ECC          rereads/    errors   algorithm      processed    uncorrected
+           fast | delayed   rewrites  corrected  invocations   [10^9 bytes]  errors
+read:          0 42899520         0  42899520   481501625     535295.725           0
+write:         0        0         0         0     103400     233851.148           0
+verify:        0        0         0         0   140789756          0.000           0
+
+Non-medium error count:     8751
+
+SMART Self-test log
+Num  Test              Status                 segment  LifeTime  LBA_first_err [SK ASC ASQ]
+     Description                              number   (hours)
+# 1  Background long   Failed in segment -->       3   24188                 - [0x1 0x5d 0xfd]
