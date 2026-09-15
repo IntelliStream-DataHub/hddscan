@@ -71,6 +71,9 @@
 #define DEF_BLOCK (4u * 1024u)
 #define RATE_REF_CHUNK (4u * 1024u * 1024u) /* the chunk --min-rate is quoted at */
 #define RATE_SETTLE_S 120   /* scan time before the throughput floor judges */
+#define RATE_WINDOW_S 600   /* the trailing window a slow stretch is judged over */
+#define RATE_STEP_S 10      /* how often that window moves */
+#define RATE_STEPS (RATE_WINDOW_S / RATE_STEP_S + 1)
 #define MAX_RETRIES 1000
 #define N_BANDS 512
 #define MAX_FINDINGS 200000
@@ -2683,6 +2686,14 @@ typedef struct {
 	double rate_seen;       /* what the scan managed, once it has settled */
 	int too_slow;
 	int too_slow_warned;
+	/* the same floor over a trailing window: see rate_window() */
+	struct {
+		uint64_t t_us, bytes;
+	} rw[RATE_STEPS];
+	int rw_head, rw_n;
+	uint64_t slow_secs;     /* scan time the trailing window spent under it */
+	double slow_worst;      /* bytes/s at its worst */
+	uint64_t slow_worst_pos;
 
 	/*
 	 * A rolling window of recent chunk latencies.  The cumulative figures
@@ -4011,6 +4022,45 @@ static void rate_judge(ctx_t *c, uint64_t now)
 	}
 }
 
+/*
+ * The whole-scan rate can hide a stretch that crawled: ten hours at full speed
+ * average away an hour at a few hundred KiB a second, which is a region of
+ * the surface -- or a period of the drive's life -- going badly wrong.  So
+ * the floor is also held against a trailing ten-minute window.  Long enough
+ * that a drive's own housekeeping (a background media scan after idle, a
+ * cache flush) does not register; short enough that an hour-long collapse
+ * cannot hide.  Only SUSPECT: the drive did get through it.
+ */
+static void rate_window(ctx_t *c)
+{
+	uint64_t now = now_us();
+	int oldest;
+	double rate;
+
+	if (c->rate_floor <= 0)
+		return;
+	if (c->rw_n && now - c->rw[(c->rw_head + RATE_STEPS - 1) % RATE_STEPS].t_us <
+		       (uint64_t)RATE_STEP_S * 1000000ull)
+		return;
+	c->rw[c->rw_head].t_us = now;
+	c->rw[c->rw_head].bytes = c->bytes_done;
+	c->rw_head = (c->rw_head + 1) % RATE_STEPS;
+	if (c->rw_n < RATE_STEPS) {
+		c->rw_n++;
+		return;
+	}
+	oldest = c->rw_head;    /* a full ring: the next slot is the oldest */
+	rate = (double)(c->bytes_done - c->rw[oldest].bytes) /
+	       ((double)(now - c->rw[oldest].t_us) / 1e6);
+	if (rate >= c->rate_floor)
+		return;
+	c->slow_secs += RATE_STEP_S;
+	if (!c->slow_worst || rate < c->slow_worst) {
+		c->slow_worst = rate;
+		c->slow_worst_pos = c->pos;
+	}
+}
+
 static void progress(ctx_t *c, int final)
 {
 	static uint64_t last;
@@ -4160,6 +4210,9 @@ static void state_save(ctx_t *c)
 		c->blocks_unstable, c->blocks_fixed, c->hard_errors, c->retry_ios);
 	fprintf(f, "writes %" PRIu64 " %" PRIu64 "\n", c->writes_done,
 		c->writes_slow);
+	if (c->slow_secs)
+		fprintf(f, "slowstretch %" PRIu64 " %.0f %" PRIu64 "\n",
+			c->slow_secs, c->slow_worst, c->slow_worst_pos);
 	/* the surface map, so a resumed scan still draws what came before */
 	for (i = 0; i < N_BANDS; i++) {
 		const band_t *b = &c->bands[i];
@@ -4232,6 +4285,9 @@ static int state_load(ctx_t *c)
 				   &b.slow_blocks, &b.sum_us, &b.max_us,
 				   &b.bytes) == 8 && bi >= 0 && bi < N_BANDS)
 				c->bands[bi] = b;
+		} else if (!strncmp(line, "slowstretch ", 12)) {
+			sscanf(line + 12, "%" SCNu64 " %lf %" SCNu64, &c->slow_secs,
+			       &c->slow_worst, &c->slow_worst_pos);
 		} else if (!strncmp(line, "writes ", 7)) {
 			sscanf(line + 7, "%" SCNu64 " %" SCNu64,
 			       &c->writes_done, &c->writes_slow);
@@ -4981,6 +5037,7 @@ static void scan_loop(ctx_t *c, int verify_only_pass)
 
 		check_temperature(c);
 		kmsg_poll(c, 0);
+		rate_window(c);
 		progress(c, 0);
 		if (c->state_path && now_us() - last_state > 15000000ull) {
 			state_save(c);
@@ -5398,6 +5455,18 @@ static int verdict_of(ctx_t *c, const char **why)
 			return 1;
 		}
 	}
+	if (!c->too_slow && c->slow_secs && c->rate_floor > 0) {
+		char b1[32], b2[32], b3[32];
+
+		snprintf(buf, sizeof(buf), "for %s of the scan the last ten minutes "
+			 "tested under the %s/s floor, worst %s/s near %s",
+			 human_time((double)c->slow_secs, b1, sizeof(b1)),
+			 human_size((uint64_t)c->rate_floor, b2, sizeof(b2)),
+			 human_size((uint64_t)c->slow_worst, b3, sizeof(b3)),
+			 human_size(c->slow_worst_pos, (char[32]){0}, 32));
+		*why = buf;
+		return 1;
+	}
 	if (over_too_often(c->writes_slow, c->writes_done)) {
 		snprintf(buf, sizeof(buf), "%" PRIu64 " of %" PRIu64 " chunk writes "
 			 "took longer than the latency budget, more than one in "
@@ -5622,6 +5691,12 @@ static void report(ctx_t *c)
 		    c->k_resets || c->k_timeouts || c->k_offline ? c_red() :
 		    c->k_medium ? c_yel() : "", c->k_resets, c->k_timeouts,
 		    c->k_medium, c->k_offline ? ", taken offline" : "", c_off());
+	if (!c->too_slow && c->slow_secs && c->rate_floor > 0)
+		out("  %sSlow stretch%s     %s under the floor over ten-minute windows, "
+		    "worst %s/s near %s\n", c_yel(), c_off(),
+		    human_time((double)c->slow_secs, b1, sizeof(b1)),
+		    human_size((uint64_t)c->slow_worst, b2, sizeof(b2)),
+		    human_size(c->slow_worst_pos, (char[32]){0}, 32));
 	if (c->too_slow)
 		out("  %sToo slow%s         %s/s against a floor of %s/s at %zu KiB "
 		    "chunks (--min-rate)\n", c_red(), c_off(),
@@ -6027,6 +6102,7 @@ static void write_json(ctx_t *c, const char *path)
 	fprintf(f, "  \"rate_bytes_per_s\": %.0f,\n", c->rate_seen);
 	fprintf(f, "  \"rate_floor_bytes_per_s\": %.0f,\n", c->rate_floor);
 	fprintf(f, "  \"too_slow\": %s,\n", c->too_slow ? "true" : "false");
+	fprintf(f, "  \"slow_stretch_s\": %" PRIu64 ",\n", c->slow_secs);
 	if (c->kmsg_state != KMSG_OFF)
 		fprintf(f, "  \"kernel_log\": {\"read\": %s, \"resets\": %" PRIu64
 			", \"timeouts\": %" PRIu64 ", \"medium_errors\": %" PRIu64

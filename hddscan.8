@@ -331,7 +331,8 @@ the transfer time of a chunk larger than the default.
 .TP
 .BI \-\-min\-rate " MIB"
 A hard drive that tests slower than this many MiB/s at 4 MiB chunks is
-FAILING, however clean its sectors. Smaller chunks get a proportionally lower
+FAILING, however clean its sectors, and one that spends a trailing ten-minute
+window under it is SUSPECT. Smaller chunks get a proportionally lower
 floor, verify mode three quarters of it. Judged over the whole scan once it has
 run for two minutes; a drive under it shows
 .B too slow
@@ -576,7 +577,10 @@ Healthy. Every sector returned data within the latency budget.
 Suspect. Sectors needed retries, reallocations, command timeouts or SAS delayed
 corrections grew during the scan, the drive has needed spin-up retries, the
 kernel logged a timeout or reset against the drive, a band of
-the surface read at more than twice what calibration expected there, or more
+the surface read at more than twice what calibration expected there, the drive
+spent ten minutes under
+.BR \-\-min\-rate ,
+or more
 than one chunk read or write in a thousand went over the latency budget.
 .TP
 .B 2

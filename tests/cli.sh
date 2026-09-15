@@ -670,6 +670,24 @@ assert_eq "a drive under the floor exits 2" "$rc" "2"
 assert_has "the JSON says too_slow" "$(cat "$TMP/rate.json")" '"too_slow": true'
 rm -f "$TMP/rate.big"
 
+# A stretch that crawled is judged over a trailing ten-minute window, which no
+# test can wait for, so it arrives the way a resumed scan would carry it: in
+# the checkpoint.
+f=$(image 32 stretch.bin)
+printf 'hddscan-state 1\npos %s\nstep 255\nbytes 13090422784\n' \
+	$((255 * 131072)) > "$TMP/stretch.ckpt"
+printf 'counters 100000 0 0 0 0 0 0 0 0 0 0\nslowstretch 840 200000 3000000000\n' \
+	>> "$TMP/stretch.ckpt"
+out=$(run --state "$TMP/stretch.ckpt" --resume --json "$TMP/stretch.json" "$f")
+assert_has "a stretch under the floor is SUSPECT when the whole scan is not" \
+	"$out" "VERDICT: SUSPECT - for 14m 00s of the scan"
+assert_has "the report says how long and where it was slow" "$out" "Slow stretch"
+assert_has "the JSON carries the slow stretch" "$(cat "$TMP/stretch.json")" \
+	'"slow_stretch_s": 840'
+assert_has "--min-rate 0 turns the slow stretch off too" \
+	"$(run --min-rate 0 --state "$TMP/stretch.ckpt" --resume "$f")" \
+	"VERDICT: HEALTHY"
+
 echo "== the SAS logs the report is built from =="
 
 # REGRESSION: smart_read() ran "smartctl -H -A -i", and on SAS the error

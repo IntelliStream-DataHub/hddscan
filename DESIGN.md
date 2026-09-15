@@ -795,6 +795,17 @@ thirty-second of it. Verify mode writes the original back as well, so it gets
 three quarters. The rate is the whole scan's, judged only once it has run for
 two minutes, and the dashboard says `too slow` from that point on.
 
+The whole-scan average can hide a stretch that crawled — ten hours at full
+speed average away an hour at a few hundred KiB a second — so the same floor is
+held against a trailing ten-minute window too. Ten minutes is long enough that
+a drive's own housekeeping (a background media scan after idle, a cache flush)
+does not register. A drive that clears the floor overall but spent time under
+it this way is SUSPECT, and the report says for how long and where:
+
+```
+  Slow stretch     14m 00s under the floor over ten-minute windows, worst 195.31 KiB/s near 2.79 GiB
+```
+
 What is judged is deliberately narrow. Only a rotational drive on a local bus: a
 slow iSCSI link or an SD card is not a failing platter. A USB drive is SUSPECT
 instead of FAILING, because a USB 2 bridge alone can hold a write-and-verify
