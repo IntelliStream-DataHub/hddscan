@@ -573,7 +573,8 @@ Print the version and exit.
 Healthy. Every sector returned data within the latency budget.
 .TP
 .B 1
-Suspect. Sectors needed retries, or SMART counters moved during the scan.
+Suspect. Sectors needed retries, SMART counters moved during the scan, or more
+than one chunk read or write in a thousand went over the latency budget.
 .TP
 .B 2
 Failing, or a usage error. A drive that tested under

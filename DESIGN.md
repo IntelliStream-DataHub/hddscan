@@ -170,6 +170,15 @@ between median and average is what the outliers are doing. The window states
 the span it actually covers, so a scan two seconds old says `last 2s` rather
 than claiming thirty.
 
+A write test times its writes in a window of their own, shown as `WMED` on the
+dashboard and `write med` on the progress line. The read columns cannot show a
+drive whose writes crawl: it reads back at full speed, and the only symptom
+used to be a rate that made no sense beside the latency next to it. A write
+lands on the same track as the read before it and waits for the same
+revolution, so it costs what a read there does — 8.79 ms against 8.44 ms on a
+healthy SAS drive, write cache on — and a write over the read budget at that
+position is counted as over budget.
+
 Exit status is `0` healthy, `1` suspect, `2` failing, `130` interrupted, so it
 drops straight into a cron job or a CI gate. Every run prints an estimated
 runtime after calibration, before committing to what may be a multi-day scan.
@@ -790,6 +799,16 @@ What is judged is deliberately narrow. Only a rotational drive on a local bus: a
 slow iSCSI link or an SD card is not a failing platter. A USB drive is SUSPECT
 instead of FAILING, because a USB 2 bridge alone can hold a write-and-verify
 pass near the floor.
+
+Going over budget is not by itself a verdict. A chunk whose sectors all read
+cleanly when drilled into was the drive having a moment — a neighbour's
+vibration, a thermal recalibration, its own background media scan — and every
+drive has those. More than one chunk read in a thousand, or one write in a
+thousand, is a habit, and makes the drive SUSPECT; fewer leave it HEALTHY, and
+the verdict says how many there were rather than dropping them. At least three
+are needed either way, so a short range is not judged on one. A sector that
+*stays* slow, needs retries or cannot be read is judged as before, however
+rare.
 
 Coverage is stated explicitly in every report — "every sector of the device was
 read" versus "SAMPLED" or "PARTIAL" — so a clean verdict is never mistaken for

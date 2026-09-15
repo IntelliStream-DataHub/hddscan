@@ -309,6 +309,41 @@ else
 	skip "checkpoint and resume" "scan finished before the first checkpoint"
 fi
 
+echo "== over budget now and then is not a verdict =="
+
+# A chunk over budget whose sectors all drill clean is the drive having a
+# moment, and every drive has those.  One in a thousand is the line.  The
+# counts that decide it are loaded from a checkpoint written by hand, resumed
+# at the last chunk, so the test does not depend on how fast this machine is.
+f=$(image 32 over.bin)
+ckpt() {
+	printf 'hddscan-state 1\npos %s\nstep 255\nbytes 13090422784\n' \
+		$((255 * 131072)) > "$TMP/over.ckpt"
+	printf 'counters 100000 %s 0 0 0 0 0 0 0 0 0\nwrites %s\n' \
+		"$1" "$2" >> "$TMP/over.ckpt"
+	run --state "$TMP/over.ckpt" --resume "$f"
+}
+out=$(ckpt 5 "0 0")
+assert_has "a few chunks over budget in 100000 leave a drive HEALTHY" \
+	"$out" "VERDICT: HEALTHY"
+assert_has "a HEALTHY verdict still says what went over budget" \
+	"$out" "5 chunk reads went over it"
+assert_has "more than one chunk in a thousand over budget is SUSPECT" \
+	"$(ckpt 500 "0 0")" "500 of 100001 chunk reads were over the latency budget"
+assert_has "more than one write in a thousand over budget is SUSPECT" \
+	"$(ckpt 0 "100000 500")" "500 of 100000 chunk writes took longer"
+# REGRESSION: any single chunk over budget used to make a drive SUSPECT, which
+# lowering the budget to 3x the median would have turned into noise.  Every
+# chunk over budget is still a habit, not a moment.
+assert_has "every chunk over budget is SUSPECT even with clean sectors" \
+	"$(run --chunk-slow-ms 0.001 --sector-slow-ms 1000 --floor-ms 0 "$f")" \
+	"256 of 256 chunk reads"
+out=$(runp --profile predeploy --confirm "$f" --json "$TMP/w.json" "$f")
+assert_has "a write scan reports its writes over budget" "$out" \
+	"writes over budget"
+assert_has "the JSON counts writes over budget" "$(cat "$TMP/w.json")" \
+	'"writes_over_budget": 0'
+
 echo "== runs outlive the process that started them =="
 
 # A run is a directory of small text records, and everything that reports on

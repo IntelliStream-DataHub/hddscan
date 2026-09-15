@@ -400,6 +400,7 @@ typedef struct {
 	uint64_t bad, weak, slow, bytes;
 	int too_slow;           /* under the throughput floor, see rate_judge() */
 	double lat_med, lat_avg, lat_min, lat_max;
+	double wlat_med;        /* 0 when nothing has been written */
 	char report[PATH_MAX];
 	char note[160];         /* the last thing this job had to say */
 } jrec_t;
@@ -603,6 +604,8 @@ static void jrec_put(const jrec_t *j)
 		j->lat_min, j->lat_max);
 	if (j->too_slow)
 		fprintf(f, "tooslow 1\n");
+	if (j->wlat_med > 0)
+		fprintf(f, "wlat %.2f\n", j->wlat_med);
 	if (j->report[0])
 		fprintf(f, "report %s\n", j->report);
 	if (j->note[0])
@@ -659,6 +662,8 @@ static int jrec_get(const char *path, jrec_t *j)
 			j->verdict = atoi(v);
 		else if (!strcmp(k, "tooslow"))
 			j->too_slow = atoi(v);
+		else if (!strcmp(k, "wlat"))
+			j->wlat_med = atof(v);
 		else if (!strcmp(k, "pid"))
 			j->pid = (pid_t)atoi(v);
 		else if (!strcmp(k, "pidstart"))
@@ -1297,6 +1302,17 @@ static int transport_is_local(transport_t t)
 	return t == TR_ATA || t == TR_SCSI || t == TR_USB ||
 	       t == TR_NVME || t == TR_MMC || t == TR_UNKNOWN;
 }
+
+#define LATWIN 4096
+#define LATWIN_SECS 30
+typedef struct {
+	struct {
+		uint64_t at_us;
+		uint32_t us;
+	} s[LATWIN];
+	int head;
+	int n;
+} latwin_t;
 
 typedef struct {
 	char name[64];          /* sda */
@@ -2572,6 +2588,15 @@ typedef struct {
 	uint64_t t_end_us;
 	uint64_t chunks_read;
 	uint64_t chunks_slow;
+	/*
+	 * A write lands on the same track as the read before it and waits for
+	 * the same revolution, so it costs what a read there does: 8.79 ms
+	 * against 8.44 on a healthy SAS drive even with its write cache on.
+	 * One over the read budget is a write the drive struggled to put down,
+	 * which a read-back that verifies cannot see.
+	 */
+	uint64_t writes_done;
+	uint64_t writes_slow;
 	uint64_t chunks_err;
 	uint64_t blocks_drilled;
 	uint64_t prot_errors;   /* reads refused by the drive's guard tag check */
@@ -2634,14 +2659,9 @@ typedef struct {
 	 * device the window is whatever the last LATWIN samples cover, and
 	 * the display says which.
 	 */
-#define LATWIN 4096
-#define LATWIN_SECS 30
-	struct {
-		uint64_t at_us;
-		uint32_t us;
-	} latwin[LATWIN];
-	int latwin_head;
-	int latwin_n;
+	latwin_t latwin;
+	latwin_t wlatwin;       /* the same for writes, which cost what a read
+				 * at the same place does -- see writes_slow */
 	int temp_abort;
 	const char *profile;    /* the named profile these defaults came from */
 	int la_disabled;        /* drive look-ahead was actually turned off */
@@ -3835,14 +3855,13 @@ static void drill_chunk(ctx_t *c, uint64_t off, size_t len, void *buf,
  * update, comfortably under PIPE_BUF, so records never interleave.
  */
 
-static void latwin_add(ctx_t *c, uint64_t us)
+static void latwin_add(latwin_t *w, uint64_t us)
 {
-	c->latwin[c->latwin_head].at_us = now_us();
-	c->latwin[c->latwin_head].us = us > 0xffffffffu ? 0xffffffffu
-						        : (uint32_t)us;
-	c->latwin_head = (c->latwin_head + 1) % LATWIN;
-	if (c->latwin_n < LATWIN)
-		c->latwin_n++;
+	w->s[w->head].at_us = now_us();
+	w->s[w->head].us = us > 0xffffffffu ? 0xffffffffu : (uint32_t)us;
+	w->head = (w->head + 1) % LATWIN;
+	if (w->n < LATWIN)
+		w->n++;
 }
 
 /*
@@ -3850,8 +3869,8 @@ static void latwin_add(ctx_t *c, uint64_t us)
  * spans -- which is not always LATWIN_SECS, and saying so is cheaper than
  * letting someone believe a two second sample is a thirty second one.
  */
-static int latwin_stats(ctx_t *c, double *med, double *avg, double *lo,
-			double *hi, double *span)
+static int latwin_stats(const latwin_t *w, double *med, double *avg,
+			double *lo, double *hi, double *span)
 {
 	static uint32_t tmp[LATWIN];
 	uint64_t now = now_us(), cut, oldest = 0;
@@ -3860,13 +3879,13 @@ static int latwin_stats(ctx_t *c, double *med, double *avg, double *lo,
 
 	cut = now > (uint64_t)LATWIN_SECS * 1000000ull
 	      ? now - (uint64_t)LATWIN_SECS * 1000000ull : 0;
-	for (i = 0; i < c->latwin_n; i++) {
-		int k = (c->latwin_head - 1 - i + LATWIN * 2) % LATWIN;
+	for (i = 0; i < w->n; i++) {
+		int k = (w->head - 1 - i + LATWIN * 2) % LATWIN;
 
-		if (c->latwin[k].at_us < cut)
+		if (w->s[k].at_us < cut)
 			break;
-		tmp[n++] = c->latwin[k].us;
-		oldest = c->latwin[k].at_us;
+		tmp[n++] = w->s[k].us;
+		oldest = w->s[k].at_us;
 	}
 	if (n < 2)
 		return 0;
@@ -4008,8 +4027,12 @@ static void progress(ctx_t *c, int final)
 	 */
 	if (g_job_own) {
 		double med = 0, avg = 0, lo = 0, hi = 0, span = 0;
+		double wmed = 0, wavg, wlo, whi, wspan;
 
-		latwin_stats(c, &med, &avg, &lo, &hi, &span);
+		latwin_stats(&c->latwin, &med, &avg, &lo, &hi, &span);
+		if (!latwin_stats(&c->wlatwin, &wmed, &wavg, &wlo, &whi, &wspan))
+			wmed = 0;
+		g_job.wlat_med = wmed;
 		g_job.pct = pct;
 		g_job.rate = rate;
 		g_job.eta = eta;
@@ -4029,11 +4052,16 @@ static void progress(ctx_t *c, int final)
 		return;
 	{
 		double med, avg, lo, hi, span;
+		double wmed, wavg, wlo, whi, wspan;
 
-		if (latwin_stats(c, &med, &avg, &lo, &hi, &span))
+		if (latwin_stats(&c->latwin, &med, &avg, &lo, &hi, &span))
 			snprintf(lw, sizeof(lw),
 				 "  last %.0fs med %.1f avg %.1f min %.1f "
 				 "max %.1f ms", span, med, avg, lo, hi);
+		if (lw[0] && latwin_stats(&c->wlatwin, &wmed, &wavg, &wlo,
+					  &whi, &wspan))
+			snprintf(lw + strlen(lw) - 3, sizeof(lw) - (strlen(lw) - 3),
+				 ", write med %.1f ms", wmed);
 	}
 	fprintf(stderr, "\r%s  %5.1f%%  %s/s%s  bad:%" PRIu64 " slow:%" PRIu64
 		" weak:%" PRIu64 "%s  elapsed %s  eta %s   ",
@@ -4080,6 +4108,8 @@ static void state_save(ctx_t *c)
 		c->chunks_read, c->chunks_slow, c->chunks_err, c->blocks_drilled,
 		c->blocks_slow, c->blocks_bad, c->blocks_recovered,
 		c->blocks_unstable, c->blocks_fixed, c->hard_errors, c->retry_ios);
+	fprintf(f, "writes %" PRIu64 " %" PRIu64 "\n", c->writes_done,
+		c->writes_slow);
 	fprintf(f, "chunklat %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 "\n",
 		c->chunk_lat.count, c->chunk_lat.sum_us,
 		c->chunk_lat.min_us, c->chunk_lat.max_us);
@@ -4131,6 +4161,9 @@ static int state_load(ctx_t *c)
 			       &c->blocks_drilled, &c->blocks_slow, &c->blocks_bad,
 			       &c->blocks_recovered, &c->blocks_unstable,
 			       &c->blocks_fixed, &c->hard_errors, &c->retry_ios);
+		} else if (!strncmp(line, "writes ", 7)) {
+			sscanf(line + 7, "%" SCNu64 " %" SCNu64,
+			       &c->writes_done, &c->writes_slow);
 		} else if (!strncmp(line, "chunklat ", 9)) {
 			sscanf(line + 9, "%" SCNu64 " %" SCNu64 " %" SCNu64 " %" SCNu64,
 			       &c->chunk_lat.count, &c->chunk_lat.sum_us,
@@ -4478,7 +4511,7 @@ static void scan_loop(ctx_t *c, int verify_only_pass)
 		if (r == (ssize_t)len) {
 			c->prot_run = 0;
 			lat_add(&c->chunk_lat, us);
-			latwin_add(c, us);
+			latwin_add(&c->latwin, us);
 			c->bands[band].sum_us += us;
 			if (us > c->bands[band].max_us)
 				c->bands[band].max_us = us;
@@ -4584,6 +4617,10 @@ static void scan_loop(ctx_t *c, int verify_only_pass)
 			w = timed_pwrite(c->fd, pat, len, c->pos, &wus, &werr);
 			if (w == (ssize_t)len) {
 				lat_add(&c->write_lat, wus);
+				latwin_add(&c->wlatwin, wus);
+				c->writes_done++;
+				if (wus > chunk_thr_at(c, c->pos))
+					c->writes_slow++;
 				if (c->wr_early_n < 512) {
 					c->wr_early_sum += wus;
 					c->wr_early_n++;
@@ -4637,7 +4674,7 @@ static void scan_loop(ctx_t *c, int verify_only_pass)
 					uint64_t bad_at = 0;
 
 					lat_add(&c->chunk_lat, rus);
-					latwin_add(c, rus);
+					latwin_add(&c->latwin, rus);
 					if (prot_write) {
 						/* it reads now, so it counts
 						 * as covered, and the band
@@ -4847,8 +4884,24 @@ static const char *errname(int e)
 	return e ? strerror(e) : "-";
 }
 
+/*
+ * A chunk over budget whose sectors all read cleanly when drilled into was the
+ * drive having a moment -- a neighbour's vibration, a thermal recalibration,
+ * its own background scan -- and every drive has those.  Once in a while is
+ * not a verdict; as a habit it is.  A few are needed before the rate means
+ * anything, so a short range is not judged on one.
+ */
+#define OVER_ONE_IN 1000
+#define OVER_MIN 3
+
+static int over_too_often(uint64_t over, uint64_t of)
+{
+	return over >= OVER_MIN && over > of / OVER_ONE_IN;
+}
+
 static int verdict_of(ctx_t *c, const char **why)
 {
+	static char buf[200];
 	long long d_realloc = 0, d_pending = 0, d_uncorr = 0;
 
 	if (c->smart_before.have && c->smart_after.have) {
@@ -4881,7 +4934,6 @@ static int verdict_of(ctx_t *c, const char **why)
 		return 2;
 	}
 	if (c->too_slow) {
-		static char buf[200];
 		char b1[32], b2[32];
 		int usb = c->dev->transport == TR_USB;
 
@@ -4898,8 +4950,24 @@ static int verdict_of(ctx_t *c, const char **why)
 		*why = "sectors needed retries or the drive reallocated during the scan";
 		return 1;
 	}
-	if (c->blocks_recovered || c->chunks_slow) {
+	if (c->blocks_recovered) {
 		*why = "some reads exceeded the latency budget but recovered on retry";
+		return 1;
+	}
+	if (over_too_often(c->chunks_slow, c->chunks_read)) {
+		snprintf(buf, sizeof(buf), "%" PRIu64 " of %" PRIu64 " chunk reads "
+			 "were over the latency budget, more than one in %d, "
+			 "though no sector stayed slow when drilled into",
+			 c->chunks_slow, c->chunks_read, OVER_ONE_IN);
+		*why = buf;
+		return 1;
+	}
+	if (over_too_often(c->writes_slow, c->writes_done)) {
+		snprintf(buf, sizeof(buf), "%" PRIu64 " of %" PRIu64 " chunk writes "
+			 "took longer than the latency budget, more than one in "
+			 "%d%s", c->writes_slow, c->writes_done, OVER_ONE_IN,
+			 c->smr_suspected ? "; the pattern is drive-managed SMR" : "");
+		*why = buf;
 		return 1;
 	}
 	if (c->smart_after.have &&
@@ -4907,6 +4975,18 @@ static int verdict_of(ctx_t *c, const char **why)
 	     c->smart_after.reported_uncorr)) {
 		*why = "SMART reports pending or uncorrectable sectors from before this scan";
 		return 1;
+	}
+	if (c->chunks_slow || c->writes_slow) {
+		char wr[48] = "";
+
+		if (c->writes_done)
+			snprintf(wr, sizeof(wr), " and %" PRIu64 " writes",
+				 c->writes_slow);
+		snprintf(buf, sizeof(buf), "every sector returned data within the "
+			 "latency budget; %" PRIu64 " chunk reads%s went over it, "
+			 "too rarely to hold against the drive", c->chunks_slow, wr);
+		*why = buf;
+		return 0;
 	}
 	*why = "every sector returned data within the latency budget";
 	return 0;
@@ -5117,6 +5197,9 @@ static void report(ctx_t *c)
 	out("\n  --- Counters ---\n");
 	out("    chunks read              %12" PRIu64 "\n", c->chunks_read);
 	out("    chunks over budget       %12" PRIu64 "\n", c->chunks_slow);
+	if (mode_writes(c->mode))
+		out("    writes over budget       %12" PRIu64 "  of %" PRIu64 "\n",
+		    c->writes_slow, c->writes_done);
 	out("    chunks with I/O errors   %12" PRIu64 "\n", c->chunks_err);
 	out("    sectors drilled down     %12" PRIu64 "\n", c->blocks_drilled);
 	out("    retry reads issued       %12" PRIu64 "\n", c->retry_ios);
@@ -5483,6 +5566,8 @@ static void write_json(ctx_t *c, const char *path)
 	fprintf(f, "    \"protection_errors\": %" PRIu64 ",\n", c->prot_errors);
 	fprintf(f, "    \"chunks_read\": %" PRIu64 ",\n", c->chunks_read);
 	fprintf(f, "    \"chunks_over_budget\": %" PRIu64 ",\n", c->chunks_slow);
+	fprintf(f, "    \"writes\": %" PRIu64 ",\n", c->writes_done);
+	fprintf(f, "    \"writes_over_budget\": %" PRIu64 ",\n", c->writes_slow);
 	fprintf(f, "    \"sectors_drilled\": %" PRIu64 ",\n", c->blocks_drilled);
 	fprintf(f, "    \"sectors_recovered\": %" PRIu64 ",\n", c->blocks_recovered);
 	fprintf(f, "    \"sectors_unstable\": %" PRIu64 ",\n", c->blocks_unstable);
@@ -5630,6 +5715,8 @@ static void write_prometheus(ctx_t *c, const char *path)
 	  "gauge", (double)c->blocks_unstable },
 	{ "hddscan_sectors_slow", "Sectors consistently over the latency budget",
 	  "gauge", (double)c->blocks_slow },
+	{ "hddscan_writes_slow", "Chunk writes over the latency budget",
+	  "gauge", (double)c->writes_slow },
 	{ "hddscan_sectors_recovered", "Sectors slow once but clean on retry",
 	  "gauge", (double)c->blocks_recovered },
 	{ "hddscan_sectors_corrupt", "Sectors returning data that did not match",
@@ -7129,9 +7216,9 @@ static void tui_dashboard(const run_t *r, const jrec_t *j, int n, int nruns)
 		printf("  %-8s %6s %-10s %-20s %-10s %s", "DRIVE", "PCT",
 		       "SIZE", "MODEL", "STATE", "LAST MESSAGE");
 	else
-		printf("  %-8s %6s %11s %7s %7s %8s %6s %6s %6s %6s %9s %s",
+		printf("  %-8s %6s %11s %7s %7s %8s %6s %6s %6s %6s %6s %9s %s",
 		       "DRIVE", "PCT", "RATE", "BAD", "WEAK", "SLOW", "MED",
-		       "AVG", "MIN", "MAX", "ETA", "STATE");
+		       "AVG", "MIN", "MAX", "WMED", "ETA", "STATE");
 	tui_eol();
 
 	listrows = rows - row - g_msg_count - 3;
@@ -7197,7 +7284,7 @@ static void tui_dashboard(const run_t *r, const jrec_t *j, int n, int nruns)
 			       col, jrec_word(x, 1), c_off(),
 			       cols > 66 ? cols - 64 : 14, x->note);
 		} else {
-			char lat[48];
+			char lat[64];
 
 			if (x->state == JS_RUNNING && x->lat_max > 0)
 				snprintf(lat, sizeof(lat),
@@ -7206,6 +7293,14 @@ static void tui_dashboard(const run_t *r, const jrec_t *j, int n, int nruns)
 			else
 				snprintf(lat, sizeof(lat), "%6s %6s %6s %6s",
 					 "-", "-", "-", "-");
+			/* writes are timed separately: a drive whose writes
+			 * crawl reads back at full speed */
+			if (x->state == JS_RUNNING && x->wlat_med > 0)
+				snprintf(lat + strlen(lat), sizeof(lat) - strlen(lat),
+					 " %6.1f", x->wlat_med);
+			else
+				snprintf(lat + strlen(lat), sizeof(lat) - strlen(lat),
+					 " %6s", "-");
 			printf("  %-8.8s %5.1f%% %9s/s %7" PRIu64 " %7" PRIu64
 			       " %8" PRIu64 " %s %9s %s%s%s",
 			       jrec_name(x), x->state == JS_DONE ? 100.0 : x->pct,

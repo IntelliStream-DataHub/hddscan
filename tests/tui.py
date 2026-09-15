@@ -610,7 +610,9 @@ def main():
                   "SLOW" in lines[i], lines[i])
             # what the drive is doing *now*, which the cumulative report
             # cannot show while a scan is still running
-            for col in ("MED", "AVG", "MIN", "MAX"):
+            # writes are timed on their own: a drive whose writes crawl
+            # reads back at full speed, and the read columns hide it
+            for col in ("MED", "AVG", "MIN", "MAX", "WMED"):
                 check("the table has a %s latency column" % col,
                       col in lines[i], lines[i])
             check("the latency columns say what unit and window they use",
