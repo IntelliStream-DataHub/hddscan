@@ -69,6 +69,8 @@
 
 #define DEF_CHUNK (128u * 1024u)
 #define DEF_BLOCK (4u * 1024u)
+#define RATE_REF_CHUNK (4u * 1024u * 1024u) /* the chunk --min-rate is quoted at */
+#define RATE_SETTLE_S 120   /* scan time before the throughput floor judges */
 #define MAX_RETRIES 1000
 #define N_BANDS 512
 #define MAX_FINDINGS 200000
@@ -198,9 +200,12 @@ static const char *human_time(double s, char *buf, size_t n)
 	else if (s < 90)
 		snprintf(buf, n, "%.0fs", s);
 	else if (s < 5400)
-		snprintf(buf, n, "%.0fm %02.0fs", s / 60, fmod_local(s, 60));
+		/* truncate, not round: 119 s is 1m 59s, never "2m 59s" */
+		snprintf(buf, n, "%lldm %02llds", (long long)(s / 60),
+			 (long long)fmod_local(s, 60));
 	else
-		snprintf(buf, n, "%.0fh %02.0fm", s / 3600, fmod_local(s, 3600) / 60);
+		snprintf(buf, n, "%lldh %02lldm", (long long)(s / 3600),
+			 (long long)(fmod_local(s, 3600) / 60));
 	return buf;
 }
 
@@ -393,6 +398,7 @@ typedef struct {
 	long long started, updated, ended;
 	double pct, rate, eta;
 	uint64_t bad, weak, slow, bytes;
+	int too_slow;           /* under the throughput floor, see rate_judge() */
 	double lat_med, lat_avg, lat_min, lat_max;
 	char report[PATH_MAX];
 	char note[160];         /* the last thing this job had to say */
@@ -595,6 +601,8 @@ static void jrec_put(const jrec_t *j)
 		"\nbytes %" PRIu64 "\n", j->bad, j->weak, j->slow, j->bytes);
 	fprintf(f, "lat %.2f %.2f %.2f %.2f\n", j->lat_med, j->lat_avg,
 		j->lat_min, j->lat_max);
+	if (j->too_slow)
+		fprintf(f, "tooslow 1\n");
 	if (j->report[0])
 		fprintf(f, "report %s\n", j->report);
 	if (j->note[0])
@@ -649,6 +657,8 @@ static int jrec_get(const char *path, jrec_t *j)
 			j->state = atoi(v);
 		else if (!strcmp(k, "verdict"))
 			j->verdict = atoi(v);
+		else if (!strcmp(k, "tooslow"))
+			j->too_slow = atoi(v);
 		else if (!strcmp(k, "pid"))
 			j->pid = (pid_t)atoi(v);
 		else if (!strcmp(k, "pidstart"))
@@ -2556,6 +2566,8 @@ typedef struct {
 	/* running state */
 	uint64_t pos;
 	uint64_t bytes_done;
+	uint64_t bytes_at_start; /* bytes_done when this session began: a resumed
+				  * scan brings its old total with it */
 	uint64_t t_start_us;
 	uint64_t t_end_us;
 	uint64_t chunks_read;
@@ -2606,6 +2618,12 @@ typedef struct {
 	int smr_suspected;
 	int smr_windows;        /* consecutive collapsed write windows */
 	int stall_warned;       /* said once that retries are eating the run */
+
+	/* the throughput floor: see rate_judge() */
+	double rate_floor;      /* bytes/s; 0 when the rule does not apply */
+	double rate_seen;       /* what the scan managed, once it has settled */
+	int too_slow;
+	int too_slow_warned;
 
 	/*
 	 * A rolling window of recent chunk latencies.  The cumulative figures
@@ -3863,6 +3881,67 @@ static int latwin_stats(ctx_t *c, double *med, double *avg, double *lo,
 	return n;
 }
 
+/*
+ * A drive can return every sector inside its budget and still be no use.
+ * One that covers its surface at a few hundred KiB a second is spending the
+ * time somewhere -- writes that crawl, or a chunk over budget almost every
+ * time, each drilled into sector by sector -- and a scan of it will not
+ * finish this year.  A working hard drive at 4 MiB chunks manages well over
+ * 10 MiB/s even writing and reading every chunk back, so below that is not
+ * a slow drive, it is a failing one.
+ *
+ * The floor scales down with the chunk and never up: a small chunk pays the
+ * same lost revolution per request for less data, so 128 KiB honestly runs
+ * far slower and a flat floor would condemn healthy drives at the default.
+ * Verify mode writes the original back on top of what write mode does, so
+ * it gets a quarter less.  Only a hard drive on a local bus is judged --
+ * a slow network link or an SD card is not a failing platter -- and image
+ * files, so the rule can be tested at all.
+ */
+static double rate_floor_of(const ctx_t *c, double min_mib)
+{
+	double f;
+
+	if (min_mib <= 0 || !(c->dev->is_file || c->dev->rotational) ||
+	    !transport_is_local(c->dev->transport))
+		return 0;
+	f = min_mib * 1048576.0;
+	if (c->chunk < RATE_REF_CHUNK)
+		f *= (double)c->chunk / (double)RATE_REF_CHUNK;
+	if (c->mode == MODE_VERIFY)
+		f *= 0.75;
+	return f;
+}
+
+/*
+ * Judge the rate over the whole of this session, once it has run long enough
+ * to mean something.  Not sticky while scanning: the last call, with the end
+ * time, is the one the verdict uses.
+ */
+static void rate_judge(ctx_t *c, uint64_t now)
+{
+	char b1[32], b2[32];
+	double el;
+
+	if (c->rate_floor <= 0 || now <= c->t_start_us)
+		return;
+	el = (double)(now - c->t_start_us) / 1e6;
+	if (el < RATE_SETTLE_S)
+		return;
+	c->rate_seen = (double)(c->bytes_done - c->bytes_at_start) / el;
+	c->too_slow = c->rate_seen < c->rate_floor;
+	if (c->too_slow && !c->too_slow_warned) {
+		c->too_slow_warned = 1;
+		msg(PROG ": %s: %stesting at %s/s, below the %s/s floor for "
+		    "%zu KiB chunks%s; unless it picks up it will be reported "
+		    "%s\n", c->dev->name, c_red(),
+		    human_size((uint64_t)c->rate_seen, b1, sizeof(b1)),
+		    human_size((uint64_t)c->rate_floor, b2, sizeof(b2)),
+		    c->chunk / 1024, c_off(),
+		    c->dev->transport == TR_USB ? "SUSPECT" : "FAILING");
+	}
+}
+
 static void progress(ctx_t *c, int final)
 {
 	static uint64_t last;
@@ -3882,7 +3961,8 @@ static void progress(ctx_t *c, int final)
 		return;
 	last = now;
 	el = (double)(now - c->t_start_us) / 1e6;
-	rate = el > 0 ? (double)c->bytes_done / el : 0;
+	rate = el > 0 ? (double)(c->bytes_done - c->bytes_at_start) / el : 0;
+	rate_judge(c, now);
 	{
 		uint64_t left = c->nchunks > c->step ? c->nchunks - c->step : 0;
 
@@ -3936,6 +4016,7 @@ static void progress(ctx_t *c, int final)
 		g_job.bad = c->blocks_bad + c->blocks_corrupt;
 		g_job.weak = c->blocks_recovered;
 		g_job.slow = c->blocks_slow + c->blocks_unstable;
+		g_job.too_slow = c->too_slow;
 		g_job.bytes = c->bytes_done;
 		g_job.lat_med = med;
 		g_job.lat_avg = avg;
@@ -3954,10 +4035,11 @@ static void progress(ctx_t *c, int final)
 				 "  last %.0fs med %.1f avg %.1f min %.1f "
 				 "max %.1f ms", span, med, avg, lo, hi);
 	}
-	fprintf(stderr, "\r%s  %5.1f%%  %s/s  bad:%" PRIu64 " slow:%" PRIu64
+	fprintf(stderr, "\r%s  %5.1f%%  %s/s%s  bad:%" PRIu64 " slow:%" PRIu64
 		" weak:%" PRIu64 "%s  elapsed %s  eta %s   ",
 		c->dev->name, pct,
 		human_size((uint64_t)rate, b1, sizeof(b1)),
+		c->too_slow ? " TOO SLOW" : "",
 		c->blocks_bad, c->blocks_slow + c->blocks_unstable,
 		c->blocks_recovered, lw,
 		human_time(el, b2, sizeof(b2)),
@@ -4798,6 +4880,20 @@ static int verdict_of(ctx_t *c, const char **why)
 		*why = "the drive has failed its own self-test";
 		return 2;
 	}
+	if (c->too_slow) {
+		static char buf[200];
+		char b1[32], b2[32];
+		int usb = c->dev->transport == TR_USB;
+
+		snprintf(buf, sizeof(buf), "the drive tested at %s/s, below the "
+			 "%s/s floor for %zu KiB chunks%s",
+			 human_size((uint64_t)c->rate_seen, b1, sizeof(b1)),
+			 human_size((uint64_t)c->rate_floor, b2, sizeof(b2)),
+			 c->chunk / 1024,
+			 usb ? "; a USB 2 link alone can be that slow" : "");
+		*why = buf;
+		return usb ? 1 : 2;
+	}
 	if (c->blocks_unstable || c->blocks_slow || d_realloc > 0 || d_pending > 0) {
 		*why = "sectors needed retries or the drive reallocated during the scan";
 		return 1;
@@ -4984,8 +5080,15 @@ static void report(ctx_t *c)
 	out("  Duration         %s, %s read, %s/s average\n",
 	    human_time(secs, b1, sizeof(b1)),
 	    human_size(c->bytes_done, b2, sizeof(b2)),
-	    human_size(secs > 0 ? (uint64_t)((double)c->bytes_done / secs) : 0,
+	    human_size(secs > 0 ? (uint64_t)((double)(c->bytes_done -
+						      c->bytes_at_start) / secs) : 0,
 		       (char[32]){0}, 32));
+	if (c->too_slow)
+		out("  %sToo slow%s         %s/s against a floor of %s/s at %zu KiB "
+		    "chunks (--min-rate)\n", c_red(), c_off(),
+		    human_size((uint64_t)c->rate_seen, b1, sizeof(b1)),
+		    human_size((uint64_t)c->rate_floor, b2, sizeof(b2)),
+		    c->chunk / 1024);
 	if (c->abort_reason[0])
 		out("  %sIncomplete%s       %s\n", c_yel(), c_off(), c->abort_reason);
 	if (g_stop && !c->abort_reason[0])
@@ -5364,6 +5467,9 @@ static void write_json(ctx_t *c, const char *path)
 	fprintf(f, "  \"duration_s\": %.3f,\n",
 		(double)(c->t_end_us - c->t_start_us) / 1e6);
 	fprintf(f, "  \"bytes_tested\": %" PRIu64 ",\n", c->bytes_done);
+	fprintf(f, "  \"rate_bytes_per_s\": %.0f,\n", c->rate_seen);
+	fprintf(f, "  \"rate_floor_bytes_per_s\": %.0f,\n", c->rate_floor);
+	fprintf(f, "  \"too_slow\": %s,\n", c->too_slow ? "true" : "false");
 	fprintf(f, "  \"protection_type\": %d,\n", c->dev->prot_type);
 	fprintf(f, "  \"protection_refused_bytes\": %" PRIu64 ",\n", c->prot_bytes);
 	fprintf(f, "  \"complete\": %s,\n",
@@ -5692,6 +5798,7 @@ typedef struct {
 	double chunk_ms, block_ms;
 	double auto_factor;
 	double floor_ms;
+	double min_rate;        /* MiB/s at RATE_REF_CHUNK chunks */
 	long long max_temp;
 	uint64_t seed;
 	const char *confirm;
@@ -5902,6 +6009,10 @@ static void usage(void)
 "  --sector-slow-ms MS    sector budget; over this we retry the sector\n"
 "  --auto-factor F        auto budget = F x measured median (default 3)\n"
 "  --floor-ms MS          auto budget never goes below this (default 25)\n"
+"  --min-rate MIB         a hard drive testing slower than this many MiB/s at\n"
+"                         4 MiB chunks is failing; scaled down for smaller\n"
+"                         chunks.  Judged after 2 minutes; 0 turns it off\n"
+"                         (default 10)\n"
 "  --retries N            re-reads of a suspicious sector (default 20).  A\n"
 "                         sector that is merely weak often reads back fine\n"
 "                         after a few tries; that is the drive recovering\n"
@@ -6446,6 +6557,8 @@ static int scan_device(device_t *d, const opts_t *o, const char *json_path,
 	}
 
 	c.t_start_us = now_us();
+	c.bytes_at_start = c.bytes_done;
+	c.rate_floor = rate_floor_of(&c, o->min_rate);
 	scan_loop(&c, c.mode == MODE_CHECK);
 
 	if (c.second_pass && c.mode == MODE_WRITE && !g_stop) {
@@ -6455,6 +6568,7 @@ static int scan_device(device_t *d, const opts_t *o, const char *json_path,
 		scan_loop(&c, 1);
 	}
 	c.t_end_us = now_us();
+	rate_judge(&c, c.t_end_us);
 
 	if (!o->no_smart)
 		smart_read(d, &c.smart_after);
@@ -6650,13 +6764,17 @@ static const char *jrec_word(const jrec_t *j, int format)
 		return "orphaned";
 	if (j->state == JS_QUEUED)
 		return "queued";
-	return format ? "formatting" : "scanning";
+	if (format)
+		return "formatting";
+	return j->too_slow ? "too slow" : "scanning";
 }
 
 static const char *jrec_color(const jrec_t *j)
 {
 	if (j->state == JS_ORPHANED)
 		return c_yel();
+	if (j->state == JS_RUNNING && j->too_slow)
+		return c_red();
 	if (j->state != JS_DONE && j->state != JS_STOPPED)
 		return "";
 	return j->verdict == 0 ? c_grn() : j->verdict == 1 ? c_yel() : c_red();
@@ -9302,6 +9420,7 @@ int main(int argc, char **argv)
 	o.bb_blocksize = 1024;
 	o.auto_factor = 3.0;
 	o.floor_ms = 25.0;
+	o.min_rate = 10.0;
 	o.max_temp = 58;
 	o.map_width = 64;
 	o.seed = 0x5eed1234abcdef01ull;
@@ -9464,6 +9583,10 @@ int main(int argc, char **argv)
 			o.auto_factor = atof(NEXT());
 		} else if (!strcmp(a, "--floor-ms")) {
 			o.floor_ms = atof(NEXT());
+		} else if (!strcmp(a, "--min-rate")) {
+			o.min_rate = atof(NEXT());
+			if (o.min_rate < 0)
+				die("--min-rate must be 0 or more");
 		} else if (!strcmp(a, "--retry-max-seconds")) {
 			o.retry_cap_s = atof(NEXT());
 		} else if (!strcmp(a, "--retries")) {

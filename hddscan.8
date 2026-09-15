@@ -329,6 +329,16 @@ Automatic budget is F times the measured median. Default 3.
 The automatic budget never goes below this. Default 25, plus an allowance for
 the transfer time of a chunk larger than the default.
 .TP
+.BI \-\-min\-rate " MIB"
+A hard drive that tests slower than this many MiB/s at 4 MiB chunks is
+FAILING, however clean its sectors. Smaller chunks get a proportionally lower
+floor, verify mode three quarters of it. Judged over the whole scan once it has
+run for two minutes; a drive under it shows
+.B too slow
+while scanning. Only rotational drives on a local bus are judged, and a USB
+drive is SUSPECT rather than FAILING, since the link alone can be that slow.
+0 turns it off. Default 10.
+.TP
 .BI \-\-retries " N"
 Re-reads of a suspicious sector, default 20. A merely weak sector often reads
 back fine after a few tries; that is the drive recovering, and it is worth
@@ -566,7 +576,9 @@ Healthy. Every sector returned data within the latency budget.
 Suspect. Sectors needed retries, or SMART counters moved during the scan.
 .TP
 .B 2
-Failing, or a usage error.
+Failing, or a usage error. A drive that tested under
+.B \-\-min\-rate
+is failing too.
 .TP
 .B 130
 Interrupted.

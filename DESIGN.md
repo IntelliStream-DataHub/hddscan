@@ -766,6 +766,31 @@ Sectors are classified as `recovered` (slow once, clean afterwards), `slow`
 (unreadable on every attempt) or `corrupt` (returned data that did not match
 what was written).
 
+A drive can pass every sector and still fail. One that covers its surface at a
+few hundred KiB a second is spending the time somewhere — writes that crawl, or
+a chunk over budget nearly every time, each drilled into sector by sector — and
+a scan of it will not finish this year. So speed is part of the verdict: a hard
+drive that tests below 10 MiB/s at 4 MiB chunks (`--min-rate`) is FAILING. A
+working one manages several times that even writing and reading every chunk
+back, so this is not a slow drive but a broken one:
+
+```
+  sdc   0.0%  439.01 KiB/s  ...  too slow
+  sdf   0.1%   29.00 MiB/s  ...  scanning
+```
+
+The floor scales *down* with the chunk and never up. A small chunk pays the same
+lost revolution per request for less data, so 128 KiB honestly runs far slower,
+and a flat floor would condemn healthy drives at the default; 128 KiB gets a
+thirty-second of it. Verify mode writes the original back as well, so it gets
+three quarters. The rate is the whole scan's, judged only once it has run for
+two minutes, and the dashboard says `too slow` from that point on.
+
+What is judged is deliberately narrow. Only a rotational drive on a local bus: a
+slow iSCSI link or an SD card is not a failing platter. A USB drive is SUSPECT
+instead of FAILING, because a USB 2 bridge alone can hold a write-and-verify
+pass near the floor.
+
 Coverage is stated explicitly in every report — "every sector of the device was
 read" versus "SAMPLED" or "PARTIAL" — so a clean verdict is never mistaken for
 more than it is.

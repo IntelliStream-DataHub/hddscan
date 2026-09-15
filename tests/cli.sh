@@ -439,6 +439,75 @@ assert_has "--stop with no such run is an error, not a silent success" \
 assert_eq "--stop with no such run exits 2" \
 	"$(run --stop nosuchrun >/dev/null 2>&1; echo $?)" "2"
 
+echo "== a drive too slow to test is failing =="
+
+# A drive can return every sector inside its budget and still take a year to
+# get through the surface.  The floor only judges once a scan has run long
+# enough for its rate to mean something, so a short scan against an
+# unreachable floor must still come back as it would have without one.
+f=$(image 16 rate.bin)
+out=$(run --min-rate 1000000 "$f")
+assert_hasnt "the throughput floor does not judge a scan before it settles" \
+	"$out" "Too slow"
+assert_has "--min-rate below zero is refused" \
+	"$(run --min-rate -1 "$f" 2>&1)" "--min-rate must be"
+
+# While running, the record carries the flag and every reader shows it.  The
+# worker is stood in for by a sleep, so the record's process is really alive.
+sleep 120 & sp=$!
+spstart=$(sed 's/.*) //' /proc/$sp/stat | awk '{print $20}')
+d=$HDDSCAN_STATE_DIR/runs/20200303-000000
+mkdir -p "$d"
+cat > "$d/run" <<EOF
+run 1
+id 20200303-000000
+kind scan
+what write (predeploy)
+detail destructive write + verify
+outdir $TMP
+created $(( $(date +%s) - 600 ))
+ended 0
+sup $sp
+supstart $spstart
+njobs 1
+EOF
+cat > "$d/sdy.job" <<EOF
+job 1
+device sdy
+path /dev/sdy
+model MADE UP
+size 1000000000000
+state 1
+verdict -1
+pid $sp
+pidstart $spstart
+started $(( $(date +%s) - 600 ))
+updated $(date +%s)
+pct 0.1
+rate 449545
+tooslow 1
+EOF
+assert_has "a running drive under the floor says too slow" \
+	"$(run --status 20200303-000000)" "too slow"
+kill $sp 2>/dev/null; wait $sp 2>/dev/null
+run --forget 20200303-000000 >/dev/null
+
+# The verdict itself needs a scan that outlasts the settle time.  A 1 TiB
+# sparse image drilled chunk by chunk takes that long, and an unreachable
+# floor stands in for a drive that is genuinely too slow.  Drilling needs the
+# default chunk: the budget floor's allowance for a bigger one keeps a sparse
+# read under any budget.
+truncate -s 1T "$TMP/rate.big"
+out=$(run --chunk-slow-ms 0.001 --floor-ms 0 --retries 0 --max-time 130 \
+	--min-rate 1000000 --json "$TMP/rate.json" "$TMP/rate.big"); rc=$?
+assert_has "a drive under the floor is FAILING" "$out" "VERDICT: FAILING"
+assert_has "the verdict says it was too slow, and by how much" "$out" \
+	"below the"
+assert_has "the report carries a Too slow line" "$out" "Too slow"
+assert_eq "a drive under the floor exits 2" "$rc" "2"
+assert_has "the JSON says too_slow" "$(cat "$TMP/rate.json")" '"too_slow": true'
+rm -f "$TMP/rate.big"
+
 echo "== the SAS logs the report is built from =="
 
 # REGRESSION: smart_read() ran "smartctl -H -A -i", and on SAS the error
