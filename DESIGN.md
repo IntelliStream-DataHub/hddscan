@@ -810,6 +810,22 @@ are needed either way, so a short range is not judged on one. A sector that
 *stays* slow, needs retries or cannot be read is judged as before, however
 rare.
 
+A stretch of the surface can fail the same way. Each band of the surface map
+is compared with what calibration expects at that position, and a band reading
+at more than twice that — and more than 2 ms over, so microsecond jitter never
+looks like a factor of two — makes the drive SUSPECT and is named under the map:
+
+```
+    1 band (8.00 MiB) read at more than 2x what calibration expects there,
+    worst 4.5x at 12.50 MiB: damage localised like this is a head or a scratch
+```
+
+It is judged against the gradient measured before the scan, never against
+neighbouring bands, so a platter that goes slow everywhere cannot hide by being
+uniformly bad. A sampled scan seeks between the chunks it reads, which
+calibration did not time, so it is not judged. The bands are saved in the
+checkpoint, so a resumed scan's map and verdict cover what came before too.
+
 Coverage is stated explicitly in every report — "every sector of the device was
 read" versus "SAMPLED" or "PARTIAL" — so a clean verdict is never mistaken for
 more than it is.

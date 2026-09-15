@@ -344,6 +344,32 @@ assert_has "a write scan reports its writes over budget" "$out" \
 assert_has "the JSON counts writes over budget" "$(cat "$TMP/w.json")" \
 	'"writes_over_budget": 0'
 
+echo "== a stretch of the surface far slower than expected =="
+
+# A band reading far slower than the gradient calibration measured is a head
+# or a scratch, even with every sector inside its budget.  An image file has
+# no slow stretch to find, so the band's figures come from a checkpoint --
+# which is also where a resumed scan gets its surface map back from.
+f=$(image 32 band.bin)
+bandck() {
+	printf 'hddscan-state 1\npos %s\nstep 255\nbytes 13090422784\n' \
+		$((255 * 131072)) > "$TMP/band.ckpt"
+	printf 'counters 100000 0 0 0 0 0 0 0 0 0 0\n' >> "$TMP/band.ckpt"
+	printf 'band 200 64 0 0 0 %s 0 8388608\n' "$1" >> "$TMP/band.ckpt"
+	run --state "$TMP/band.ckpt" --resume --json "$TMP/band.json" "$f"
+}
+out=$(bandck 6400000)
+assert_has "a band far slower than calibration expects is SUSPECT" \
+	"$out" "VERDICT: SUSPECT - 1 band of the surface"
+assert_has "the report says where the slow band is" "$out" "worst"
+assert_has "the JSON counts slow bands" "$(cat "$TMP/band.json")" \
+	'"slow_bands": 1'
+assert_has "a resumed scan's surface map keeps the bands scanned before" \
+	"$out" "_@_"
+# microseconds over an image's own calibration are noise, not a factor of two
+assert_has "a band only microseconds over expectations is not held against it" \
+	"$(bandck 3200)" "VERDICT: HEALTHY"
+
 echo "== runs outlive the process that started them =="
 
 # A run is a directory of small text records, and everything that reports on

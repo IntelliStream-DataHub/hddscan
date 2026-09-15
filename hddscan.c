@@ -2554,7 +2554,9 @@ typedef struct {
 	uint64_t grad_off[NANCHOR];
 	uint64_t grad_us[NANCHOR];
 	int grad_n;
-	uint64_t grad_mid;      /* the median the flat budget was derived from */
+	uint64_t grad_mid;      /* median of the anchors' sequential runs */
+	uint64_t grad_typ;      /* what a chunk costs in the order being scanned */
+	int grad_budget;        /* the budget follows it (nothing pinned by hand) */
 	double auto_factor;
 	uint64_t floor_us;
 	int auto_thr;
@@ -3742,13 +3744,13 @@ static void analyze_block(ctx_t *c, uint64_t off, size_t len, void *buf,
  * floor, and the invariant-1 clamp all carry over unchanged; only the baseline
  * moves with the platter.
  */
-static uint64_t thr_at(const ctx_t *c, uint64_t off, uint64_t flat)
+static uint64_t expected_at(const ctx_t *c, uint64_t off)
 {
 	uint64_t lo_off, hi_off, lo_us, hi_us, exp;
 	int i;
 
-	if (c->grad_n < 2 || !c->grad_mid)
-		return flat;
+	if (c->grad_n < 2 || !c->grad_mid || !c->grad_typ)
+		return 0;
 	if (off <= c->grad_off[0])
 		exp = c->grad_us[0];
 	else if (off >= c->grad_off[c->grad_n - 1])
@@ -3770,8 +3772,24 @@ static uint64_t thr_at(const ctx_t *c, uint64_t off, uint64_t flat)
 					       (off - lo_off) / (hi_off - lo_off)
 					     : 0);
 	}
-	/* scale the flat budget by how this point compares to the median */
-	return (uint64_t)((double)flat * (double)exp / (double)c->grad_mid);
+	/*
+	 * The anchors are sequential runs.  A random scan pays a seek on top
+	 * of each, so scale to the order being scanned: this point costs what
+	 * the typical chunk does, times how this point compares to the
+	 * sequential median.  Dividing by the random median instead shrank
+	 * every random-order budget to about an eighth, leaving only the floor.
+	 */
+	return (uint64_t)((double)exp * (double)c->grad_typ / (double)c->grad_mid);
+}
+
+static uint64_t thr_at(const ctx_t *c, uint64_t off, uint64_t flat)
+{
+	uint64_t exp = c->grad_budget ? expected_at(c, off) : 0;
+
+	if (!exp)
+		return flat;
+	/* scale the flat budget by how this point compares to the typical chunk */
+	return (uint64_t)((double)flat * (double)exp / (double)c->grad_typ);
 }
 
 static uint64_t chunk_thr_at(const ctx_t *c, uint64_t off)
@@ -4110,6 +4128,16 @@ static void state_save(ctx_t *c)
 		c->blocks_unstable, c->blocks_fixed, c->hard_errors, c->retry_ios);
 	fprintf(f, "writes %" PRIu64 " %" PRIu64 "\n", c->writes_done,
 		c->writes_slow);
+	/* the surface map, so a resumed scan still draws what came before */
+	for (i = 0; i < N_BANDS; i++) {
+		const band_t *b = &c->bands[i];
+
+		if (b->chunks)
+			fprintf(f, "band %d %" PRIu64 " %" PRIu64 " %" PRIu64
+				" %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64
+				"\n", i, b->chunks, b->slow_chunks, b->bad_blocks,
+				b->slow_blocks, b->sum_us, b->max_us, b->bytes);
+	}
 	fprintf(f, "chunklat %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 "\n",
 		c->chunk_lat.count, c->chunk_lat.sum_us,
 		c->chunk_lat.min_us, c->chunk_lat.max_us);
@@ -4161,6 +4189,17 @@ static int state_load(ctx_t *c)
 			       &c->blocks_drilled, &c->blocks_slow, &c->blocks_bad,
 			       &c->blocks_recovered, &c->blocks_unstable,
 			       &c->blocks_fixed, &c->hard_errors, &c->retry_ios);
+		} else if (!strncmp(line, "band ", 5)) {
+			band_t b;
+			int bi;
+
+			memset(&b, 0, sizeof(b));
+			if (sscanf(line + 5, "%d %" SCNu64 " %" SCNu64 " %" SCNu64
+				   " %" SCNu64 " %" SCNu64 " %" SCNu64 " %" SCNu64,
+				   &bi, &b.chunks, &b.slow_chunks, &b.bad_blocks,
+				   &b.slow_blocks, &b.sum_us, &b.max_us,
+				   &b.bytes) == 8 && bi >= 0 && bi < N_BANDS)
+				c->bands[bi] = b;
 		} else if (!strncmp(line, "writes ", 7)) {
 			sscanf(line + 7, "%" SCNu64 " %" SCNu64,
 			       &c->writes_done, &c->writes_slow);
@@ -4812,6 +4851,73 @@ static void print_percentiles(const lat_t *l, const char *what)
 	    (double)l->max_us / 1000.0);
 }
 
+/*
+ * A stretch of the surface that reads far slower than calibration says it
+ * should, even with every sector inside its budget.  Damage localised to a
+ * band is a head struggling over a patch or a scratch, not random wear, and
+ * it is a trend that gets worse.  Judged against the gradient measured before
+ * the scan, never against the neighbouring bands: a whole platter going slow
+ * must not hide by being uniformly bad.
+ *
+ * Twice the expected cost is well clear of anything a smooth zone gradient
+ * does between anchors, and the band has to be over by a couple of
+ * milliseconds as well, so microsecond jitter -- an image file, or an SSD --
+ * never looks like a factor of two.  A sampled scan seeks between the chunks
+ * it reads, which calibration did not time, so it is not judged at all.
+ */
+#define BAND_SLOW_X 2.0
+#define BAND_MIN_EXCESS_US 2000
+#define BAND_MIN_CHUNKS 32
+
+typedef struct {
+	int n;                  /* slow bands */
+	uint64_t bytes;         /* how much of the surface they cover */
+	uint64_t worst_off;
+	double worst_x;
+} slowbands_t;
+
+static uint64_t band_start(const ctx_t *c, int i)
+{
+	uint64_t span = c->dev->size ? c->dev->size : 1;
+
+	return (uint64_t)i * (span / N_BANDS + 1);
+}
+
+static void slow_bands(const ctx_t *c, slowbands_t *sb)
+{
+	int i;
+
+	memset(sb, 0, sizeof(*sb));
+	if (c->sample > 1)
+		return;
+	for (i = 0; i < N_BANDS; i++) {
+		const band_t *b = &c->bands[i];
+		uint64_t mid, exp;
+		double avg;
+
+		if (b->chunks < BAND_MIN_CHUNKS)
+			continue;
+		mid = band_start(c, i) + (band_start(c, 1) / 2);
+		if (mid < c->start)
+			mid = c->start;
+		if (mid > c->end)
+			mid = c->end;
+		exp = expected_at(c, mid);
+		if (!exp)
+			return;
+		avg = (double)b->sum_us / (double)b->chunks;
+		if (avg < (double)exp * BAND_SLOW_X ||
+		    avg - (double)exp < BAND_MIN_EXCESS_US)
+			continue;
+		sb->n++;
+		sb->bytes += b->bytes;
+		if (avg / (double)exp > sb->worst_x) {
+			sb->worst_x = avg / (double)exp;
+			sb->worst_off = band_start(c, i);
+		}
+	}
+}
+
 static void print_map(ctx_t *c)
 {
 	int width = c->map_width;
@@ -4875,6 +4981,20 @@ static void print_map(ctx_t *c)
 	}
 	out("\n    legend: '.:-=+*#@' fastest to slowest average read, "
 	    "'!' weak sectors, 'X' bad sectors, '_' not scanned\n");
+	{
+		slowbands_t sb;
+		char b1[32], b2[32];
+
+		slow_bands(c, &sb);
+		if (sb.n)
+			out("    %s%d band%s (%s) read at more than %.0fx what "
+			    "calibration expects there%s,\n    worst %.1fx at %s: "
+			    "damage localised like this is a head or a scratch\n",
+			    c_yel(), sb.n, sb.n == 1 ? "" : "s",
+			    human_size(sb.bytes, b1, sizeof(b1)), BAND_SLOW_X,
+			    c_off(), sb.worst_x,
+			    human_size(sb.worst_off, b2, sizeof(b2)));
+	}
 	out("    a smooth left-to-right gradient is normal: outer tracks hold more\n"
 	    "    sectors per revolution, so they read faster than inner ones\n");
 }
@@ -4961,6 +5081,23 @@ static int verdict_of(ctx_t *c, const char **why)
 			 c->chunks_slow, c->chunks_read, OVER_ONE_IN);
 		*why = buf;
 		return 1;
+	}
+	{
+		slowbands_t sb;
+		char b1[32], b2[32];
+
+		slow_bands(c, &sb);
+		if (sb.n) {
+			snprintf(buf, sizeof(buf), "%d band%s of the surface (%s) "
+				 "read at more than %.0fx what calibration expects "
+				 "there, worst %.1fx at %s", sb.n,
+				 sb.n == 1 ? "" : "s",
+				 human_size(sb.bytes, b1, sizeof(b1)), BAND_SLOW_X,
+				 sb.worst_x,
+				 human_size(sb.worst_off, b2, sizeof(b2)));
+			*why = buf;
+			return 1;
+		}
 	}
 	if (over_too_often(c->writes_slow, c->writes_done)) {
 		snprintf(buf, sizeof(buf), "%" PRIu64 " of %" PRIu64 " chunk writes "
@@ -5070,7 +5207,7 @@ static void report(ctx_t *c)
 			    "information%s\n", c_yel(),
 			    human_size(c->prot_bytes, b1, sizeof(b1)), c_off());
 	}
-	if (c->grad_n >= 2) {
+	if (c->grad_budget) {
 		uint64_t lo = UINT64_MAX, hi = 0;
 		int k;
 
@@ -5568,6 +5705,12 @@ static void write_json(ctx_t *c, const char *path)
 	fprintf(f, "    \"chunks_over_budget\": %" PRIu64 ",\n", c->chunks_slow);
 	fprintf(f, "    \"writes\": %" PRIu64 ",\n", c->writes_done);
 	fprintf(f, "    \"writes_over_budget\": %" PRIu64 ",\n", c->writes_slow);
+	{
+		slowbands_t sb;
+
+		slow_bands(c, &sb);
+		fprintf(f, "    \"slow_bands\": %d,\n", sb.n);
+	}
 	fprintf(f, "    \"sectors_drilled\": %" PRIu64 ",\n", c->blocks_drilled);
 	fprintf(f, "    \"sectors_recovered\": %" PRIu64 ",\n", c->blocks_recovered);
 	fprintf(f, "    \"sectors_unstable\": %" PRIu64 ",\n", c->blocks_unstable);
@@ -6539,8 +6682,7 @@ static int scan_device(device_t *d, const opts_t *o, const char *json_path,
 	 * rather than dictated: an explicit --chunk-slow-ms or --sector-slow-ms
 	 * means that number everywhere, not a number this tool then bends.
 	 */
-	if (!o->chunk_ms && !o->block_ms && cal.valid && cal.nanchor >= 2 &&
-	    median) {
+	if (cal.valid && cal.nanchor >= 2 && cal.seq_us && median) {
 		int k;
 
 		for (k = 0; k < cal.nanchor; k++) {
@@ -6548,7 +6690,9 @@ static int scan_device(device_t *d, const opts_t *o, const char *json_path,
 			c.grad_us[k] = cal.anchor_us[k];
 		}
 		c.grad_n = cal.nanchor;
-		c.grad_mid = median;
+		c.grad_mid = cal.seq_us;
+		c.grad_typ = median;
+		c.grad_budget = !o->chunk_ms && !o->block_ms;
 	}
 
 	if (c.chunk_thr_us > c.block_thr_us) {
@@ -6563,12 +6707,12 @@ static int scan_device(device_t *d, const opts_t *o, const char *json_path,
 		    "chunk / %.1f ms sector\n", c.chunk / 1024,
 		    (double)median / 1000.0, (double)c.chunk_thr_us / 1000.0,
 		    (double)c.block_thr_us / 1000.0);
-		if (c.grad_n >= 2)
+		if (c.grad_budget)
 			out("  the budget follows the platter: %.2f ms per chunk "
 			    "at the outer edge,\n  %.2f ms at the inner, so the "
 			    "same margin applies everywhere\n",
-			    (double)c.grad_us[0] / 1000.0,
-			    (double)c.grad_us[c.grad_n - 1] / 1000.0);
+			    (double)expected_at(&c, c.grad_off[0]) / 1000.0,
+			    (double)expected_at(&c, c.grad_off[c.grad_n - 1]) / 1000.0);
 	} else {
 		/*
 		 * Calibration read nothing it could time -- on a PI-formatted
