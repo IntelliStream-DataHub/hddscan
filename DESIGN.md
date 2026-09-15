@@ -826,6 +826,26 @@ uniformly bad. A sampled scan seeks between the chunks it reads, which
 calibration did not time, so it is not judged. The bands are saved in the
 checkpoint, so a resumed scan's map and verdict cover what came before too.
 
+The kernel sees what the scan cannot. A drive that stops answering has its
+command aborted, then the device reset, then the target, and if a retry works
+the scan records one very slow read. The drive this was developed against did
+exactly that while its scan showed no bad sectors:
+
+```
+sd 6:0:2:0: attempting task abort!scmd(...), outstanding for 60255 ms
+sd 6:0:2:0: device reset: FAILED scmd(...)
+sd 6:0:2:0: [sdc] tag#2574 FAILED Result: hostbyte=DID_TIME_OUT
+```
+
+So a scan reads `/dev/kmsg` from the moment it starts, and counts what is logged
+against its drive — matched by name, by SCSI address and by ATA port, since
+most of those lines give only the address. A drive taken offline, or reset three
+or more times, is FAILING; any other reset or timeout, or a medium error the
+scan's own reads got past, is SUSPECT. Timeouts that smartctl's own commands
+provoke count too: a drive that will not answer those is no healthier. Reading
+`/dev/kmsg` needs root; without it the report says the log was not read rather
+than implying it was clean.
+
 Coverage is stated explicitly in every report — "every sector of the device was
 read" versus "SAMPLED" or "PARTIAL" — so a clean verdict is never mistaken for
 more than it is.

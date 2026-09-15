@@ -370,6 +370,39 @@ assert_has "a resumed scan's surface map keeps the bands scanned before" \
 assert_has "a band only microseconds over expectations is not held against it" \
 	"$(bandck 3200)" "VERDICT: HEALTHY"
 
+echo "== what the kernel logged against the drive =="
+
+# A drive that stops answering is aborted, reset and retried by the kernel,
+# and when a retry works the scan sees one slow read and nothing else.  The
+# fixture is the log of a real drive doing that mid-scan; HDDSCAN_KMSG reads it
+# in place of /dev/kmsg, and HDDSCAN_KMSG_HCTL gives the image the address the
+# log's lines name the drive by.
+f=$(image 8 kmsg.bin)
+fx=$PWD/tests/fixtures/kmsg-sas-resets.txt
+out=$(HDDSCAN_KMSG=$fx HDDSCAN_KMSG_HCTL=6:0:2:0 run --json "$TMP/k.json" "$f")
+assert_has "kernel resets and timeouts against the drive are counted" \
+	"$out" "4 resets, 5 command timeouts"
+assert_has "a drive the kernel had to reset repeatedly is FAILING" \
+	"$out" "VERDICT: FAILING - the kernel had to reset the drive 4 times"
+assert_has "the JSON carries the kernel log counts" "$(cat "$TMP/k.json")" \
+	'"resets": 4, "timeouts": 5'
+out=$(HDDSCAN_KMSG=$fx HDDSCAN_KMSG_HCTL=6:0:3:0 run "$f")
+assert_has "another drive's trouble in the same log is not held against it" \
+	"$out" "0 resets, 0 command timeouts"
+assert_has "a drive with nothing logged against it stays HEALTHY" \
+	"$out" "VERDICT: HEALTHY"
+# ATA names a drive by port, and ata51 is not ata5
+printf '%s\n' "ata51: hard resetting link" "ata51: hard resetting link" \
+	"ata51: hard resetting link" \
+	"ata5.00: exception Emask 0x0 SAct 0x0 SErr 0x0 action 0x6 frozen" \
+	"ata5.00: error: { UNC }" > "$TMP/ata.log"
+out=$(HDDSCAN_KMSG=$TMP/ata.log HDDSCAN_KMSG_HCTL=ata5 run "$f")
+assert_has "ATA lines are matched by port, and not by a longer port number" \
+	"$out" "0 resets, 1 command timeouts, 1 medium errors"
+assert_has "one timeout is SUSPECT, not FAILING" "$out" "VERDICT: SUSPECT"
+assert_hasnt "an image with no log to read says nothing about one" \
+	"$(run "$f")" "Kernel log"
+
 echo "== runs outlive the process that started them =="
 
 # A run is a directory of small text records, and everything that reports on

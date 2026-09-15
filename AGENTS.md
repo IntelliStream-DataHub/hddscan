@@ -430,6 +430,14 @@ drive reported that no counters could be read. `tests/fixtures/` holds output
 captured from a failing drive; the suite guards the column positions the parser
 depends on, since the C path itself needs hardware.
 
+The kernel log is the same story. `HDDSCAN_KMSG` makes a scan read a file of
+log lines instead of `/dev/kmsg`, and `HDDSCAN_KMSG_HCTL` gives an image the
+SCSI address (or `ataN` port) those lines name a drive by; they exist for the
+suite and nothing else. `tests/fixtures/kmsg-sas-resets.txt` is a real drive
+being aborted and reset mid-scan. What they cannot reach is the `/dev/kmsg`
+read itself -- one record per `read()`, `EPIPE` when the ring overwrote one --
+and the address taken from sysfs, both of which need root and a real drive.
+
 ## When reporting results
 
 **The report must never contradict itself.** Two numbers describing the same

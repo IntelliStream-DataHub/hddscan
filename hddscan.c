@@ -2646,6 +2646,14 @@ typedef struct {
 	int smr_windows;        /* consecutive collapsed write windows */
 	int stall_warned;       /* said once that retries are eating the run */
 
+	/* what the kernel said about this drive while we scanned: kmsg_poll() */
+	int kmsg_fd;
+	int kmsg_state;         /* KMSG_* */
+	char kmsg_tok[4][80];   /* how kernel messages name this drive */
+	int kmsg_ntok;
+	uint64_t kmsg_last_us;
+	uint64_t k_offline, k_resets, k_timeouts, k_medium;
+
 	/* the throughput floor: see rate_judge() */
 	double rate_floor;      /* bytes/s; 0 when the rule does not apply */
 	double rate_seen;       /* what the scan managed, once it has settled */
@@ -4483,6 +4491,183 @@ static void order_setup(ctx_t *c, uint64_t segment_bytes)
 		c->seg_chunks = c->nchunks;
 }
 
+/*
+ * The kernel's side of the story.  When a drive stops answering, the SCSI
+ * layer aborts the command, resets the device, then the target, and retries --
+ * and if a retry succeeds the scan sees nothing but one very slow read.  The
+ * real record of a drive going wrong is in the kernel log:
+ *
+ *   sd 6:0:2:0: attempting task abort!scmd(...), outstanding for 60255 ms
+ *   sd 6:0:2:0: device reset: FAILED scmd(...)
+ *   sd 6:0:2:0: [sdc] tag#2574 FAILED Result: hostbyte=DID_TIME_OUT
+ *
+ * which is what the slowest drive on the machine this was written on said,
+ * while its scan showed zero bad sectors.  Most of those lines name the drive
+ * only by its SCSI address, and ATA ones only by port, so both are taken from
+ * sysfs alongside the name.
+ *
+ * /dev/kmsg needs root, which a scan of a real drive has anyway.  Opened at
+ * the start and read from its end, so only what happens during this scan
+ * counts -- including anything smartctl's own commands provoked, since a drive
+ * that times out on those is no healthier.  HDDSCAN_KMSG names a file to read
+ * instead, from the top; it exists for the test suite, with HDDSCAN_KMSG_HCTL
+ * standing in for the address an image file does not have.
+ */
+enum { KMSG_OFF, KMSG_UNREADABLE, KMSG_READING, KMSG_DONE };
+
+static void kmsg_tok_add(ctx_t *c, const char *pre, const char *v,
+			 const char *post)
+{
+	if (c->kmsg_ntok < 4 && v && *v)
+		snprintf(c->kmsg_tok[c->kmsg_ntok++], sizeof(c->kmsg_tok[0]),
+			 "%s%s%s", pre, v, post);
+}
+
+static void kmsg_open(ctx_t *c)
+{
+	const char *hook = getenv("HDDSCAN_KMSG");
+	const char *sp = c->dev->syspath;
+	char hctl[32] = "", ata[16] = "", tgt[32] = "";
+
+	c->kmsg_fd = -1;
+	c->kmsg_state = KMSG_OFF;
+	if (c->dev->is_file && !(hook && *hook))
+		return;
+
+	/* .../6:0:2:0/block/sdc -> 6:0:2:0; .../ata5/... -> ata5 */
+	if (hook && *hook && getenv("HDDSCAN_KMSG_HCTL")) {
+		const char *h = getenv("HDDSCAN_KMSG_HCTL");
+
+		if (!strncmp(h, "ata", 3))
+			snprintf(ata, sizeof(ata), "%s", h);
+		else
+			snprintf(hctl, sizeof(hctl), "%s", h);
+	} else if (sp[0]) {
+		const char *b = strstr(sp, "/block/"), *a = strstr(sp, "/ata");
+
+		if (b) {
+			const char *q = b;
+
+			while (q > sp && q[-1] != '/')
+				q--;
+			if (b - q > 0 && b - q < (int)sizeof(hctl) && strchr(q, ':'))
+				snprintf(hctl, sizeof(hctl), "%.*s", (int)(b - q), q);
+		}
+		if (a && a[4] >= '0' && a[4] <= '9')
+			snprintf(ata, sizeof(ata), "%.*s",
+				 (int)strspn(a + 4, "0123456789") + 3, a + 1);
+	}
+	kmsg_tok_add(c, "[", c->dev->name, "]");
+	kmsg_tok_add(c, "sd ", hctl, ":");
+	if (hctl[0]) {
+		/* target6:0:2: -- the address without its LUN */
+		const char *l = strrchr(hctl, ':');
+
+		if (l) {
+			snprintf(tgt, sizeof(tgt), "%.*s", (int)(l - hctl), hctl);
+			kmsg_tok_add(c, "target", tgt, ":");
+		}
+	}
+	kmsg_tok_add(c, "", ata, "");
+
+	if (hook && *hook) {
+		c->kmsg_fd = open(hook, O_RDONLY | O_CLOEXEC);
+	} else {
+		c->kmsg_fd = open("/dev/kmsg", O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+		if (c->kmsg_fd >= 0)
+			lseek(c->kmsg_fd, 0, SEEK_END);
+	}
+	c->kmsg_state = c->kmsg_fd >= 0 ? KMSG_READING : KMSG_UNREADABLE;
+}
+
+static int kmsg_about_us(const ctx_t *c, const char *line)
+{
+	int i;
+
+	for (i = 0; i < c->kmsg_ntok; i++) {
+		const char *t = c->kmsg_tok[i];
+		const char *hit = strstr(line, t);
+
+		if (!hit)
+			continue;
+		/* "ata5" must not match ata51 */
+		if (!strncmp(t, "ata", 3) && t[strlen(t) - 1] != ':' &&
+		    hit[strlen(t)] >= '0' && hit[strlen(t)] <= '9')
+			continue;
+		return 1;
+	}
+	return 0;
+}
+
+static void kmsg_line(ctx_t *c, const char *line)
+{
+	if (!kmsg_about_us(c, line))
+		return;
+	if (strstr(line, "offline device") || strstr(line, "Device offlined") ||
+	    strstr(line, "rejecting I/O to dead device"))
+		c->k_offline++;
+	else if (strstr(line, "attempting device reset") ||
+		 strstr(line, "attempting target reset") ||
+		 strstr(line, "hard resetting link") ||
+		 strstr(line, "COMRESET failed"))
+		c->k_resets++;
+	else if (strstr(line, "attempting task abort") ||
+		 strstr(line, "DID_TIME_OUT") ||
+		 strstr(line, "timing out command") ||
+		 strstr(line, "exception Emask"))
+		c->k_timeouts++;
+	else if (strstr(line, "Medium Error") ||
+		 strstr(line, "Unrecovered read error") ||
+		 strstr(line, "error: { UNC") ||
+		 strstr(line, "critical medium error"))
+		c->k_medium++;
+}
+
+static void kmsg_poll(ctx_t *c, int now)
+{
+	char buf[8192];
+	ssize_t r;
+
+	if (c->kmsg_state != KMSG_READING)
+		return;
+	if (!now && now_us() - c->kmsg_last_us < 2000000ull)
+		return;
+	c->kmsg_last_us = now_us();
+	if (getenv("HDDSCAN_KMSG")) {
+		/* a plain file: lines, read once to the end */
+		FILE *f = fdopen(c->kmsg_fd, "r");
+
+		if (f) {
+			while (fgets(buf, sizeof(buf), f))
+				kmsg_line(c, buf);
+			fclose(f);
+		} else {
+			close(c->kmsg_fd);
+		}
+		c->kmsg_fd = -1;
+		c->kmsg_state = KMSG_DONE;
+		return;
+	}
+	/* one record per read(): "pri,seq,usec,flags;message\n KEY=value..." */
+	for (;;) {
+		r = read(c->kmsg_fd, buf, sizeof(buf) - 1);
+		if (r < 0 && errno == EPIPE)
+			continue;       /* overwritten before we got to it */
+		if (r <= 0)
+			break;
+		buf[r] = 0;
+		kmsg_line(c, buf);
+	}
+}
+
+static void kmsg_close(ctx_t *c)
+{
+	kmsg_poll(c, 1);
+	if (c->kmsg_fd >= 0)
+		close(c->kmsg_fd);
+	c->kmsg_fd = -1;
+}
+
 static void check_temperature(ctx_t *c)
 {
 	long long t;
@@ -4771,6 +4956,7 @@ static void scan_loop(ctx_t *c, int verify_only_pass)
 		}
 
 		check_temperature(c);
+		kmsg_poll(c, 0);
 		progress(c, 0);
 		if (c->state_path && now_us() - last_state > 15000000ull) {
 			state_save(c);
@@ -5011,6 +5197,7 @@ static const char *errname(int e)
  * not a verdict; as a habit it is.  A few are needed before the rate means
  * anything, so a short range is not judged on one.
  */
+#define KMSG_RESETS_FAILING 3  /* a drive reset once may have hiccupped */
 #define OVER_ONE_IN 1000
 #define OVER_MIN 3
 
@@ -5053,6 +5240,17 @@ static int verdict_of(ctx_t *c, const char **why)
 		*why = "the drive has failed its own self-test";
 		return 2;
 	}
+	if (c->k_offline) {
+		*why = "the kernel took the drive offline during the scan";
+		return 2;
+	}
+	if (c->k_resets >= KMSG_RESETS_FAILING) {
+		snprintf(buf, sizeof(buf), "the kernel had to reset the drive %"
+			 PRIu64 " times during the scan: it repeatedly "
+			 "stopped responding", c->k_resets);
+		*why = buf;
+		return 2;
+	}
 	if (c->too_slow) {
 		char b1[32], b2[32];
 		int usb = c->dev->transport == TR_USB;
@@ -5072,6 +5270,20 @@ static int verdict_of(ctx_t *c, const char **why)
 	}
 	if (c->blocks_recovered) {
 		*why = "some reads exceeded the latency budget but recovered on retry";
+		return 1;
+	}
+	if (c->k_resets || c->k_timeouts) {
+		snprintf(buf, sizeof(buf), "the drive stopped answering during the "
+			 "scan: the kernel logged %" PRIu64 " command timeouts or "
+			 "aborts and %" PRIu64 " resets", c->k_timeouts, c->k_resets);
+		*why = buf;
+		return 1;
+	}
+	if (c->k_medium) {
+		snprintf(buf, sizeof(buf), "the kernel logged %" PRIu64 " medium "
+			 "errors against the drive that the scan's own reads got "
+			 "past", c->k_medium);
+		*why = buf;
 		return 1;
 	}
 	if (over_too_often(c->chunks_slow, c->chunks_read)) {
@@ -5300,6 +5512,16 @@ static void report(ctx_t *c)
 	    human_size(secs > 0 ? (uint64_t)((double)(c->bytes_done -
 						      c->bytes_at_start) / secs) : 0,
 		       (char[32]){0}, 32));
+	if (c->kmsg_state == KMSG_UNREADABLE)
+		out("  Kernel log       %snot read%s: /dev/kmsg needs root, so resets "
+		    "and timeouts\n                   during the scan are not "
+		    "part of this verdict\n", c_yel(), c_off());
+	else if (c->kmsg_state != KMSG_OFF)
+		out("  Kernel log       %s%" PRIu64 " resets, %" PRIu64 " command "
+		    "timeouts, %" PRIu64 " medium errors%s%s against this drive\n",
+		    c->k_resets || c->k_timeouts || c->k_offline ? c_red() :
+		    c->k_medium ? c_yel() : "", c->k_resets, c->k_timeouts,
+		    c->k_medium, c->k_offline ? ", taken offline" : "", c_off());
 	if (c->too_slow)
 		out("  %sToo slow%s         %s/s against a floor of %s/s at %zu KiB "
 		    "chunks (--min-rate)\n", c_red(), c_off(),
@@ -5690,6 +5912,12 @@ static void write_json(ctx_t *c, const char *path)
 	fprintf(f, "  \"rate_bytes_per_s\": %.0f,\n", c->rate_seen);
 	fprintf(f, "  \"rate_floor_bytes_per_s\": %.0f,\n", c->rate_floor);
 	fprintf(f, "  \"too_slow\": %s,\n", c->too_slow ? "true" : "false");
+	if (c->kmsg_state != KMSG_OFF)
+		fprintf(f, "  \"kernel_log\": {\"read\": %s, \"resets\": %" PRIu64
+			", \"timeouts\": %" PRIu64 ", \"medium_errors\": %" PRIu64
+			", \"offline\": %" PRIu64 "},\n",
+			c->kmsg_state == KMSG_UNREADABLE ? "false" : "true",
+			c->k_resets, c->k_timeouts, c->k_medium, c->k_offline);
 	fprintf(f, "  \"protection_type\": %d,\n", c->dev->prot_type);
 	fprintf(f, "  \"protection_refused_bytes\": %" PRIu64 ",\n", c->prot_bytes);
 	fprintf(f, "  \"complete\": %s,\n",
@@ -6533,6 +6761,7 @@ static int scan_device(device_t *d, const opts_t *o, const char *json_path,
 	c.pos = c.start;
 	order_setup(&c, o->segment);
 
+	kmsg_open(&c);
 	if (!o->no_smart)
 		smart_read(d, &c.smart_before);
 	if (c.smart_before.have && c.smart_before.temp_c > 0) {
@@ -6836,6 +7065,7 @@ static int scan_device(device_t *d, const opts_t *o, const char *json_path,
 	field_restore_all();
 	close(c.fd);
 	c.fd = -1;
+	kmsg_close(&c);
 
 	report(&c);
 	if (json_path)
