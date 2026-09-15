@@ -304,21 +304,21 @@ reads eight times the chunk size — and tells you what it found:
 A disk spins at a fixed rate, so an outer track sweeps further per revolution
 and — with zone bit recording putting more sectors there — reads roughly twice
 as fast as one at the inner edge. A single budget for the whole device is
-therefore loose on the outside and tight on the inside: the same 44 ms means
-five times the local median at LBA 0 and only three times it at the end.
+therefore loose on the outside and tight on the inside: the same 26 ms means
+four times the local median at LBA 0 and barely twice it at the end.
 
 So the budget follows the gradient. Calibration already samples eight anchors
 spread across the device; the budget is interpolated between them, keeping the
 same margin relative to what a read *at that position* is expected to cost:
 
 ```
-  calibrated: median 128 KiB read 8.81 ms -> budget 44.1 ms chunk / 44.1 ms sector
+  calibrated: median 128 KiB read 8.81 ms -> budget 26.4 ms chunk / 26.4 ms sector
   the budget follows the platter: 6.20 ms per chunk at the outer edge,
   11.40 ms at the inner, so the same margin applies everywhere
 ```
 
 ```
-  Latency budget   31.0 ms where the platter is quickest to 57.0 ms where it is
+  Latency budget   25.0 ms where the platter is quickest to 34.2 ms where it is
                    slowest, following the drive's own gradient (auto-calibrated)
 ```
 
@@ -328,6 +328,14 @@ itself over a bad region and normalise away the exact thing the scan exists to
 find. The gradient is physics, measured once, and smooth. And it never bends a
 threshold you gave by hand: `--chunk-slow-ms 25` means 25 ms everywhere.
 
+The multiple is three by default (`--auto-factor`). A chunk that takes three
+times what a read at that position should cost has something inside it worth
+looking at, and on a drive whose worst reads sit at four or five times its
+median a looser multiple reported nothing at all. Going over the chunk budget
+only costs a drill-down; a sector is still counted slow only if it is over the
+sector budget itself. `--floor-ms` still sits underneath, so a very fast
+drive's budget never drops into the rotational noise.
+
 Invariant 1 still holds pointwise — the chunk budget is clamped to the sector
 budget at each position, not just on average.
 
@@ -335,8 +343,8 @@ The guarantee is unchanged at any chunk size — a chunk is still never faster
 than its slowest sector, and drill-down still resolves to 4 KiB. What does
 change is **what the scan can see**. The budget is calibrated as a multiple of
 the median chunk, so a bigger chunk raises the bar a sector has to clear before
-anyone looks at it: on a 7200 rpm drive 128 KiB calibrates to about 44 ms,
-1 MiB to about 110 ms, 4 MiB to around 150 ms. A sector taking 100 ms is found
+anyone looks at it: on a 7200 rpm drive 128 KiB calibrates to about 26 ms,
+1 MiB to about 66 ms, 4 MiB to around 90 ms. A sector taking 80 ms is found
 by the first and hides inside the last. The scan says so up front rather than
 leaving you to work it out:
 

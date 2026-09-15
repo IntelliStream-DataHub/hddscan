@@ -78,8 +78,8 @@ The budget scales with
 .BR --chunk .
 It is a multiple of the measured median chunk, so a larger chunk is much faster
 but raises the bar a sector must clear before anything looks at it. On a
-7200 rpm drive, 128 KiB calibrates to roughly 44 ms and 4 MiB to roughly
-150 ms; a sector taking 100 ms is found by the first and hidden by the second.
+7200 rpm drive, 128 KiB calibrates to roughly 26 ms and 4 MiB to roughly
+90 ms; a sector taking 60 ms is found by the first and hidden by the second.
 The scan states the resulting sensitivity before it starts.
 .BR --sector-slow-ms
 pins the sector budget independently, at the cost of drilling into more chunks.
@@ -323,7 +323,7 @@ never exceed this, since a looser chunk budget would let slow sectors hide
 inside chunks that are never examined.
 .TP
 .BI \-\-auto\-factor " F"
-Automatic budget is F times the measured median. Default 5.
+Automatic budget is F times the measured median. Default 3.
 .TP
 .BI \-\-floor\-ms " MS"
 The automatic budget never goes below this. Default 25, plus an allowance for

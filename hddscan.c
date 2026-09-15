@@ -5900,7 +5900,7 @@ static void usage(void)
 "Latency budget\n"
 "  --chunk-slow-ms MS     chunk budget; over this we drill into sectors\n"
 "  --sector-slow-ms MS    sector budget; over this we retry the sector\n"
-"  --auto-factor F        auto budget = F x measured median (default 5)\n"
+"  --auto-factor F        auto budget = F x measured median (default 3)\n"
 "  --floor-ms MS          auto budget never goes below this (default 25)\n"
 "  --retries N            re-reads of a suspicious sector (default 20).  A\n"
 "                         sector that is merely weak often reads back fine\n"
@@ -9300,7 +9300,7 @@ int main(int argc, char **argv)
 	o.rd_retries = o.wr_retries = -1;
 	o.segment = 1024ull * 1024 * 1024;
 	o.bb_blocksize = 1024;
-	o.auto_factor = 5.0;
+	o.auto_factor = 3.0;
 	o.floor_ms = 25.0;
 	o.max_temp = 58;
 	o.map_width = 64;
