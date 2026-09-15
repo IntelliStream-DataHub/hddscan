@@ -846,6 +846,17 @@ provoke count too: a drive that will not answer those is no healthier. Reading
 `/dev/kmsg` needs root; without it the report says the log was not read rather
 than implying it was clean.
 
+SMART is read before and after the scan, and what *moved* in between counts
+for more than any lifetime total. Uncorrectable errors (187, 198), end-to-end
+errors (184) or SAS uncorrected read and write errors growing during the scan
+are FAILING: the drive itself admits it could not deliver data. Command
+timeouts (188) growing, a SAS grown defect list growing, or SAS delayed
+corrections and rereads at one or more per gigabyte read (and at least ten) are
+SUSPECT. The SAS drive this was developed against had 1007 delayed corrections
+over its whole life and none during its scan; a failing one reports tens per
+gigabyte. Two lifetime counters are SUSPECT on their own, because a healthy
+drive never has them: spin-up retries (10) and end-to-end errors (184).
+
 Coverage is stated explicitly in every report — "every sector of the device was
 read" versus "SAMPLED" or "PARTIAL" — so a clean verdict is never mistaken for
 more than it is.

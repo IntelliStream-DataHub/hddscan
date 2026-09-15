@@ -403,6 +403,74 @@ assert_has "one timeout is SUSPECT, not FAILING" "$out" "VERDICT: SUSPECT"
 assert_hasnt "an image with no log to read says nothing about one" \
 	"$(run "$f")" "Kernel log"
 
+echo "== SMART counters that move during the scan =="
+
+# A scan reads SMART before and after.  HDDSCAN_SMARTCTL runs a stand-in that
+# serves one captured report per call, so the verdict can be tested against
+# counters that move -- which needs a drive going wrong, and no image does.
+f=$(image 8 smart.bin)
+cat > "$TMP/smartctl" <<'EOF'
+#!/bin/sh
+d=$(dirname "$0"); n=$(cat "$d/smart.n" 2>/dev/null || echo 0)
+n=$((n + 1)); echo $n > "$d/smart.n"
+if [ -f "$d/smart.$n" ]; then cat "$d/smart.$n"; else cat "$d/smart.2"; fi
+EOF
+chmod +x "$TMP/smartctl"
+# ata REALLOC SPIN_RETRY END_TO_END REPORTED_UNCORRECT COMMAND_TIMEOUT
+ata() {
+	printf 'SMART overall-health self-assessment test result: PASSED\n'
+	printf '%3d %s 0x0033 100 100 010 Pre-fail Always - %s\n' \
+		5 Reallocated_Sector_Ct "$1" 10 Spin_Retry_Count "$2" \
+		184 End-to-End_Error "$3" 187 Reported_Uncorrect "$4" \
+		188 Command_Timeout "$5"
+}
+# sas GROWN_DEFECTS READ_DELAYED READ_GB READ_UNCORRECTED
+sas() {
+	printf 'SMART Health Status: OK\n\nElements in grown defect list: %s\n\n' "$1"
+	printf 'Error counter log:\n'
+	printf 'read:          0 %s         0  1007   1007     %s           %s\n' \
+		"$2" "$3" "$4"
+	printf 'write:         0        0         0         0     103400     233851.148           0\n'
+}
+smart() {
+	rm -f "$TMP/smart.n"
+	HDDSCAN_SMARTCTL=$TMP/smartctl run "$f"
+}
+ata 0 0 0 0 0 > "$TMP/smart.1"; ata 0 0 0 0 0 > "$TMP/smart.2"
+assert_has "SMART counters that do not move leave a drive HEALTHY" \
+	"$(smart)" "VERDICT: HEALTHY"
+ata 0 0 0 0 0 > "$TMP/smart.1"; ata 0 0 0 0 2 > "$TMP/smart.2"
+assert_has "command timeouts (188) growing during the scan are SUSPECT" \
+	"$(smart)" "VERDICT: SUSPECT - the drive counted 2 command timeouts"
+ata 0 0 0 0 0 > "$TMP/smart.1"; ata 0 0 0 1 0 > "$TMP/smart.2"
+assert_has "reported uncorrectable (187) growing during the scan is FAILING" \
+	"$(smart)" "VERDICT: FAILING - the drive's own counters recorded 1"
+ata 0 0 0 0 0 > "$TMP/smart.1"; ata 0 0 4 0 0 > "$TMP/smart.2"
+assert_has "end-to-end errors (184) growing during the scan are FAILING" \
+	"$(smart)" "VERDICT: FAILING"
+ata 0 3 0 0 0 > "$TMP/smart.1"; ata 0 3 0 0 0 > "$TMP/smart.2"
+out=$(smart)
+assert_has "a drive that has needed spin-up retries (10) is SUSPECT" \
+	"$out" "retries to spin up"
+assert_has "the report lists spin retries" "$out" "spin retries (10)"
+sas 1 1007 1000.000 0 > "$TMP/smart.1"; sas 1 1007 1010.000 0 > "$TMP/smart.2"
+assert_has "a SAS drive whose counters stay put is HEALTHY" \
+	"$(smart)" "VERDICT: HEALTHY"
+sas 1 1007 1000.000 0 > "$TMP/smart.1"; sas 3 1007 1010.000 0 > "$TMP/smart.2"
+out=$(smart)
+assert_has "a SAS grown defect list growing during the scan is SUSPECT" \
+	"$out" "the drive reallocated during the scan"
+assert_has "the report shows the grown defect list" "$out" "grown defect list"
+sas 1 1007 1000.000 0 > "$TMP/smart.1"; sas 1 1107 1010.000 0 > "$TMP/smart.2"
+assert_has "SAS delayed corrections at one or more per GB read are SUSPECT" \
+	"$(smart)" "delayed corrections or rereads 100 times during the scan"
+sas 1 1007 1000.000 0 > "$TMP/smart.1"; sas 1 1012 1010.000 0 > "$TMP/smart.2"
+assert_has "a few SAS delayed corrections are not held against a drive" \
+	"$(smart)" "VERDICT: HEALTHY"
+sas 1 1007 1000.000 0 > "$TMP/smart.1"; sas 1 1007 1010.000 2 > "$TMP/smart.2"
+assert_has "SAS uncorrected read errors growing during the scan are FAILING" \
+	"$(smart)" "VERDICT: FAILING"
+
 echo "== runs outlive the process that started them =="
 
 # A run is a directory of small text records, and everything that reports on

@@ -1860,6 +1860,10 @@ typedef struct {
 	long long crc_err;
 	long long reported_uncorr;
 	long long seek_err;
+	long long spin_retry;   /* 10; this and the next three are -1 when absent */
+	long long e2e_err;      /* 184: data corrupted on the drive's own path */
+	long long cmd_timeout;  /* 188 */
+	long long grown;        /* SAS: elements in grown defect list */
 	long long power_on_hours;
 	long long temp_c;
 	long long start_stop;
@@ -2020,14 +2024,18 @@ static int have_smartctl(void)
 
 static int smart_read(const device_t *d, smart_t *s)
 {
-	char cmd[256], line[1024];
+	char cmd[PATH_MAX + 64], line[1024];
+	const char *hook;
 	FILE *p;
 
 	memset(s, 0, sizeof(*s));
 	s->temp_c = -1;
 	s->rcd = s->dra = s->wce = s->awre = s->arre = -1;
 	s->recovery_time_ms = -1;
-	if (d->is_file || !have_smartctl() || !name_ok(d->name))
+	s->spin_retry = s->e2e_err = s->cmd_timeout = s->grown = -1;
+	hook = getenv("HDDSCAN_SMARTCTL");
+	if (!(hook && *hook) &&
+	    (d->is_file || !have_smartctl() || !name_ok(d->name)))
 		return -1;
 
 	/*
@@ -2038,9 +2046,17 @@ static int smart_read(const device_t *d, smart_t *s)
 	 * already the attribute table and the extra logs only add lines for
 	 * the attribute parser to trip over.
 	 */
-	snprintf(cmd, sizeof(cmd), "smartctl -H -A -i%s /dev/%s 2>/dev/null",
-		 d->transport == TR_SCSI ? " -l error -l selftest" : "",
-		 d->name);
+	/*
+	 * HDDSCAN_SMARTCTL runs a command in its place, for any device an
+	 * image included: the suite's stand-in prints one captured report per
+	 * call, so the verdict can be tested against counters that move.
+	 */
+	if (hook && *hook)
+		snprintf(cmd, sizeof(cmd), "%s 2>/dev/null", hook);
+	else
+		snprintf(cmd, sizeof(cmd), "smartctl -H -A -i%s /dev/%s 2>/dev/null",
+			 d->transport == TR_SCSI ? " -l error -l selftest" : "",
+			 d->name);
 	p = popen(cmd, "re");
 	if (!p)
 		return -1;
@@ -2073,6 +2089,11 @@ static int smart_read(const device_t *d, smart_t *s)
 				 trim(st));
 			if (strstr(line, "Failed"))
 				s->selftest_failed = 1;
+			s->have = 1;
+			continue;
+		}
+		if (!strncmp(line, "Elements in grown defect list:", 30)) {
+			s->grown = strtoll(line + 30, NULL, 10);
 			s->have = 1;
 			continue;
 		}
@@ -2136,6 +2157,9 @@ static int smart_read(const device_t *d, smart_t *s)
 			switch (id) {
 			case 5:   s->realloc_ct = raw; break;
 			case 7:   s->seek_err = raw; break;
+			case 10:  s->spin_retry = raw; break;
+			case 184: s->e2e_err = raw; break;
+			case 188: s->cmd_timeout = raw; break;
 			case 9:   s->power_on_hours = raw; break;
 			case 4:   s->start_stop = raw; break;
 			case 187: s->reported_uncorr = raw; break;
@@ -5206,15 +5230,52 @@ static int over_too_often(uint64_t over, uint64_t of)
 	return over >= OVER_MIN && over > of / OVER_ONE_IN;
 }
 
+/* how far a SMART counter moved during the scan; 0 if either end is missing */
+static long long grew(long long before, long long after)
+{
+	return before >= 0 && after > before ? after - before : 0;
+}
+
+/*
+ * SAS keeps no reallocation attribute, but it counts what reallocation and
+ * recovery cost it.  "Corrected with delay" and "rereads/rewrites" are reads
+ * the firmware only got back by working for them -- the slow read, seen from
+ * inside.  A healthy drive gathers a handful over its life (1007 on the SAS
+ * drive this was developed against, none of them during its scan); a failing
+ * one reports tens per gigabyte.  One per gigabyte the scan read, and at
+ * least ten, is the firmware fighting the media.
+ */
+#define SAS_DELAYED_MIN 10
+
+static long long sas_delayed(const ctx_t *c, double *per_gb)
+{
+	const smart_t *b = &c->smart_before, *a = &c->smart_after;
+	long long n = grew(b->rd_delayed, a->rd_delayed) +
+		      grew(b->rd_reread, a->rd_reread);
+	double gb = a->rd_gb - b->rd_gb;
+
+	if (gb <= 0)
+		gb = (double)(c->bytes_done - c->bytes_at_start) / 1e9;
+	*per_gb = gb > 0 ? (double)n / gb : 0;
+	return n;
+}
+
 static int verdict_of(ctx_t *c, const char **why)
 {
 	static char buf[200];
 	long long d_realloc = 0, d_pending = 0, d_uncorr = 0;
+	long long d_smart_uncorr = 0, d_timeouts = 0;
+	const smart_t *s0 = &c->smart_before, *sa = &c->smart_after;
 
-	if (c->smart_before.have && c->smart_after.have) {
-		d_realloc = c->smart_after.realloc_ct - c->smart_before.realloc_ct;
-		d_pending = c->smart_after.pending - c->smart_before.pending;
-		d_uncorr = c->smart_after.offline_uncorr - c->smart_before.offline_uncorr;
+	if (s0->have && sa->have) {
+		d_realloc = sa->realloc_ct - s0->realloc_ct + grew(s0->grown, sa->grown);
+		d_pending = sa->pending - s0->pending;
+		d_uncorr = sa->offline_uncorr - s0->offline_uncorr;
+		d_smart_uncorr = grew(s0->reported_uncorr, sa->reported_uncorr) +
+				 grew(s0->e2e_err, sa->e2e_err) +
+				 grew(s0->rd_uncorr, sa->rd_uncorr) +
+				 grew(s0->wr_uncorr, sa->wr_uncorr);
+		d_timeouts = grew(s0->cmd_timeout, sa->cmd_timeout);
 	}
 
 	if (c->spares_exhausted) {
@@ -5223,6 +5284,13 @@ static int verdict_of(ctx_t *c, const char **why)
 	}
 	if (c->blocks_bad || c->blocks_corrupt || d_uncorr > 0) {
 		*why = "unreadable or corrupted sectors were found";
+		return 2;
+	}
+	if (d_smart_uncorr > 0) {
+		snprintf(buf, sizeof(buf), "the drive's own counters recorded %lld "
+			 "uncorrectable or end-to-end errors during the scan",
+			 d_smart_uncorr);
+		*why = buf;
 		return 2;
 	}
 	if (c->smart_after.have && c->smart_after.health[0] &&
@@ -5271,6 +5339,25 @@ static int verdict_of(ctx_t *c, const char **why)
 	if (c->blocks_recovered) {
 		*why = "some reads exceeded the latency budget but recovered on retry";
 		return 1;
+	}
+	if (d_timeouts > 0) {
+		snprintf(buf, sizeof(buf), "the drive counted %lld command timeouts "
+			 "(SMART 188) during the scan", d_timeouts);
+		*why = buf;
+		return 1;
+	}
+	if (s0->have && sa->have) {
+		double per_gb;
+		long long n = sas_delayed(c, &per_gb);
+
+		if (n >= SAS_DELAYED_MIN && per_gb >= 1.0) {
+			snprintf(buf, sizeof(buf), "the drive needed delayed "
+				 "corrections or rereads %lld times during the scan, "
+				 "%.0f per GB read: the firmware fighting the media",
+				 n, per_gb);
+			*why = buf;
+			return 1;
+		}
 	}
 	if (c->k_resets || c->k_timeouts) {
 		snprintf(buf, sizeof(buf), "the drive stopped answering during the "
@@ -5323,6 +5410,19 @@ static int verdict_of(ctx_t *c, const char **why)
 	    (c->smart_after.pending || c->smart_after.offline_uncorr ||
 	     c->smart_after.reported_uncorr)) {
 		*why = "SMART reports pending or uncorrectable sectors from before this scan";
+		return 1;
+	}
+	if (sa->have && sa->e2e_err > 0) {
+		snprintf(buf, sizeof(buf), "SMART reports %lld end-to-end errors "
+			 "(184) from before this scan: data corrupted on the "
+			 "drive's own internal path", sa->e2e_err);
+		*why = buf;
+		return 1;
+	}
+	if (sa->have && sa->spin_retry > 0) {
+		snprintf(buf, sizeof(buf), "SMART reports the drive has needed %lld "
+			 "retries to spin up (10)", sa->spin_retry);
+		*why = buf;
 		return 1;
 	}
 	if (c->chunks_slow || c->writes_slow) {
@@ -5660,6 +5760,18 @@ static void report(ctx_t *c)
 					 c->smart_before.crc_err,
 					 c->smart_after.crc_err,
 					 c->smart_after.have);
+			print_smart_line("spin retries (10)",
+					 c->smart_before.spin_retry,
+					 c->smart_after.spin_retry,
+					 c->smart_after.have);
+			print_smart_line("end-to-end errors (184)",
+					 c->smart_before.e2e_err,
+					 c->smart_after.e2e_err,
+					 c->smart_after.have);
+			print_smart_line("command timeouts (188)",
+					 c->smart_before.cmd_timeout,
+					 c->smart_after.cmd_timeout,
+					 c->smart_after.have);
 		} else if (!c->smart_before.sas) {
 			out("    %sno sector counters were read from this drive%s\n"
 			    "    neither the ATA attribute table nor the SCSI error "
@@ -5688,6 +5800,9 @@ static void report(ctx_t *c)
 
 		out("\n  --- SAS error counter log ---\n");
 		out("    %-34s %12s %12s\n", "", "before", "after");
+		if (b0->grown >= 0)
+			out("    %-34s %12lld %12lld\n", "grown defect list",
+			    b0->grown, a->grown);
 		out("    %-34s %12lld %12lld\n", "read: corrected with delays",
 		    b0->rd_delayed, a->rd_delayed);
 		out("    %-34s %12lld %12lld\n", "read: rereads/rewrites needed",
@@ -5976,6 +6091,10 @@ static void write_json(ctx_t *c, const char *path)
 			"\"offline_uncorrectable_after\": %lld,\n",
 			c->smart_before.offline_uncorr, c->smart_after.offline_uncorr);
 		fprintf(f, "    \"crc_errors\": %lld,\n", c->smart_after.crc_err);
+		fprintf(f, "    \"spin_retries\": %lld, \"end_to_end_errors\": %lld, "
+			"\"command_timeouts\": %lld, \"grown_defects\": %lld,\n",
+			c->smart_after.spin_retry, c->smart_after.e2e_err,
+			c->smart_after.cmd_timeout, c->smart_after.grown);
 		fprintf(f, "    \"temperature_max_c\": %lld\n  },\n", c->temp_max);
 	}
 	fprintf(f, "  \"findings\": [\n");

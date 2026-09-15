@@ -438,6 +438,12 @@ being aborted and reset mid-scan. What they cannot reach is the `/dev/kmsg`
 read itself -- one record per `read()`, `EPIPE` when the ring overwrote one --
 and the address taken from sysfs, both of which need root and a real drive.
 
+`HDDSCAN_SMARTCTL` does the same for SMART: it runs a command in place of
+`smartctl`, for any device including an image, and the suite's stand-in serves
+a before and an after report so counters can be seen to move. It proves the
+parser and the verdict, not smartmontools' real layout on real drives -- that
+is still what the captured fixtures are for.
+
 ## When reporting results
 
 **The report must never contradict itself.** Two numbers describing the same

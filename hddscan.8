@@ -573,7 +573,8 @@ Print the version and exit.
 Healthy. Every sector returned data within the latency budget.
 .TP
 .B 1
-Suspect. Sectors needed retries, SMART counters moved during the scan, the
+Suspect. Sectors needed retries, reallocations, command timeouts or SAS delayed
+corrections grew during the scan, the drive has needed spin-up retries, the
 kernel logged a timeout or reset against the drive, a band of
 the surface read at more than twice what calibration expected there, or more
 than one chunk read or write in a thousand went over the latency budget.
@@ -581,8 +582,9 @@ than one chunk read or write in a thousand went over the latency budget.
 .B 2
 Failing, or a usage error. A drive that tested under
 .BR \-\-min\-rate ,
-or that the kernel took offline or reset three or more times during the scan,
-is failing too.
+that the kernel took offline or reset three or more times during the scan, or
+whose own uncorrectable or end-to-end error counters grew during it, is failing
+too.
 .TP
 .B 130
 Interrupted.
