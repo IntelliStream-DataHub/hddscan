@@ -574,7 +574,8 @@ Print the version and exit.
 Healthy. Every sector returned data within the latency budget.
 .TP
 .B 1
-Suspect. Sectors needed retries, reallocations, command timeouts or SAS delayed
+Suspect. Sectors were unreadable or needed retries; uncorrectable errors,
+reallocations, command timeouts or SAS delayed
 corrections grew during the scan, the drive has needed spin-up retries, the
 kernel logged a timeout or reset against the drive, a band of
 the surface read at more than twice what calibration expected there, the drive
@@ -587,9 +588,10 @@ than one chunk read or write in a thousand went over the latency budget.
 Failing, or a usage error. A drive that tested under
 .BR \-\-min\-rate ,
 that disappeared mid-scan, that the kernel took offline or reset three or more
-times during the scan, or
-whose own uncorrectable or end-to-end error counters grew during it, is failing
-too.
+times during the scan, whose end-to-end error counter grew during it, that
+returned the wrong data, or that could not read a sector even after writing it,
+is failing too. Unreadable sectors on their own are not: they make a drive
+suspect until a write shows whether it can still remap them.
 .TP
 .B 130
 Interrupted.

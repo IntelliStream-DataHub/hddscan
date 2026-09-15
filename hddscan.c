@@ -2639,6 +2639,16 @@ typedef struct {
 	uint64_t blocks_unstable;
 	uint64_t blocks_corrupt;
 	uint64_t blocks_fixed;          /* read fast again after we rewrote them */
+	/*
+	 * Unreadable is not the same as unrepairable.  Every drive grows a few
+	 * uncorrectable sectors, and a write is what makes the firmware remap
+	 * them -- a couple of hundred can be a drive with years left.  The one
+	 * that is failing is the one where the write did not help: the sector
+	 * is still unreadable after being written this run, or the drive has
+	 * nowhere left to put it (spares_exhausted).
+	 */
+	uint64_t blocks_unrepaired;
+	int drill_written;      /* the chunk being drilled was just written */
 	long long realloc_delta;        /* sectors the firmware moved, per SMART */
 	uint64_t sas_reassigned;
 	int spares_exhausted;
@@ -3669,8 +3679,11 @@ static void analyze_block(ctx_t *c, uint64_t off, size_t len, void *buf,
 		sorted_med = lat[n_lat / 2];
 	}
 
-	if (errors == attempts)
+	if (errors == attempts) {
 		st = ST_BAD;
+		if (c->drill_written)
+			c->blocks_unrepaired++;
+	}
 	else if (errors > 0)
 		st = ST_UNSTABLE;
 	else if (n_lat && lat[0] > block_thr_at(c, off))
@@ -3756,6 +3769,8 @@ static void analyze_block(ctx_t *c, uint64_t off, size_t len, void *buf,
 					    rus > block_thr_at(c, off))
 						ok = 0;
 				}
+				if (!ok && st == ST_BAD)
+					c->blocks_unrepaired++;
 				if (ok) {
 					if (f)
 						f->fixed_by_rewrite = 1;
@@ -4269,6 +4284,7 @@ static void state_save(ctx_t *c)
 		c->blocks_unstable, c->blocks_fixed, c->hard_errors, c->retry_ios);
 	fprintf(f, "writes %" PRIu64 " %" PRIu64 "\n", c->writes_done,
 		c->writes_slow);
+	fprintf(f, "unrepaired %" PRIu64 "\n", c->blocks_unrepaired);
 	if (c->slow_secs)
 		fprintf(f, "slowstretch %" PRIu64 " %.0f %" PRIu64 "\n",
 			c->slow_secs, c->slow_worst, c->slow_worst_pos);
@@ -4347,6 +4363,8 @@ static int state_load(ctx_t *c)
 		} else if (!strncmp(line, "slowstretch ", 12)) {
 			sscanf(line + 12, "%" SCNu64 " %lf %" SCNu64, &c->slow_secs,
 			       &c->slow_worst, &c->slow_worst_pos);
+		} else if (!strncmp(line, "unrepaired ", 11)) {
+			c->blocks_unrepaired = strtoull(line + 11, NULL, 10);
 		} else if (!strncmp(line, "writes ", 7)) {
 			sscanf(line + 7, "%" SCNu64 " %" SCNu64,
 			       &c->writes_done, &c->writes_slow);
@@ -4956,9 +4974,21 @@ static void scan_loop(ctx_t *c, int verify_only_pass)
 			}
 		}
 
-		/* ---- write phase ---- */
+		/*
+		 * ---- write phase ----
+		 * A destructive pass writes the chunk even when the read before
+		 * it failed.  The read only times the drive and the data is
+		 * about to be overwritten anyway, and an unreadable sector is
+		 * exactly the one that needs a write: it is what makes the
+		 * firmware remap it, and the drill-down after it then says
+		 * whether that worked.  Verify mode cannot, for the reason
+		 * prot_write gives.
+		 */
+		c->drill_written = verify_only_pass && c->mode == MODE_WRITE;
 		if (!verify_only_pass && mode_writes(c->mode) &&
-		    (r == (ssize_t)len || prot_write)) {
+		    (r == (ssize_t)len || prot_write ||
+		     (c->mode == MODE_WRITE && r != (ssize_t)len))) {
+			c->drill_written = 1;
 			uint64_t wus = 0, rus = 0;
 			int werr = 0;
 			ssize_t w;
@@ -5384,7 +5414,7 @@ static int verdict_of(ctx_t *c, const char **why)
 {
 	static char buf[200];
 	long long d_realloc = 0, d_pending = 0, d_uncorr = 0;
-	long long d_smart_uncorr = 0, d_timeouts = 0;
+	long long d_smart_uncorr = 0, d_timeouts = 0, d_e2e = 0;
 	const smart_t *s0 = &c->smart_before, *sa = &c->smart_after;
 
 	if (s0->have && sa->have) {
@@ -5392,9 +5422,9 @@ static int verdict_of(ctx_t *c, const char **why)
 		d_pending = sa->pending - s0->pending;
 		d_uncorr = sa->offline_uncorr - s0->offline_uncorr;
 		d_smart_uncorr = grew(s0->reported_uncorr, sa->reported_uncorr) +
-				 grew(s0->e2e_err, sa->e2e_err) +
 				 grew(s0->rd_uncorr, sa->rd_uncorr) +
 				 grew(s0->wr_uncorr, sa->wr_uncorr);
+		d_e2e = grew(s0->e2e_err, sa->e2e_err);
 		d_timeouts = grew(s0->cmd_timeout, sa->cmd_timeout);
 	}
 
@@ -5406,14 +5436,23 @@ static int verdict_of(ctx_t *c, const char **why)
 		*why = "the drive can no longer reallocate: its spare sectors are gone";
 		return 2;
 	}
-	if (c->blocks_bad || c->blocks_corrupt || d_uncorr > 0) {
-		*why = "unreadable or corrupted sectors were found";
+	if (c->blocks_unrepaired) {
+		snprintf(buf, sizeof(buf), "%" PRIu64 " sector%s stayed unreadable "
+			 "after being rewritten: the drive cannot repair %s",
+			 c->blocks_unrepaired, c->blocks_unrepaired == 1 ? "" : "s",
+			 c->blocks_unrepaired == 1 ? "it" : "them");
+		*why = buf;
 		return 2;
 	}
-	if (d_smart_uncorr > 0) {
-		snprintf(buf, sizeof(buf), "the drive's own counters recorded %lld "
-			 "uncorrectable or end-to-end errors during the scan",
-			 d_smart_uncorr);
+	/* wrong data is not an unreadable sector: the drive lied about it */
+	if (c->blocks_corrupt) {
+		*why = "sectors returned data that did not match what was written";
+		return 2;
+	}
+	if (d_e2e > 0) {
+		snprintf(buf, sizeof(buf), "the drive recorded %lld end-to-end "
+			 "errors (184) during the scan: data corrupted on its own "
+			 "internal path", d_e2e);
 		*why = buf;
 		return 2;
 	}
@@ -5455,6 +5494,23 @@ static int verdict_of(ctx_t *c, const char **why)
 			 usb ? "; a USB 2 link alone can be that slow" : "");
 		*why = buf;
 		return usb ? 1 : 2;
+	}
+	if (c->blocks_bad) {
+		snprintf(buf, sizeof(buf), "%" PRIu64 " unreadable sector%s%s",
+			 c->blocks_bad, c->blocks_bad == 1 ? "" : "s",
+			 c->force_remap ?
+			 ", all of which read back after being rewritten" :
+			 "; a write pass will show whether the drive can remap "
+			 "them");
+		*why = buf;
+		return 1;
+	}
+	if (d_uncorr > 0 || d_smart_uncorr > 0) {
+		snprintf(buf, sizeof(buf), "the drive's own counters recorded %lld "
+			 "uncorrectable errors during the scan", d_uncorr +
+			 d_smart_uncorr);
+		*why = buf;
+		return 1;
 	}
 	if (c->blocks_unstable || c->blocks_slow || d_realloc > 0 || d_pending > 0) {
 		*why = "sectors needed retries or the drive reallocated during the scan";
@@ -6103,10 +6159,19 @@ no_modes:	;
 		    " cover the device -- and destroy everything on it. So would\n"
 		    " reformatting without protection ('sg_format --fmtpinfo=0').\n");
 	}
-	if (v == 2)
+	if (v == 2 && c->blocks_unrepaired)
 		out(" Do not trust this drive with data. Copy anything valuable off it now,\n"
-		    " then replace it. A full destructive write pass can force the drive to\n"
-		    " remap the bad sectors, but reallocation growth means the media is going.\n");
+		    " then replace it. Writing over those sectors did not make them readable,\n"
+		    " so the drive can no longer remap its way out of them.\n");
+	else if (v == 2)
+		out(" Do not trust this drive with data. Copy anything valuable off it now,\n"
+		    " then replace it.\n");
+	else if (v == 1 && c->blocks_bad && !c->force_remap)
+		out(" Unreadable sectors are not by themselves a failing drive: every drive\n"
+		    " grows some, and writing them is what makes the firmware remap them.\n"
+		    " Run a write pass (--profile predeploy on an empty drive, or --repair)\n"
+		    " to find out whether this one still can. If they stay unreadable after\n"
+		    " being written, it is failing.\n");
 	else if (v == 1)
 		out(" The drive works but showed weak spots. Re-run the scan in a few days;\n"
 		    " if the same offsets are slow again, or SMART counters keep growing,\n"
@@ -6202,6 +6267,7 @@ static void write_json(ctx_t *c, const char *path)
 	fprintf(f, "    \"sectors_unstable\": %" PRIu64 ",\n", c->blocks_unstable);
 	fprintf(f, "    \"sectors_slow\": %" PRIu64 ",\n", c->blocks_slow);
 	fprintf(f, "    \"sectors_bad\": %" PRIu64 ",\n", c->blocks_bad);
+	fprintf(f, "    \"sectors_unrepaired\": %" PRIu64 ",\n", c->blocks_unrepaired);
 	fprintf(f, "    \"sectors_corrupt\": %" PRIu64 ",\n", c->blocks_corrupt);
 	fprintf(f, "    \"sectors_healed\": %" PRIu64 ",\n", c->blocks_fixed);
 	fprintf(f, "    \"sectors_reassigned\": %" PRIu64 ",\n", c->sas_reassigned);

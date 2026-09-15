@@ -443,11 +443,13 @@ ata 0 0 0 0 0 > "$TMP/smart.1"; ata 0 0 0 0 2 > "$TMP/smart.2"
 assert_has "command timeouts (188) growing during the scan are SUSPECT" \
 	"$(smart)" "VERDICT: SUSPECT - the drive counted 2 command timeouts"
 ata 0 0 0 0 0 > "$TMP/smart.1"; ata 0 0 0 1 0 > "$TMP/smart.2"
-assert_has "reported uncorrectable (187) growing during the scan is FAILING" \
-	"$(smart)" "VERDICT: FAILING - the drive's own counters recorded 1"
+# REGRESSION: uncorrectable errors growing used to be FAILING outright, but
+# every drive grows some and a couple of hundred can be a drive with years left
+assert_has "reported uncorrectable (187) growing during the scan is SUSPECT" \
+	"$(smart)" "VERDICT: SUSPECT - the drive's own counters recorded 1 uncorrectable"
 ata 0 0 0 0 0 > "$TMP/smart.1"; ata 0 0 4 0 0 > "$TMP/smart.2"
 assert_has "end-to-end errors (184) growing during the scan are FAILING" \
-	"$(smart)" "VERDICT: FAILING"
+	"$(smart)" "VERDICT: FAILING - the drive recorded 4 end-to-end errors"
 ata 0 3 0 0 0 > "$TMP/smart.1"; ata 0 3 0 0 0 > "$TMP/smart.2"
 out=$(smart)
 assert_has "a drive that has needed spin-up retries (10) is SUSPECT" \
@@ -468,8 +470,34 @@ sas 1 1007 1000.000 0 > "$TMP/smart.1"; sas 1 1012 1010.000 0 > "$TMP/smart.2"
 assert_has "a few SAS delayed corrections are not held against a drive" \
 	"$(smart)" "VERDICT: HEALTHY"
 sas 1 1007 1000.000 0 > "$TMP/smart.1"; sas 1 1007 1010.000 2 > "$TMP/smart.2"
-assert_has "SAS uncorrected read errors growing during the scan are FAILING" \
-	"$(smart)" "VERDICT: FAILING"
+assert_has "SAS uncorrected read errors growing during the scan are SUSPECT" \
+	"$(smart)" "VERDICT: SUSPECT - the drive's own counters recorded 2 uncorrectable"
+
+echo "== unreadable is not unrepairable =="
+
+# Every drive grows uncorrectable sectors, and writing them is what makes the
+# firmware remap them.  A drive is failing when the write did not help.  An
+# image cannot return EIO, so the counts come from a checkpoint.
+f=$(image 32 unrep.bin)
+unrep() {
+	printf 'hddscan-state 1\npos %s\nstep 255\nbytes 13090422784\n' \
+		$((255 * 131072)) > "$TMP/unrep.ckpt"
+	printf 'counters 100000 0 0 0 0 %s 0 0 0 0 0\nunrepaired %s\n' \
+		"$1" "$2" >> "$TMP/unrep.ckpt"
+	run --state "$TMP/unrep.ckpt" --resume --json "$TMP/unrep.json" "$f"
+}
+out=$(unrep 200 0)
+# REGRESSION: a single unreadable sector made a drive FAILING, even when the
+# write that followed let the drive remap it.
+assert_has "200 unreadable sectors nobody has rewritten are SUSPECT" \
+	"$out" "VERDICT: SUSPECT - 200 unreadable sectors"
+assert_has "a read-only scan says a write pass will settle it" \
+	"$out" "Run a write pass"
+out=$(unrep 200 1)
+assert_has "a sector still unreadable after being rewritten is FAILING" \
+	"$out" "VERDICT: FAILING - 1 sector stayed unreadable after being rewritten"
+assert_has "the JSON counts unrepaired sectors" "$(cat "$TMP/unrep.json")" \
+	'"sectors_unrepaired": 1'
 
 echo "== a drive that disappears mid-scan =="
 

@@ -858,15 +858,28 @@ provoke count too: a drive that will not answer those is no healthier. Reading
 than implying it was clean.
 
 SMART is read before and after the scan, and what *moved* in between counts
-for more than any lifetime total. Uncorrectable errors (187, 198), end-to-end
-errors (184) or SAS uncorrected read and write errors growing during the scan
-are FAILING: the drive itself admits it could not deliver data. Command
+for more than any lifetime total. End-to-end errors (184) growing during the
+scan are FAILING: that is data corrupted on the drive's own internal path, not
+a sector it could not read. Uncorrectable errors (187, 198) or SAS uncorrected
+read and write errors growing are SUSPECT, for the reason below. Command
 timeouts (188) growing, a SAS grown defect list growing, or SAS delayed
 corrections and rereads at one or more per gigabyte read (and at least ten) are
 SUSPECT. The SAS drive this was developed against had 1007 delayed corrections
 over its whole life and none during its scan; a failing one reports tens per
 gigabyte. Two lifetime counters are SUSPECT on their own, because a healthy
 drive never has them: spin-up retries (10) and end-to-end errors (184).
+
+**Unreadable is not unrepairable.** Every drive grows uncorrectable sectors,
+and a couple of hundred can be a drive with years left: writing them is what
+makes the firmware remap them to spares. So unreadable sectors, whether the scan
+found them or the drive's counters did, make a drive SUSPECT. What makes it
+FAILING is a repair that did not work — a sector still unreadable after being
+written in the same run, or a drive with no spares left to remap into. A
+destructive pass writes every chunk for this reason, including one whose read
+failed, and the drill-down after the write says whether the drive coped; a
+read-only scan cannot know, and says a write pass will settle it. Sectors that
+return the *wrong* data are still FAILING: that is not a sector the drive
+cannot read, it is one the drive lies about.
 
 A failed read is a statement about a sector only while there is still a drive
 to make it. One that drops off the bus, is taken offline by the kernel or has
