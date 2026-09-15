@@ -471,6 +471,32 @@ sas 1 1007 1000.000 0 > "$TMP/smart.1"; sas 1 1007 1010.000 2 > "$TMP/smart.2"
 assert_has "SAS uncorrected read errors growing during the scan are FAILING" \
 	"$(smart)" "VERDICT: FAILING"
 
+echo "== a drive that disappears mid-scan =="
+
+# A drive that drops off the bus fails every read from then on, and a scan that
+# took each failure at face value reported millions of bad sectors for one
+# event.  Truncating an image mid-scan is the same thing seen from a file: its
+# capacity collapses under the scan.
+truncate -s 1T "$TMP/gone.img"
+run --chunk-slow-ms 0.001 --floor-ms 0 --retries 0 --max-time 60 \
+	--json "$TMP/gone.json" "$TMP/gone.img" > "$TMP/gone.out" 2>&1 &
+gp=$!
+for _ in $(seq 1 100); do
+	grep -q "testing" "$TMP/gone.out" 2>/dev/null && break
+	sleep 0.1
+done
+sleep 1
+truncate -s 100M "$TMP/gone.img"
+wait $gp; rc=$?
+out=$(cat "$TMP/gone.out")
+assert_has "a drive that disappears mid-scan is FAILING" "$out" \
+	"VERDICT: FAILING - the drive disappeared from the system"
+assert_has "the report says how it disappeared" "$out" "its capacity collapsed"
+assert_eq "a drive that disappears exits 2" "$rc" "2"
+assert_has "its reads after it went are not counted as bad sectors" \
+	"$(cat "$TMP/gone.json")" '"sectors_bad": 0'
+rm -f "$TMP/gone.img"
+
 echo "== runs outlive the process that started them =="
 
 # A run is a directory of small text records, and everything that reports on

@@ -332,7 +332,9 @@ only — say so rather than implying otherwise.
   the `EIO` path, the drive look-ahead success path, SMR gating, every
   SAS-specific code path (error counter log, mode pages, `sg_reassign`), and
   the format dashboard's feed — `format_child()` only ever runs against a real
-  SCSI drive. Do not quietly upgrade these to "verified" without real hardware
+  SCSI drive. A drive vanishing is tested only as an image whose capacity
+  collapses; the `/sys/block`, device-state and `ENODEV` checks in
+  `dev_gone()` need a drive actually pulled. Do not quietly upgrade these to "verified" without real hardware
   behind them.
 - Test artifacts (`*.bin`, `hddscan-*.txt`, `*.md5`, state files) must be
   cleaned up; the repo tracks only `hddscan.c`, `Makefile`, `hddscan.8`,

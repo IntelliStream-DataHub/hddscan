@@ -2681,6 +2681,8 @@ typedef struct {
 	uint64_t kmsg_last_us;
 	uint64_t k_offline, k_resets, k_timeouts, k_medium;
 
+	int dev_gone;           /* the drive left mid-scan: see dev_gone() */
+
 	/* the throughput floor: see rate_judge() */
 	double rate_floor;      /* bytes/s; 0 when the rule does not apply */
 	double rate_seen;       /* what the scan managed, once it has settled */
@@ -3856,6 +3858,61 @@ static uint64_t block_thr_at(const ctx_t *c, uint64_t off)
 	return v < c->floor_us ? c->floor_us : v;
 }
 
+/*
+ * A failed read is a statement about a sector only while there is still a
+ * drive to make it.  One that drops off the bus, is taken offline by the
+ * kernel, or has its capacity collapse to nothing fails every read instantly
+ * from then on -- and left alone, the scan drills every chunk, retries every
+ * sector, and reports millions of bad sectors on what is really one event.
+ * So on a failed read, ask whether the drive is still there before blaming
+ * the platter, and if it is not, stop and say what happened.
+ */
+static int dev_gone(ctx_t *c, ssize_t r, int err, size_t want)
+{
+	char path[PATH_MAX], state[32] = "", b1[32];
+	const char *why = NULL;
+	uint64_t now_size = UINT64_MAX;
+	struct stat st;
+	FILE *f;
+
+	if (r == (ssize_t)want)
+		return 0;
+	if (c->dev->is_file) {
+		if (!fstat(c->fd, &st))
+			now_size = (uint64_t)st.st_size;
+	} else {
+		uint64_t sz;
+
+		if (!ioctl(c->fd, BLKGETSIZE64, &sz))
+			now_size = sz;
+		snprintf(path, sizeof(path), "/sys/block/%s", c->dev->name);
+		if (stat(path, &st) < 0)
+			why = "it is gone from /sys/block";
+		snprintf(path, sizeof(path), "/sys/block/%s/device/state",
+			 c->dev->name);
+		if (!why && (f = fopen(path, "re"))) {
+			if (fgets(state, sizeof(state), f) && strstr(state, "offline"))
+				why = "the kernel has taken it offline";
+			fclose(f);
+		}
+	}
+	if (!why && (err == ENODEV || err == ENXIO))
+		why = "the kernel says there is no such device any more";
+	if (!why && now_size < c->dev->size)
+		why = "its capacity collapsed";
+	if (!why)
+		return 0;
+	c->dev_gone = 1;
+	snprintf(c->abort_reason, sizeof(c->abort_reason),
+		 "the drive disappeared mid-scan: %s%s%s%s", why,
+		 now_size < c->dev->size ? " (now " : "",
+		 now_size < c->dev->size ? human_size(now_size, b1, sizeof(b1)) : "",
+		 now_size < c->dev->size ? ")" : "");
+	msg(PROG ": %s: %s%s%s\n", c->dev->name, c_red(), c->abort_reason,
+	    c_off());
+	return 1;
+}
+
 /* walk a suspicious chunk one block at a time */
 static void drill_chunk(ctx_t *c, uint64_t off, size_t len, void *buf,
 			void *scratch)
@@ -3890,6 +3947,8 @@ static void drill_chunk(ctx_t *c, uint64_t off, size_t len, void *buf,
 			c->prot_bytes += bl;
 			continue;
 		}
+		if (dev_gone(c, r, err, bl))
+			return;
 		c->blocks_drilled++;
 		if (r == (ssize_t)bl) {
 			lat_add(&c->block_lat, us);
@@ -4871,6 +4930,8 @@ static void scan_loop(ctx_t *c, int verify_only_pass)
 			}
 			continue;
 		} else {
+			if (dev_gone(c, r, err, len))
+				break;
 			if (r >= 0)
 				c->short_reads++;
 			c->chunks_err++;
@@ -5025,6 +5086,8 @@ static void scan_loop(ctx_t *c, int verify_only_pass)
 
 		if (drill)
 			drill_chunk(c, c->pos, len, buf, scratch);
+		if (c->dev_gone)
+			break;
 
 		c->bytes_done += len;
 
@@ -5335,6 +5398,10 @@ static int verdict_of(ctx_t *c, const char **why)
 		d_timeouts = grew(s0->cmd_timeout, sa->cmd_timeout);
 	}
 
+	if (c->dev_gone) {
+		*why = "the drive disappeared from the system during the scan";
+		return 2;
+	}
 	if (c->spares_exhausted) {
 		*why = "the drive can no longer reallocate: its spare sectors are gone";
 		return 2;

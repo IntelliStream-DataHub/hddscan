@@ -868,6 +868,15 @@ over its whole life and none during its scan; a failing one reports tens per
 gigabyte. Two lifetime counters are SUSPECT on their own, because a healthy
 drive never has them: spin-up retries (10) and end-to-end errors (184).
 
+A failed read is a statement about a sector only while there is still a drive
+to make it. One that drops off the bus, is taken offline by the kernel or has
+its capacity collapse fails every read instantly from then on, and a scan that
+took each failure at face value would drill every chunk and report millions of
+bad sectors for what is one event. So a failed read first asks whether the drive
+is still there — `/sys/block`, the SCSI device state, `ENODEV`, its current
+size — and if it is not, the scan stops, says what happened, and the drive is
+FAILING.
+
 Coverage is stated explicitly in every report — "every sector of the device was
 read" versus "SAMPLED" or "PARTIAL" — so a clean verdict is never mistaken for
 more than it is.
