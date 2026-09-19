@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hddscan</title>
+<meta name="description" content="hddscan times every read on a spinning disk and finds the sectors the firmware is quietly struggling with — the failure SMART reports as OK.">
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%231b1f27'/%3E%3Ccircle cx='16' cy='16' r='10' fill='none' stroke='%23e8924f' stroke-width='3'/%3E%3Ccircle cx='16' cy='16' r='2.5' fill='%23e8924f'/%3E%3C/svg%3E">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="./">hdd<span>scan</span></a>
+		<nav>
+			<a href="guide.html">Guide</a>
+			<a href="guide.html#options">Options</a>
+			<a href="https://github.com/IntelliStream-DataHub/hddscan">GitHub</a>
+		</nav>
+	</div>
+</header>
+
+<main>
+<section class="hero">
+	<div class="wrap">
+		<h1>Find the sectors that are <em>dying</em>, not just the ones already dead.</h1>
+		<p class="lead">hddscan times every read on a spinning disk and flags the
+		sectors the drive is quietly struggling with: the failure SMART reports
+		as OK.</p>
+		<div class="cta">
+			<a class="btn primary" href="guide.html">Read the guide</a>
+			<a class="btn" href="https://github.com/IntelliStream-DataHub/hddscan">Source on GitHub</a>
+		</div>
+		<figure class="shot">
+			<img src="img/tui-dashboard.svg" width="879" height="599"
+			     alt="The hddscan dashboard: 24 drives in a write test, five still scanning with their rate, weak-sector count and latency, the finished ones with their verdicts.">
+		</figure>
+	</div>
+</section>
+
+<section class="band">
+	<div class="wrap split">
+		<div>
+			<p class="kicker">The problem</p>
+			<h2>“SMART Health Status: OK” until the day it isn’t</h2>
+			<p>A drive can return every sector correctly and still be failing.
+			When a sector gets hard to read, the firmware retries it,
+			re-reads it with different settings, and corrects the data. Your
+			read succeeds; it just takes tens of milliseconds instead of a few.
+			Nothing is reallocated, nothing is logged as an error, and SMART
+			keeps saying OK.</p>
+			<p>Those slow sectors are the ones about to become unreadable.
+			Timing reads is the only way to see them coming, and that is what
+			hddscan does.</p>
+		</div>
+		<div class="evidence" role="group" aria-label="One real drive">
+			<dl>
+				<div><dt>SMART health status</dt><dd class="ok">OK</dd></div>
+				<div><dt>Sectors reallocated, ever</dt><dd>1</dd></div>
+				<div><dt>Uncorrected read errors</dt><dd>0</dd></div>
+				<div><dt>Reads the drive had to grind for</dt><dd class="bad">42,899,520</dd></div>
+				<div><dt>Its own long self-test</dt><dd class="bad">failed</dd></div>
+			</dl>
+			<p style="font-size:14px;color:var(--muted);margin:10px 0 12px">One real SAS drive, from its own error
+			counter log: about 80,000 slow recoveries per terabyte read, and a
+			failure prediction years old.</p>
+		</div>
+	</div>
+</section>
+
+<section class="band">
+	<div class="wrap">
+		<p class="kicker">How it works</p>
+		<h2>Time every read against what this drive should manage</h2>
+		<ol class="steps">
+			<li>
+				<h3>Calibrate</h3>
+				<p>Measure the drive at eight points from the outer edge to the
+				inner, with the same access pattern the scan will use. The
+				budget follows the platter, because an outer track reads about
+				twice as fast as an inner one.</p>
+			</li>
+			<li>
+				<h3>Scan and drill down</h3>
+				<p>Read the drive in chunks, one request at a time so each is
+				timed alone. A chunk is never faster than its slowest sector,
+				so any chunk over budget is re-read 4 KiB at a time to find the
+				culprit.</p>
+			</li>
+			<li>
+				<h3>Judge and report</h3>
+				<p>Every suspect sector is retried and classified: weak
+				(slow, or readable only on a retry), unreadable, or corrupt.
+				The verdict says how much of the drive was actually tested.</p>
+			</li>
+		</ol>
+	</div>
+</section>
+
+<section class="band">
+	<div class="wrap">
+		<p class="kicker">What you get</p>
+		<h2>Built for a shelf of drives, not a single disk</h2>
+		<div class="grid">
+			<div class="card">
+				<h3>It asks what you are about to do</h3>
+				<p>Pick a profile: <b>predeploy</b> writes every sector and
+				verifies it, <b>inservice</b> never writes, <b>survey</b>
+				samples a shelf, <b>decay</b> checks a written pattern weeks
+				later, <b>repair</b> forces the drive to retire what it cannot
+				read.</p>
+				<a href="guide.html#profiles">Profiles</a>
+			</div>
+			<div class="card">
+				<h3>Runs outlive the terminal</h3>
+				<p>A scan belongs to a process of its own. Close the window or
+				lose the ssh session and it keeps going. Thirty formats and
+				twenty-four scans are two rows on one screen.</p>
+				<a href="guide.html#runs">Runs</a>
+			</div>
+			<div class="card">
+				<h3>Reports that do not overclaim</h3>
+				<p>Every report has a Coverage line. A scan that was sampled,
+				interrupted or partial says so, and blocks it could not test
+				are named as untested, never passed as healthy.</p>
+				<a href="guide.html#reports">Reading a report</a>
+			</div>
+			<div class="card">
+				<h3>Put a damaged drive back to work</h3>
+				<p>A few hundred bad sectors do not make a drive scrap. One key
+				maps the damage out below the filesystem with device-mapper,
+				so ZFS, btrfs or ext4 get a clean device. No kernel module.</p>
+				<a href="guide.html#hide">Hiding bad blocks</a>
+			</div>
+			<div class="card">
+				<h3>Leaves drives configured for service</h3>
+				<p>Predeploy saves what a SAS drive should run with:
+				auto-reallocation, the read cache, and its own weekly background
+				scan. Every change is printed with the command that undoes it.</p>
+				<a href="guide.html#settings">Drive settings</a>
+			</div>
+			<div class="card">
+				<h3>Low level format, in parallel</h3>
+				<p>Change sector size, strip or keep protection information,
+				across a whole shelf at once. On one 14 TB drive, removing it
+				gave back 284 GB.</p>
+				<a href="guide.html#format">Formatting</a>
+			</div>
+			<div class="card">
+				<h3>One static binary</h3>
+				<p>Single-file C with no dependencies beyond libc, so it runs on
+				a rescue system with nothing installed. smartctl, sdparm and
+				sg3-utils are used when they are there.</p>
+				<a href="guide.html#install">Install</a>
+			</div>
+		</div>
+	</div>
+</section>
+
+<section class="band">
+	<div class="wrap split">
+		<figure class="shot" style="margin:0">
+			<img src="img/tui-hide-confirm.svg" width="761" height="635"
+			     alt="The summary at the end of a 24-drive run: 21 healthy, 2 suspect, 1 failing. The failing drive is selected, and the bottom line asks: press y to hide the damage on sdg.">
+		</figure>
+		<div>
+			<p class="kicker">When a drive fails the scan</p>
+			<h2>Decide what it is still good for</h2>
+			<p>The summary a scan ends on holds every verdict until you press a
+			key. On a drive with damage, <kbd>h</kbd> writes a map of the bad
+			extents onto the drive itself and creates
+			<code>/dev/mapper/bb-&lt;serial&gt;</code>: the same drive with the
+			damage cut out, and spares held back for anything found later.</p>
+			<p>Put a backup pool on that, with compression and checksums, and a
+			drive you were about to throw away keeps working.</p>
+			<p><a href="guide.html#hide">How the map works →</a></p>
+		</div>
+	</div>
+</section>
+
+<section class="band">
+	<div class="wrap narrow">
+		<p class="kicker">Quick start</p>
+		<h2>Build it and run it</h2>
+<pre><code>git clone https://github.com/IntelliStream-DataHub/hddscan
+cd hddscan
+make                 # or: make static, for a binary with no glibc floor
+sudo ./hddscan       # opens the form</code></pre>
+		<p>The default profile writes, so a bare <code>hddscan /dev/sdb</code>
+		stops and asks for <code>--confirm</code> instead of doing anything:
+		an error, never data loss. For a drive with data on it, use
+		<code>--profile inservice</code>, which never writes.</p>
+	</div>
+</section>
+
+<section class="band">
+	<div class="wrap narrow">
+		<p class="kicker">Honest about its limits</p>
+		<h2>What it has not been proven on</h2>
+		<p>The test suite runs against image files, with no root and no real
+		drive, so some paths have only been read, not run.
+		<a href="https://github.com/IntelliStream-DataHub/hddscan/blob/main/DESIGN.md#what-was-verified-during-development">DESIGN.md</a>
+		lists them, including:</p>
+		<ul class="limits">
+			<li>The <code>EIO</code> path from genuinely unreadable media</li>
+			<li>Shingled (SMR) drive gating</li>
+			<li>Loading a device-mapper map on a live system</li>
+			<li>The ATA half of the look-ahead control</li>
+		</ul>
+	</div>
+</section>
+</main>
+
+<footer>
+	<div class="wrap">
+		<span>hddscan · MIT licence · © 2026 Olav Gjerde</span>
+		<span><a href="guide.html">Guide</a> · <a href="https://github.com/IntelliStream-DataHub/hddscan">GitHub</a></span>
+	</div>
+</footer>
+</body>
+</html>

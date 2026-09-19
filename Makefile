@@ -46,7 +46,17 @@ test: $(BIN)
 	@bash tests/dm.sh
 	@python3 tests/tui.py
 
+# The site in docs/: screenshots drawn from hddscan's own output, and an option
+# reference generated from --help.  sitecheck prints nothing when the reference
+# is current, the way mancheck does for the man page.
+site: $(BIN)
+	@python3 tools/shots.py
+	@python3 tools/options.py
+
+sitecheck: $(BIN)
+	@python3 tools/options.py --check
+
 clean:
 	rm -f $(BIN) $(BIN)-static
 
-.PHONY: all static install clean mancheck test
+.PHONY: all static install clean mancheck sitecheck site test

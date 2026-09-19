@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="753" height="311" viewBox="0 0 753 311" role="img" aria-label="sudo hddscan --attach">
+<rect width="753" height="311" rx="9" fill="#1b1f27"/>
+<rect width="753" height="30" rx="9" fill="#2a2f3a"/>
+<rect y="21" width="753" height="9" fill="#2a2f3a"/>
+<circle cx="20" cy="15" r="6" fill="#ff5f57"/>
+<circle cx="40" cy="15" r="6" fill="#febc2e"/>
+<circle cx="60" cy="15" r="6" fill="#28c840"/>
+<text x="376" y="20" fill="#9aa3b2" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" text-anchor="middle">sudo hddscan --attach</text>
+<text y="61" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de" font-weight="bold"> hddscan 1.0 </tspan><tspan x="127.6" fill="#d0d4de">  runs on this machine   2 in progress                                  </tspan></text>
+<text y="97" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de">  RUN               KIND    WHAT                   DRIVES PROGRESS  STATE     ELAPSED</tspan></text>
+<rect x="18.0" y="101.5" width="699.7" height="18" fill="#d0d4de"/>
+<text y="115" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#1b1f27">  20260912-093044   format  format 4096B PI kept       30   60.6%  running   4h 08m</tspan></text>
+<text y="133" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de">  20260912-080512   scan    write (predeploy)          24   95.7%  running   83h 00m </tspan></text>
+<text y="151" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de">  20260915-201544   scan    write (predeploy)          24  100.0%  finished  81h 00m </tspan></text>
+<text y="277" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de">  a run keeps going whether or not this program is open                              </tspan></text>
+<text y="295" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de">  enter open   x stop   f forget   n new test   q quit                               </tspan></text>
+</svg>

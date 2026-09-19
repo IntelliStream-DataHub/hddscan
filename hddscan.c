@@ -1671,6 +1671,18 @@ static int enumerate_devices(device_t **out)
 	device_t *v = NULL;
 	int n = 0, cap = 0;
 
+	/*
+	 * For the screenshots on the project's site: the form then offers only
+	 * the images named on the command line, so the pictures are the same
+	 * on every machine that regenerates them and never show the real
+	 * drives, serials included, of the one that happened to.
+	 */
+	if (getenv("HDDSCAN_NO_ENUMERATE")) {
+		if (dir)
+			closedir(dir);
+		*out = NULL;
+		return 0;
+	}
 	if (!dir)
 		die("cannot open /sys/block: %s", strerror(errno));
 	while ((e = readdir(dir))) {
@@ -5884,7 +5896,7 @@ static void fs_plan(const ctx_t *c)
 	out("\n   2. mkfs.ext4 -b 4096 -l /root/%s.bb %s\n", slug, target);
 	out("      ext2/3/4 only: mke2fs puts every listed block in the bad-block\n"
 	    "      inode, where nothing else can be allocated. XFS and btrfs have\n"
-	    "      no equivalent. Do not put this drive in an mdraid array or a\n"
+	    "      no equivalent. Do not put the raw drive in an mdraid array or a\n"
 	    "      ZFS pool: both fault a drive out on a read error instead of\n"
 	    "      stepping around it.\n");
 	out("\n   3. e2fsck -l /root/%s.bb %s\n", slug, target);
@@ -5898,7 +5910,7 @@ static void fs_plan(const ctx_t *c)
 	out("\n   Or, for any filesystem (ZFS, btrfs, XFS): cut the damage out below\n"
 	    "   it with device-mapper, and build on /dev/mapper/bb-* instead:\n"
 	    "        %s --hide-bad --confirm %s %s\n"
-	    "      needs dm-badblocks, and the scan to have covered the whole drive.\n",
+	    "      needs root, and a scan that covered the whole drive.\n",
 	    PROG, c->dev->name, c->dev->path);
 	out("\n   Re-scan every few months and add what it finds: the list only\n"
 	    "   covers damage that had already appeared by the time it was made.\n");
@@ -7091,7 +7103,8 @@ static void usage(void)
 "                         (HDDSCAN_STATE_DIR does the same thing)\n"
 "\n"
 "Test mode\n"
-"  --mode read            read-only surface scan (default, safe)\n"
+"  --mode read            read-only surface scan, never writes (the mode of\n"
+"                         --profile inservice; the default profile writes)\n"
 "  --mode verify          non-destructive write test: save sector, write\n"
 "                         pattern, read back, restore.  DATA LOSS ON POWER CUT\n"
 "  --mode write           destructive: overwrite everything with a pattern\n"

@@ -1,0 +1,680 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hddscan guide</title>
+<meta name="description" content="How to use hddscan: the interactive form, the dashboard, the summary and its reports, and every command-line option.">
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%231b1f27'/%3E%3Ccircle cx='16' cy='16' r='10' fill='none' stroke='%23e8924f' stroke-width='3'/%3E%3Ccircle cx='16' cy='16' r='2.5' fill='%23e8924f'/%3E%3C/svg%3E">
+</head>
+<body>
+
+<header class="top">
+	<div class="wrap">
+		<a class="brand" href="./">hdd<span>scan</span></a>
+		<nav>
+			<a href="guide.html" aria-current="page">Guide</a>
+			<a href="#options">Options</a>
+			<a href="https://github.com/IntelliStream-DataHub/hddscan">GitHub</a>
+		</nav>
+	</div>
+</header>
+
+<div class="wrap guide">
+<aside class="toc" aria-label="Contents">
+	<p>Contents</p>
+	<ul>
+		<li><a href="#install">Install</a></li>
+		<li><a href="#concepts">Concepts</a>
+			<ul>
+				<li><a href="#profiles">Profiles</a></li>
+				<li><a href="#verdicts">Verdicts</a></li>
+			</ul>
+		</li>
+		<li><a href="#tui">The terminal UI</a>
+			<ul>
+				<li><a href="#form">The form</a></li>
+				<li><a href="#dashboard">The dashboard</a></li>
+				<li><a href="#runs">Runs</a></li>
+				<li><a href="#summary">The summary</a></li>
+				<li><a href="#keys">Keys</a></li>
+			</ul>
+		</li>
+		<li><a href="#cli">The command line</a>
+			<ul>
+				<li><a href="#recipes">Common tasks</a></li>
+				<li><a href="#runs-cli">Watching runs</a></li>
+				<li><a href="#reports">Reading a report</a></li>
+				<li><a href="#hide">Hiding bad blocks</a></li>
+				<li><a href="#settings">Drive settings</a></li>
+				<li><a href="#format">Low level format</a></li>
+				<li><a href="#files">Files it writes</a></li>
+			</ul>
+		</li>
+		<li><a href="#options">Option reference</a></li>
+	</ul>
+</aside>
+
+<article class="doc">
+<h1>hddscan guide</h1>
+<p>hddscan finds sectors on a rotating disk that return data too slowly or not
+at all. You can drive it from an interactive form or entirely from the command
+line; both do the same things with the same defaults, so a report from one can
+be compared with a report from the other.</p>
+
+<h2 id="install">Install</h2>
+<pre><code>git clone https://github.com/IntelliStream-DataHub/hddscan
+cd hddscan
+make                # dynamic build; needs glibc 2.38 or newer where it runs
+make static         # no glibc floor: one file for a rescue system
+sudo make install   # /usr/local/sbin/hddscan, the man page, and a dm-badblocks link</code></pre>
+<p>It needs nothing beyond libc. It uses these tools when they are installed
+and does without them otherwise; <code>hddscan --check-deps</code> says which
+are missing and prints the <code>dnf</code> or <code>apt</code> line that
+installs them.</p>
+<div class="table-wrap"><table>
+	<thead><tr><th>Tool</th><th>What it adds</th></tr></thead>
+	<tbody>
+		<tr><td><code>smartctl</code></td><td>SMART counters before and after the scan, and on SAS the error counter and self-test logs</td></tr>
+		<tr><td><code>sdparm</code></td><td>SAS drive settings: look-ahead, caches, auto-reallocation, background scan</td></tr>
+		<tr><td><code>hdparm</code></td><td>the same for ATA drives, where they exist</td></tr>
+		<tr><td><code>sg3_utils</code></td><td>low level format, and forcing a reallocation</td></tr>
+		<tr><td><code>dmsetup</code></td><td>loading a bad-block map as a device</td></tr>
+	</tbody>
+</table></div>
+<p>Reading a drive needs root. Everything else (reports, run records, the maps
+on image files) does not.</p>
+
+<h2 id="concepts">Concepts</h2>
+
+<h3 id="profiles">Profiles</h3>
+<p>The first question is what you are about to do with the drive, because that
+decides how it should be tested. A profile sets the mode and the passes that
+go with it; any flag you give explicitly overrides it.</p>
+<div class="table-wrap"><table>
+	<thead><tr><th>Profile</th><th>Mode</th><th>For</th></tr></thead>
+	<tbody>
+		<tr><td><b>predeploy</b> (default)</td><td>write</td><td>No data on it yet. Writes every sector, verifies it reads back, and leaves a SAS drive configured for service.</td></tr>
+		<tr><td><b>inservice</b></td><td>read</td><td>It holds data you want to keep. Never writes anything.</td></tr>
+		<tr><td><b>survey</b></td><td>read, sampled</td><td>Quick triage of a shelf: reads one chunk in 64.</td></tr>
+		<tr><td><b>decay</b></td><td>check</td><td>Weeks after a predeploy run: has the written pattern rotted?</td></tr>
+		<tr><td><b>repair</b></td><td>write</td><td>Predeploy, plus rewriting what is still slow and forcing a reallocation of anything unreadable.</td></tr>
+	</tbody>
+</table></div>
+<div class="callout"><p>The default writes, because a surface test is
+normally run before a drive goes into service, and a read-only pass cannot tell
+you whether a sector will accept a write. So a bare
+<code>hddscan /dev/sdb</code> stops and asks for <code>--confirm</code>
+instead of doing anything: an error, never data loss.</p></div>
+
+<h3 id="verdicts">Verdicts and sectors</h3>
+<p>Every sector that does not simply come back is one of three things:</p>
+<div class="table-wrap"><table>
+	<thead><tr><th>Sector</th><th>Meaning</th></tr></thead>
+	<tbody>
+		<tr><td><b>weak</b></td><td>Over its latency budget, or readable only on a retry. The drive is still returning the data, by grinding for it.</td></tr>
+		<tr><td><b>unreadable</b></td><td>Every attempt failed.</td></tr>
+		<tr><td><b>corrupt</b></td><td>It read back, but not what was written: silent corruption, found by the write and check modes.</td></tr>
+	</tbody>
+</table></div>
+<p>Each drive then gets a verdict, which is also the exit status:
+<span class="verdict v-ok">HEALTHY</span> (0),
+<span class="verdict v-warn">SUSPECT</span> (1) or
+<span class="verdict v-bad">FAILING</span> (2); 130 means the scan was
+interrupted. Every report also carries a <b>Coverage</b> line. A verdict of
+HEALTHY over 3% of a drive is not a healthy drive, and the report will not let
+that difference get lost.</p>
+
+<h2 id="tui">The terminal UI</h2>
+<p>Run <code>sudo hddscan</code> on a terminal with no device named and it
+opens the form. If work is already running on the machine, it shows that
+first.</p>
+
+<h3 id="form">The form</h3>
+<figure class="shot">
+	<img src="img/tui-form.svg" width="668" height="851" loading="lazy"
+	     alt="The configure form: four drives selected at the top, then the settings in three groups (how to test, drive settings, low level format), and a line saying the selected mode writes to the drive and saves drive settings.">
+</figure>
+<figcaption>The form, with four drives selected and the predeploy profile.
+The drives here are image files, which is why they read <i>regular file
+(image)</i>.</figcaption>
+<p>Drives come first. <kbd>Space</kbd> picks one, <kbd>a</kbd> picks every
+free hard disk, and <kbd>g</kbd> picks every free disk on the same controller
+as the one under the cursor, which is one keystroke per shelf. Drives that are
+mounted, in use or already in a run are shown but cannot be picked.</p>
+<p>The settings below are in three groups, because they answer different
+questions:</p>
+<ul>
+	<li><b>How to test</b>: profile, mode, chunk size, scan order. Changing the
+	profile resets the rest to what that profile means.</li>
+	<li><b>Drive settings</b>: look-ahead, caches, auto-reallocation,
+	recovery limit, background scan. These change the drive itself and are put
+	back when the run ends, unless <b>Save to drive</b> or the profile says
+	otherwise.</li>
+	<li><b>Low level format</b>: used only when Mode is <i>format</i>.</li>
+</ul>
+<p>Press <kbd>s</kbd> to start. Anything that writes, saves a setting or erases
+the drive asks again, and needs <kbd>y</kbd>.</p>
+
+<h3 id="dashboard">The dashboard</h3>
+<figure class="shot">
+	<img src="img/tui-dashboard.svg" width="879" height="599" loading="lazy"
+	     alt="The dashboard's table: each drive's percentage, read rate, bad and weak sector counts and ETA, with a second row of latencies; finished drives show their verdict.">
+</figure>
+<figcaption>A 24-drive write test, 83 hours in. Each drive has two rows: what
+it is doing, then how it is behaving. Screenshots of runs come from a demo
+record store, not a real shelf.</figcaption>
+<p>Rate, ETA and latency are measured over the last 30 seconds, so a drive
+that has just walked into a bad patch shows it now rather than hours later.
+Drives needing attention sort to the top. A shelf is more drives than a screen
+holds, so the table pages with <kbd>&lt;</kbd> <kbd>&gt;</kbd>, and
+<kbd>g</kbd> swaps it for an overview with one line per drive:</p>
+<figure class="shot">
+	<img src="img/tui-overview.svg" width="778" height="599" loading="lazy"
+	     alt="The overview: 24 drives, three to a line, each with a percentage and a progress bar.">
+</figure>
+<p>The dashboard is only a viewer. <kbd>q</kbd> quits and leaves the run going;
+<kbd>x</kbd> then <kbd>y</kbd> stops it, and so do <kbd>Ctrl-C</kbd> or
+<kbd>Esc</kbd>, immediately. A stopped drive still writes its report, with a
+Coverage line saying how far it got.</p>
+
+<h3 id="runs">Runs</h3>
+<figure class="shot">
+	<img src="img/tui-runs.svg" width="753" height="311" loading="lazy"
+	     alt="The list of runs: a 30-drive format and a 24-drive write test in progress, and a finished 24-drive write test.">
+</figure>
+<p>A scan or a format is a <b>run</b>, owned by a supervisor process of its
+own rather than by the terminal that started it. Close the window or lose the
+ssh session and it carries on; start hddscan again and this list is the first
+thing you see. <kbd>Enter</kbd> opens a run, <kbd>x</kbd> stops one,
+<kbd>f</kbd> forgets a finished one. A drive already in a live run is refused
+by any other, since two runs on one spindle would time each other's seeks.</p>
+
+<h3 id="summary">The summary</h3>
+<figure class="shot">
+	<img src="img/tui-summary.svg" width="871" height="635" loading="lazy"
+	     alt="The summary of a finished 24-drive run: 21 healthy, 2 suspect, 1 failing, a row per drive with its verdict and report path, and a footer offering h hide bad blocks.">
+</figure>
+<p>A scan can run for days, so its result does not scroll away when the last
+drive finishes: the summary holds every verdict until you press a key.
+<kbd>n</kbd> starts another test and <kbd>q</kbd> quits. For a drive whose
+scan covered the whole drive and found damage, <kbd>h</kbd> hides it behind a
+device-mapper device (<a href="#hide">see below</a>). <kbd>↑</kbd>
+<kbd>↓</kbd> choose the drive, marked with <code>&gt;</code>, and
+<kbd>y</kbd> confirms:</p>
+<figure class="shot">
+	<img src="img/tui-hide-confirm.svg" width="761" height="635" loading="lazy"
+	     alt="The same summary with its bottom line asking: press y to hide the damage on sdg; whatever is on it becomes unreachable.">
+</figure>
+
+<h3 id="keys">Keys</h3>
+<div class="table-wrap"><table>
+	<thead><tr><th>Screen</th><th>Keys</th></tr></thead>
+	<tbody>
+		<tr><td>Form</td><td><kbd>↑</kbd><kbd>↓</kbd> move · <kbd>Space</kbd> pick a drive · <kbd>a</kbd> all free · <kbd>g</kbd> this controller · <kbd>n</kbd> none · <kbd>←</kbd><kbd>→</kbd> change a value · <kbd>Tab</kbd> to the settings · <kbd>s</kbd> start · <kbd>r</kbd> runs · <kbd>q</kbd> quit</td></tr>
+		<tr><td>Dashboard</td><td><kbd>&lt;</kbd><kbd>&gt;</kbd> or <kbd>←</kbd><kbd>→</kbd> pages · <kbd>g</kbd> table / overview · <kbd>r</kbd> runs · <kbd>n</kbd> new test · <kbd>x</kbd> stop · <kbd>q</kbd> quit, the run keeps going</td></tr>
+		<tr><td>Runs</td><td><kbd>↑</kbd><kbd>↓</kbd> choose · <kbd>Enter</kbd> open · <kbd>x</kbd> stop · <kbd>f</kbd> forget · <kbd>n</kbd> new test · <kbd>q</kbd> quit</td></tr>
+		<tr><td>Summary</td><td><kbd>↑</kbd><kbd>↓</kbd> choose a drive · <kbd>h</kbd> hide its bad blocks · <kbd>&lt;</kbd><kbd>&gt;</kbd> pages · <kbd>n</kbd> new test · <kbd>r</kbd> runs · <kbd>q</kbd> quit</td></tr>
+	</tbody>
+</table></div>
+
+<h2 id="cli">The command line</h2>
+<p>Name a device and hddscan runs without the form. Devices can be given as
+<code>/dev/sdb</code>, <code>sdb</code>, or a regular file to use as an
+image.</p>
+
+<h3 id="recipes">Common tasks</h3>
+<pre><code># a drive with data on it: read-only, never writes
+sudo hddscan --profile inservice /dev/sdb
+
+# a drive going into service: writes every sector, verifies, re-reads
+sudo hddscan --confirm sdb /dev/sdb
+
+# quick triage of every free disk on the machine
+sudo hddscan --profile survey --all
+
+# weeks later, on a drive an earlier predeploy run wrote
+sudo hddscan --profile decay /dev/sdb
+
+# give a drive its best chance: write, rewrite what is still slow,
+# force a reallocation of anything unreadable, then re-read the lot
+sudo hddscan --repair --confirm sdb --recovery-time 300 /dev/sdb
+
+# a shelf, in the background
+sudo hddscan --confirm sdb --detach /dev/sd{b..z}</code></pre>
+<p><code>--confirm</code> takes the device name as given, or the drive's
+serial. A full pass over a 14 TB drive takes about a day, and
+<code>--repair</code> roughly twice that. On a drive that is already sick, two
+flags matter more than they look: <code>--recovery-time 300</code> stops the
+drive grinding a second on each bad sector, and <code>--retries 3</code> stops
+the tool grinding twenty attempts on each.</p>
+
+<h3 id="runs-cli">Watching runs</h3>
+<figure class="shot">
+	<img src="img/cli-status.svg" width="1166" height="473" loading="lazy"
+	     alt="hddscan --status listing three runs, then the drives of one 30-drive format with each drive's progress.">
+</figure>
+<pre><code>sudo hddscan --status                  # every run on this machine
+sudo hddscan --status sdq              # the run a given drive is in
+sudo hddscan --status-json             # the same, for a script
+sudo hddscan --attach 20260912-080512  # open the dashboard on one
+sudo hddscan --stop 20260912-080512    # stop it; partial reports are still written
+sudo hddscan --forget 20260912-080512  # drop a finished run's records</code></pre>
+<p>Records live in <code>/var/lib/hddscan</code> as root and
+<code>~/.local/state/hddscan</code> otherwise, as plain key-and-value text.</p>
+
+<h3 id="reports">Reading a report</h3>
+<p>Every drive gets a text report: the drive, the profile and mode, the
+Coverage line, latency percentiles and distributions, a surface map, the
+counters, and every suspect sector with how many tries it took. It ends with
+the verdict and what to do next.</p>
+<figure class="shot">
+	<img src="img/cli-report.svg" width="761" height="1031" loading="lazy"
+	     alt="The end of a report: the counters, one corrupt sector, VERDICT FAILING, and a section called Using this drive anyway with the commands to build a bad-block list, make an ext4 filesystem around it, or hide the damage with device-mapper.">
+</figure>
+<figcaption>The end of a report on an image file with one injected corrupt
+sector, so its timings are a file's, not a platter's.</figcaption>
+<p>A report never contradicts itself. Two numbers describing the same thing
+are computed the same way, and blocks the scan could not test (for example on
+a drive formatted with protection information and never written since) are
+listed as not covered rather than counted as either good or bad.</p>
+
+<h3 id="hide">Hiding bad blocks</h3>
+<p>A drive with a few hundred bad sectors can still be a good backup target,
+as long as nothing is stored on them. There are two ways to arrange that:</p>
+<ul>
+	<li><b>ext2/3/4</b> can take a list of bad blocks when the filesystem is
+	made. The report prints the commands, with the numbers filled in.</li>
+	<li><b>Any filesystem</b>, ZFS included: hddscan writes a map of the damage
+	onto the drive and loads it with device-mapper, so the filesystem sees a
+	slightly smaller device with none of the known damage in it. No kernel
+	module.</li>
+</ul>
+<pre><code>sudo hddscan --profile inservice /dev/sdc          # a whole-drive scan
+sudo hddscan --hide-bad --confirm sdc /dev/sdc     # map it: /dev/mapper/bb-&lt;serial&gt;
+sudo zpool create -o ashift=12 -O compression=zstd backup /dev/mapper/bb-&lt;serial&gt;</code></pre>
+<p>The damage is only ever taken from a scan that covered the whole drive and
+finished. A list from a sampled or interrupted scan would hide the damage it
+happened to look at and leave the rest in the middle of the new device. The
+drive is found by serial, since <code>sdc</code> may be <code>sdd</code> after
+a reboot.</p>
+<figure class="shot">
+	<img src="img/cli-dm.svg" width="862" height="473" loading="lazy"
+	     alt="hddscan dm create on a 12.7 TiB image with four bad extents skipped and 13,348 spares; a later remap moving one extent to the nearest spare; the status afterwards; the first lines of the device-mapper table.">
+</figure>
+<p>The map keeps the drive in its original order and steps over the damage
+known when it was made. Damage found later is moved to the nearest of the
+spare extents held back for it, 0.1% of the drive spread across the platter,
+so a moved extent costs a short seek. Two copies of the map, with checksums,
+live at the start and end of the drive. <code>hddscan dm</code> manages it
+directly, and is also installed as <code>dm-badblocks</code>:</p>
+<pre><code>sudo hddscan dm status /dev/sdc
+sudo hddscan dm remap /dev/sdc --bad new.bb --block-size 512    # sectors from the kernel log
+sudo hddscan dm activate-all                                    # what runs at boot</code></pre>
+<p><code>contrib/dm-badblocks.service</code> activates every mapped drive at
+boot, before local filesystems and ZFS imports. On a single disk, ZFS can
+repair a bad block only if it has a second copy, so set <code>copies=2</code>
+on the datasets that matter.</p>
+<div class="callout"><p>Not yet run on real hardware: loading a map with
+device-mapper, remapping on a live device, and the boot unit. The map itself
+and data surviving a remap are tested on image files.</p></div>
+
+<h3 id="settings">Drive settings</h3>
+<p>hddscan can change how a drive behaves, through <code>sdparm</code> or
+<code>hdparm</code>. Settings a scan needs are put back when the run ends,
+on <code>Ctrl-C</code> and on error; settings meant to last are saved on the
+drive and announced with the command that undoes each one.</p>
+<ul>
+	<li>For the scan: the drive's look-ahead is turned off, so a prefetch cannot
+	mask a marginal sector, and so is its read cache.</li>
+	<li>Predeploy and repair also turn the write cache off for the run, so the
+	write pass times the platter rather than the drive's memory.</li>
+	<li>Predeploy and repair save <code>--fix-config</code> (auto-reallocation
+	on for reads and writes, read cache on) and the drive's own background
+	scan, weekly. <code>--no-fix-config</code> and <code>--bms keep</code> opt
+	out. None of it applies if you override the mode.</li>
+	<li><code>--persist</code> saves the settings you named explicitly, never a
+	default. <code>--apply-settings</code> applies them without a scan.</li>
+</ul>
+
+<h3 id="format">Low level format</h3>
+<pre><code># see exactly what it would run
+sudo hddscan --format --format-pi none --confirm sdb --dry-run /dev/sdb
+
+# strip protection information, keep the sector size
+sudo hddscan --format --format-pi none --confirm sdb /dev/sdb
+
+# change the sector size too, and ask for a fast format
+sudo hddscan --format --format-blocksize 4096 --format-pi none \
+             --format-fast --confirm sdb /dev/sdb</code></pre>
+<p><code>--format</code> runs a SCSI FORMAT UNIT on every selected drive in
+parallel, as a run like any other. It erases the drive and cannot be called
+back, so it prints the exact <code>sg_format</code> command first.
+<code>--format-pi</code> defaults to <i>keep</i>, because
+<code>sg_format</code> itself defaults to stripping protection information.
+Removing it can recover real capacity: on one 14 TB Seagate it gave back
+284 GB.</p>
+
+<h3 id="files">Files it writes</h3>
+<div class="table-wrap"><table>
+	<thead><tr><th>File</th><th>What</th></tr></thead>
+	<tbody>
+		<tr><td><code>hddscan-&lt;device&gt;.txt</code></td><td>The report, in <code>--outdir</code></td></tr>
+		<tr><td><code>--json</code>, <code>--csv</code></td><td>Machine-readable report, and every suspect sector</td></tr>
+		<tr><td><code>--badblocks-list</code></td><td>Bad sectors in <code>badblocks(8)</code> format, ready for <code>mkfs -l</code></td></tr>
+		<tr><td><code>--prometheus</code></td><td>Metrics for node_exporter's textfile collector</td></tr>
+		<tr><td><code>/var/lib/hddscan/runs/</code></td><td>Run records and a checkpoint per drive, which <code>--badblocks-from</code> and <code>--hide-bad</code> read</td></tr>
+	</tbody>
+</table></div>
+
+<h2 id="options">Option reference</h2>
+<p>Generated from <code>hddscan --help</code>. <code>man 8 hddscan</code> has
+the same options at more length.</p>
+<!-- BEGIN OPTIONS: generated by tools/options.py from hddscan --help; do not edit -->
+<pre class="usage">Usage: hddscan [options] [device ...]
+       hddscan --list
+       hddscan --status [RUN|DRIVE]</pre>
+<p>Run on a terminal with no device named, hddscan opens the interactive picker; <a href="#opt-no-tui"><code>--no-tui</code></a> turns that off.  Devices may be given as /dev/sdb, sdb, or a regular file to use as an image.  With no device and <a href="#opt-all"><code>--all</code></a>, every unmounted rotational disk is scanned.</p>
+<nav class="optnav" aria-label="Option groups"><ul>
+<li><a href="#g-selection">Selection</a></li>
+<li><a href="#g-parallelism">Parallelism</a></li>
+<li><a href="#g-runs-that-outlive-the-terminal">Runs that outlive the terminal</a></li>
+<li><a href="#g-test-mode">Test mode</a></li>
+<li><a href="#g-range-and-sizing">Range and sizing</a></li>
+<li><a href="#g-latency-budget">Latency budget</a></li>
+<li><a href="#g-safety-and-environment">Safety and environment</a></li>
+<li><a href="#g-low-level-format">Low level format</a></li>
+<li><a href="#g-drive-settings">Drive settings</a></li>
+<li><a href="#g-output">Output</a></li>
+<li><a href="#g-device-mapper-maps-hddscan-dm-command-also-installed-as-dm-badblocks">Device-mapper maps</a></li>
+</ul></nav>
+<section class="optgroup" id="g-selection">
+<h3>Selection</h3>
+<dl class="opts">
+<dt id="opt-profile"><code>--profile NAME</code></dt>
+<dd><pre class="optpre">what you are about to do with the drive, which sets
+the mode and the passes that go with it.  Default
+&#x27;predeploy&#x27;, so a bare run stops and asks for
+<a href="#opt-confirm"><code>--confirm</code></a> rather than doing anything:
+  predeploy  no data on it yet: write every sector
+             and verify it reads back, 1M chunks,
+             write cache off for the run.  Leaves
+             the drive configured for service:
+             <a href="#opt-fix-config"><code>--fix-config</code></a> and <a href="#opt-bms"><code>--bms</code></a> on, weekly,
+             SAVED on SAS drives
+  inservice  it holds data you want to keep: never
+             writes anything
+  survey     quick triage of a shelf: samples the
+             surface, read only
+  decay      weeks after predeploy: has it rotted?
+  repair     predeploy, plus forcing a reallocation
+             of anything unreadable
+Any explicit flag overrides what the profile set,
+whichever order they appear in.  The drive
+settings a profile carries apply only in its own
+mode: <a href="#opt-mode"><code>--mode</code></a> read on predeploy saves nothing</pre></dd>
+<dt id="opt-tui"><code>-i, --tui</code></dt>
+<dd>interactive terminal UI: pick drives and settings on one form, then watch a live dashboard while it runs. A summary holds the verdicts when the scan finishes; from there n starts another test and q quits. Implied when nothing to scan was named and stdin and stdout are a terminal; pass it to get the form even with devices named, which arrive pre-selected</dd>
+<dt id="opt-no-tui"><code>--no-tui</code></dt>
+<dd>never open the UI, whatever the terminal looks like</dd>
+<dt id="opt-check-deps"><code>--check-deps</code></dt>
+<dd>list the optional tools hddscan can use, whether each is installed, and the dnf/apt line that installs what is missing, then exit</dd>
+<dt id="opt-list"><code>--list</code></dt>
+<dd>show detected drives, their health-relevant facts and whether they are safe to test, then exit</dd>
+<dt id="opt-all"><code>--all</code></dt>
+<dd>scan every detected rotational, unmounted disk</dd>
+<dt id="opt-include-ssd"><code>--include-ssd</code></dt>
+<dd>allow non-rotational devices (thresholds will be off)</dd>
+<dt id="opt-include-remote"><code>--include-remote</code></dt>
+<dd>allow iSCSI/virtio/FC/Hyper-V disks.  These report themselves as rotational but you would be measuring a network and someone else&#x27;s cache, not a platter</dd>
+</dl></section>
+<section class="optgroup" id="g-parallelism">
+<h3>Parallelism</h3>
+<dl class="opts">
+<dt><code>Several drives are always scanned at the same time, one worker process per</code></dt>
+<dd></dd>
+<dt><code>drive, because separate spindles are genuinely independent.</code></dt>
+<dd>Work is never</dd>
+<dt><code>parallelised inside a single drive: a second outstanding request makes the</code></dt>
+<dd></dd>
+<dt><code>head seek away and you would be timing the queue, not the platter.</code></dt>
+<dd></dd>
+<dt id="opt-max-parallel"><code>--max-parallel N</code></dt>
+<dd>cap concurrent drives.  Useful when the HBA, expander or PSU cannot feed every drive at full speed, which would otherwise show up as inflated latency</dd>
+<dt id="opt-sequential"><code>--sequential</code></dt>
+<dd>one drive at a time, full report straight to stdout</dd>
+</dl></section>
+<section class="optgroup" id="g-runs-that-outlive-the-terminal">
+<h3>Runs that outlive the terminal</h3>
+<dl class="opts">
+<dt><code>A scan or a format is a run: it belongs to a supervisor process of its own,</code></dt>
+<dd></dd>
+<dt><code>not to the window that started it, and every drive in it keeps a small</code></dt>
+<dd></dd>
+<dt><code>record of where it has got to.</code></dt>
+<dd>Quit, close the terminal or lose the ssh</dd>
+<dt><code>session and the work carries on; come back with --status or --attach.</code></dt>
+<dd></dd>
+<dt><code>Records live under /var/lib/hddscan as root, otherwise under</code></dt>
+<dd></dd>
+<dt><code>~/.local/state/hddscan.</code></dt>
+<dd>On the dashboard, q leaves the run going, d goes</dd>
+<dt><code>back to the list of runs and x stops it.</code></dt>
+<dd></dd>
+<dt id="opt-detach"><code>--detach</code></dt>
+<dd>start the run and return to the shell, printing its id.  Nothing is watched and nothing is waited for</dd>
+<dt id="opt-status"><code>--status [RUN|DRIVE]</code></dt>
+<dd>what every run on this machine is doing, as text. With a run id (or a prefix of one, or the name of a drive in it), the drives in that one run</dd>
+<dt id="opt-status-json"><code>--status-json [RUN|DRIVE]</code></dt>
+<dd>the same thing as JSON, for a script</dd>
+<dt id="opt-attach"><code>--attach [RUN|DRIVE]</code></dt>
+<dd>open the dashboard on a run already going.  With no argument, the list of runs to choose from</dd>
+<dt id="opt-stop"><code>--stop RUN|all</code></dt>
+<dd>ask a run to stop.  Each drive still writes the report for the part of it that was covered</dd>
+<dt id="opt-forget"><code>--forget RUN|finished</code></dt>
+<dd>drop the records of a finished run.  Never touches a live one, and never touches the reports themselves</dd>
+<dt id="opt-state-dir"><code>--state-dir DIR</code></dt>
+<dd>keep run records here instead of the default (HDDSCAN_STATE_DIR does the same thing)</dd>
+</dl></section>
+<section class="optgroup" id="g-test-mode">
+<h3>Test mode</h3>
+<dl class="opts">
+<dt id="opt-mode"><code>--mode read</code></dt>
+<dd>read-only surface scan, never writes (the mode of <a href="#opt-profile"><code>--profile</code></a> inservice; the default profile writes)</dd>
+<dt><code>--mode verify</code></dt>
+<dd>non-destructive write test: save sector, write pattern, read back, restore.  DATA LOSS ON POWER CUT</dd>
+<dt><code>--mode write</code></dt>
+<dd>destructive: overwrite everything with a pattern and verify it reads back correctly</dd>
+<dt><code>--mode check</code></dt>
+<dd>read-only re-verify of a pattern an earlier <a href="#opt-mode"><code>--mode</code></a> write run left behind.  Run it days or weeks later to catch sectors that lost their charge</dd>
+<dt id="opt-confirm"><code>--confirm STRING</code></dt>
+<dd>required for verify/write; must equal the device name (e.g. sdb) or its serial number</dd>
+<dt id="opt-repair"><code>--repair</code></dt>
+<dd>give a drive its best chance, in one flag: overwrite every sector, which is what refreshes a weak one; rewrite anything still slow after that; force a reallocation on anything that will not read at all; then re-read the whole device to prove it held. Implies <a href="#opt-mode"><code>--mode</code></a> write and so DESTROYS ALL DATA and needs <a href="#opt-confirm"><code>--confirm</code></a>.  Also turns the drive&#x27;s read cache off, since a repair verified out of the drive&#x27;s own DRAM is not a repair you verified</dd>
+<dt id="opt-second-pass"><code>--second-pass</code></dt>
+<dd>after <a href="#opt-mode"><code>--mode</code></a> write, re-read the whole device and re-verify the pattern (catches slow data decay)</dd>
+<dt id="opt-rewrite-weak"><code>--rewrite-weak</code></dt>
+<dd>rewrite readable-but-slow sectors in place to make the drive refresh or remap them (needs verify/write, or read mode plus this flag for read-modify-write)</dd>
+<dt id="opt-force-remap"><code>--force-remap</code></dt>
+<dd>overwrite UNREADABLE sectors with zeros to force a reallocation.  Destroys the contents of those sectors</dd>
+</dl></section>
+<section class="optgroup" id="g-range-and-sizing">
+<h3>Range and sizing</h3>
+<dl class="opts">
+<dt id="opt-start"><code>--start SIZE</code></dt>
+<dd>first byte to test (default 0)</dd>
+<dt id="opt-end"><code>--end SIZE</code></dt>
+<dd>last byte to test (default end of device)</dd>
+<dt id="opt-chunk"><code>--chunk SIZE</code></dt>
+<dd>bulk read size, default 128K, 1M under predeploy and repair</dd>
+<dt id="opt-block"><code>--block SIZE</code></dt>
+<dd>drill-down granularity, default 4K</dd>
+<dt id="opt-sample"><code>--sample N</code></dt>
+<dd>only test every Nth chunk (fast surface survey)</dd>
+<dt id="opt-order"><code>--order ORDER</code></dt>
+<dd>sequential (default), reverse, or random.  Sequential reads at full streaming speed, but the drive is prefetching ahead of you, so a merely marginal sector can be served from its buffer and look healthy. random defeats that entirely and is far slower; combine it with <a href="#opt-sample"><code>--sample</code></a> for a thorough spot check</dd>
+<dt id="opt-max-time"><code>--max-time SECONDS</code></dt>
+<dd>stop after this long and report what was covered</dd>
+<dt id="opt-max-errors"><code>--max-errors N</code></dt>
+<dd>stop after N hard I/O errors (default: never)</dd>
+</dl></section>
+<section class="optgroup" id="g-latency-budget">
+<h3>Latency budget</h3>
+<dl class="opts">
+<dt id="opt-chunk-slow-ms"><code>--chunk-slow-ms MS</code></dt>
+<dd>chunk budget; over this we drill into sectors</dd>
+<dt id="opt-sector-slow-ms"><code>--sector-slow-ms MS</code></dt>
+<dd>sector budget; over this we retry the sector</dd>
+<dt id="opt-auto-factor"><code>--auto-factor F</code></dt>
+<dd>auto budget = F x measured median (default 3)</dd>
+<dt id="opt-floor-ms"><code>--floor-ms MS</code></dt>
+<dd>auto budget never goes below this (default 25)</dd>
+<dt id="opt-min-rate"><code>--min-rate MIB</code></dt>
+<dd>a hard drive testing slower than this many MiB/s at 4 MiB chunks is failing; scaled down for smaller chunks.  Judged after 2 minutes; 0 turns it off (default 10)</dd>
+<dt id="opt-retries"><code>--retries N</code></dt>
+<dd>re-reads of a suspicious sector (default 20).  A sector that is merely weak often reads back fine after a few tries; that is the drive recovering</dd>
+<dt id="opt-retry-max-seconds"><code>--retry-max-seconds S</code></dt>
+<dd>give up retrying one sector after this long (default 60, 0 = no limit).  Without it a drive whose every read hits the SCSI timeout would take minutes per sector and never finish</dd>
+</dl></section>
+<section class="optgroup" id="g-safety-and-environment">
+<h3>Safety and environment</h3>
+<dl class="opts">
+<dt id="opt-force"><code>--force</code></dt>
+<dd>test even if the drive looks mounted or in use</dd>
+<dt id="opt-drive-lookahead"><code>--drive-lookahead off|keep</code></dt>
+<dd>&#x27;off&#x27; (the default) tells the drive to stop prefetching into its own DRAM for the duration of the scan, so a sequential pass cannot be handed a marginal sector at cache speed.  Restored on exit. needs hdparm on ATA/SATA, sdparm on SAS/SCSI; without the right one the scan says so and runs</dd>
+</dl></section>
+<section class="optgroup" id="g-low-level-format">
+<h3>Low level format</h3>
+<dl class="opts">
+<dt id="opt-format"><code>--format</code></dt>
+<dd>FORMAT UNIT every selected drive, in parallel. This ERASES THE DRIVE, runs for hours and cannot be undone; a power cut partway through can leave a drive needing vendor tooling. Needs <a href="#opt-confirm"><code>--confirm</code></a> and sg_format.  The exact command is printed per drive before anything starts</dd>
+<dt id="opt-format-blocksize"><code>--format-blocksize 512|4096|keep</code></dt>
+<dd>logical block size to format to (default: keep)</dd>
+<dt id="opt-format-fast"><code>--format-fast</code></dt>
+<dd>ask for a fast format: the drive does not visit every block, which can turn hours into minutes. Only meaningful when the physical sector layout is not changing -- a 512e drive is already 4096 bytes per physical sector, so moving the logical size to 4096 is a remapping.  Unwritten blocks read without error afterwards.  Drives may refuse it, at no cost</dd>
+<dt id="opt-format-pi"><code>--format-pi none|keep|0..3</code></dt>
+<dd>protection information to format with.  &#x27;keep&#x27; preserves what the drive already reports, and is the default because sg_format itself defaults to stripping it -- changing block size would otherwise silently remove protection as a side effect</dd>
+</dl></section>
+<section class="optgroup" id="g-drive-settings">
+<h3>Drive settings</h3>
+<dl class="opts">
+<dt id="opt-apply-settings"><code>--apply-settings</code></dt>
+<dd>apply the settings below to every selected drive and stop, without scanning anything.  Settings are applied before the scan either way, so a drive is configured the moment you ask rather than when a scan happens to reach it</dd>
+<dt id="opt-fix-config"><code>--fix-config</code></dt>
+<dd>apply the configuration this tool recommends for a drive going into service: auto-reallocate on for both reads and writes, read cache on.  Only the parts actually wrong are touched, each is printed, and they are SAVED -- a fix that reverted when the scan ended would not be a fix.  On by default under predeploy and repair</dd>
+<dt id="opt-no-fix-config"><code>--no-fix-config</code></dt>
+<dd>leave the configuration alone under those profiles</dd>
+<dt id="opt-awre"><code>--awre on|off|keep</code></dt>
+<dd>let the drive retire a sector it struggles to write</dd>
+<dt id="opt-arre"><code>--arre on|off|keep</code></dt>
+<dd>the same on read.  With both off the firmware never reallocates, so <a href="#opt-rewrite-weak"><code>--rewrite-weak</code></a> and <a href="#opt-force-remap"><code>--force-remap</code></a> rewrite a bad sector straight back onto itself</dd>
+<dt id="opt-read-cache"><code>--read-cache on|off|keep</code></dt>
+<dd>&#x27;off&#x27; stops the drive serving any read from its own DRAM, which is stricter than <a href="#opt-drive-lookahead"><code>--drive-lookahead</code></a> off. Leaving it off on a drive in service makes reads crawl; this is the other half of the classic ex-array &#x27;writes fast, reads like treacle&#x27; fault</dd>
+<dt id="opt-drive-read-retries"><code>--drive-read-retries N bound how many times the drive re-reads a sector</code></dt>
+<dd>internally before reporting it (SCSI RRC, 0..255). The count-based twin of <a href="#opt-recovery-time"><code>--recovery-time</code></a>; firmware differs in which of the two it actually honours, so setting both is the reliable way to make a drive fail fast.  Not to be confused with <a href="#opt-retries"><code>--retries</code></a>, which is how many times *this tool* re-reads a sector</dd>
+<dt id="opt-drive-write-retries"><code>--drive-write-retries N</code></dt>
+<dd>the same for writes (SCSI WRC)</dd>
+<dt id="opt-recovery-time"><code>--recovery-time MS</code></dt>
+<dd>bound how long the drive fights one bad sector before reporting it (SCSI RTL; 0 means unlimited, which is what makes a dying disk stall for minutes and a ZFS or RAID member get faulted).  SAS only</dd>
+<dt id="opt-persist"><code>--persist</code></dt>
+<dd>save the settings this run changes to the drive so they survive a power cycle, instead of putting them back when the scan ends.  Needs a SAS/SCSI drive and sdparm; anything else is applied for the run only and says so.  Only settings you named are saved -- the look-ahead, read cache and write cache defaults are not, or every scanned drive would be left permanently slower</dd>
+<dt id="opt-write-cache"><code>--write-cache on|off|keep</code></dt>
+<dd>with the cache on a write returns as soon as the drive has it in DRAM, so a write mode times the cache and not the platter; &#x27;off&#x27; makes it honest and much slower.  Also the other half of the ex-array fault where RCD and WCE together give a drive that writes fast and reads like treacle. Restored on exit, and never saved by <a href="#opt-persist"><code>--persist</code></a> unless named here.  Default &#x27;off&#x27; under predeploy and repair, &#x27;keep&#x27; otherwise</dd>
+<dt id="opt-bms"><code>--bms on|keep</code></dt>
+<dd>&#x27;on&#x27; tells every selected SAS/SCSI drive to run its own background medium scan: the firmware sweeps the platters whenever the drive is idle, logs what it finds and reallocates the sectors it can still recover.  Unlike every other setting here this one is SAVED ON THE DRIVE and is not undone afterwards; &#x27;sdparm <code>--clear</code>=EN_BMS <code>--save</code> /dev/sdX&#x27; turns it back off.  Default &#x27;on&#x27; under predeploy and repair, &#x27;keep&#x27; otherwise, which touches nothing</dd>
+<dt id="opt-bms-interval"><code>--bms-interval HOURS</code></dt>
+<dd>how often that background scan sweeps the media, saved with it (SCSI BMS_I).  Default 168, weekly, under predeploy and repair; otherwise the drive&#x27;s own.  Needs <a href="#opt-bms"><code>--bms</code></a> on</dd>
+<dt id="opt-io-timeout"><code>--io-timeout SEC</code></dt>
+<dd>lower the kernel&#x27;s per-command timeout during the scan so a dying sector fails fast (restored after)</dd>
+<dt id="opt-max-temp"><code>--max-temp C</code></dt>
+<dd>abort if the drive gets this hot (default 58, 0=off)</dd>
+<dt id="opt-no-smart"><code>--no-smart</code></dt>
+<dd>do not call smartctl</dd>
+<dt id="opt-no-direct"><code>--no-direct</code></dt>
+<dd>do not use O_DIRECT (results will include cache hits)</dd>
+<dt id="opt-dry-run"><code>--dry-run</code></dt>
+<dd>show what would be done, touch nothing</dd>
+</dl></section>
+<section class="optgroup" id="g-output">
+<h3>Output</h3>
+<dl class="opts">
+<dt id="opt-json"><code>--json FILE</code></dt>
+<dd>write a machine readable report</dd>
+<dt id="opt-badblocks-list"><code>--badblocks-list FILE</code></dt>
+<dd>write bad sectors in badblocks(8) format, ready for &#x27;mke2fs -l FILE&#x27; so a new filesystem steps around them.  Includes every sector the scan would not trust: bad, corrupt and weak alike</dd>
+<dt id="opt-badblocks-blocksize"><code>--badblocks-blocksize N</code></dt>
+<dd>unit for that list (default 1024). Use the filesystem&#x27;s own block size, usually 4096</dd>
+<dt id="opt-badblocks-offset"><code>--badblocks-offset N</code></dt>
+<dd>subtract a partition&#x27;s start offset from the block numbers, since mke2fs runs on the partition</dd>
+<dt id="opt-badblocks-from"><code>--badblocks-from FILE</code></dt>
+<dd>build that list from a scan that has already finished, reading its checkpoint (<a href="#opt-state"><code>--state</code></a>, or the one a parallel run keeps per drive) or its <a href="#opt-csv"><code>--csv</code></a>. Touches no drive, so the block size and offset can be chosen once the partition exists</dd>
+<dt id="opt-hide-bad"><code>--hide-bad</code></dt>
+<dd>write a map of the damage the last finished whole-drive scan found onto the drive, and activate /dev/mapper/bb-&lt;serial&gt;: the same drive with the damage cut out, for any filesystem (see &#x27;dm&#x27; below). Whatever is on the drive becomes unreachable, so it needs <a href="#opt-confirm"><code>--confirm</code></a> like a write</dd>
+<dt id="opt-prometheus"><code>--prometheus FILE</code></dt>
+<dd>write metrics for node_exporter&#x27;s textfile collector</dd>
+<dt id="opt-journal"><code>--journal FILE</code></dt>
+<dd>crash journal for <a href="#opt-mode"><code>--mode</code></a> verify: the original bytes are fsynced here before the pattern is written, so a power cut mid-chunk can be undone by the next run</dd>
+<dt id="opt-csv"><code>--csv FILE</code></dt>
+<dd>write every suspect sector as CSV</dd>
+<dt id="opt-log"><code>--log FILE</code></dt>
+<dd>tee the report to a file</dd>
+<dt id="opt-state"><code>--state FILE</code></dt>
+<dd>checkpoint progress here every 15s.  With several drives the name gets the device appended, one file each; without it every drive in a run checkpoints inside the run&#x27;s own directory anyway</dd>
+<dt id="opt-resume"><code>--resume</code></dt>
+<dd>continue from the checkpoint in <a href="#opt-state"><code>--state</code></a></dd>
+<dt id="opt-outdir"><code>--outdir DIR</code></dt>
+<dd>where per-device reports go with <code>--parallel</code></dd>
+<dt id="opt-map-width"><code>--map-width N</code></dt>
+<dd>width of the surface map (default 64)</dd>
+<dt id="opt-quiet"><code>--quiet</code></dt>
+<dd>no progress output</dd>
+<dt id="opt-no-color"><code>--no-color</code></dt>
+<dd>plain text</dd>
+<dt id="opt-help"><code>-h, --help</code></dt>
+<dd>this text</dd>
+</dl></section>
+<section class="optgroup" id="g-device-mapper-maps-hddscan-dm-command-also-installed-as-dm-badblocks">
+<h3>Device-mapper maps: hddscan dm COMMAND (also installed as dm-badblocks)</h3>
+<dl class="opts">
+<dt><code>create DEV --bad FILE --confirm DEV</code></dt>
+<dd>map DEV&#x27;s damage onto DEV itself</dd>
+<dt><code>activate DEV | activate-all</code></dt>
+<dd>load it as /dev/mapper/NAME</dd>
+<dt><code>remap DEV --bad FILE</code></dt>
+<dd>move damage found later to spares</dd>
+<dt><code>status DEV | table DEV | map DEV OFF | deactivate NAME</code></dt>
+<dd></dd>
+<dt id="opt-bad"><code>--bad FILE</code></dt>
+<dd>bad blocks, badblocks(8) format, whole-device</dd>
+<dt id="opt-block-size"><code>--block-size N</code></dt>
+<dd>unit of those numbers, default 1024</dd>
+<dt id="opt-extent"><code>--extent SIZE</code></dt>
+<dd>granularity of the map, default 1M</dd>
+<dt id="opt-reserve"><code>--reserve PCT</code></dt>
+<dd>share of the drive held as spares, default 0.1</dd>
+<dt id="opt-name"><code>--name NAME</code></dt>
+<dd>device-mapper name, default bb-&lt;device&gt;</dd>
+<dt id="opt-logical"><code>--logical</code></dt>
+<dd>remap: FILE numbers blocks of the mapped device</dd>
+<dt id="opt-offline"><code>--offline</code></dt>
+<dd>remap: the device is not active</dd>
+<dt id="opt-physical"><code>--physical</code></dt>
+<dd>map: OFF is on the drive, not the mapped device</dd>
+<dt><code>&#x27;hddscan dm --help&#x27; has the rest</code></dt>
+<dd></dd>
+</dl></section>
+<p class="exit">Exit status: 0 healthy, 1 suspect, 2 failing or usage error, 130 interrupted.</p>
+<!-- END OPTIONS -->
+</article>
+</div>
+
+<footer>
+	<div class="wrap">
+		<span>hddscan · MIT licence · © 2026 Olav Gjerde</span>
+		<span><a href="./">Home</a> · <a href="https://github.com/IntelliStream-DataHub/hddscan">GitHub</a></span>
+	</div>
+</footer>
+</body>
+</html>

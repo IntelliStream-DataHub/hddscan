@@ -299,7 +299,9 @@ does the same thing.
 .SS Test mode
 .TP
 .BI \-\-mode " read"
-Read-only surface scan. The default, and safe.
+Read-only surface scan; never writes. The mode of
+.BR "\-\-profile inservice" ;
+the default profile, predeploy, writes.
 .TP
 .BI \-\-mode " verify"
 Non-destructive write test: save the sector, write a pattern, read it back,

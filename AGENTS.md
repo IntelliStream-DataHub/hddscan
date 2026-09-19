@@ -356,11 +356,24 @@ only — say so rather than implying otherwise.
   behind them.
 - Test artifacts (`*.bin`, `hddscan-*.txt`, `*.md5`, state files) must be
   cleaned up; the repo tracks only `hddscan.c`, `Makefile`, `hddscan.8`,
-  `LICENSE`, `README.md`, `DESIGN.md`, `tests/`, `docs/` (the README's
-  screenshots), `contrib/` (the boot unit for the maps) and this file.
+  `LICENSE`, `README.md`, `DESIGN.md`, `tests/`, `docs/` (the site, and the
+  README's screenshots), `tools/` (what generates them), `contrib/` (the boot
+  unit for the maps) and this file.
 - `hddscan.8` and `usage()` document the same options and must not drift.
   `make mancheck` diffs the two option lists and prints nothing when they
   agree; run it after adding or renaming any flag.
+- `docs/` is the GitHub Pages site: `index.html` (what it is for),
+  `guide.html` (the form, the dashboard and the CLI) and `style.css`, plain
+  files with no build step and no script. The option reference inside
+  `guide.html` is generated from `--help` by `tools/options.py`, between its
+  markers, and `make sitecheck` prints nothing when it is current -- run it
+  with `mancheck`. The screenshots in `docs/img/` are drawn from hddscan's own
+  output by `tools/shots.py` (`make site` does both); regenerate them after
+  changing anything a screen shows, never edit an SVG by hand. The runs in them
+  come from a demo store whose records point at a `sleep` the script starts,
+  so they draw as live. `HDDSCAN_NO_ENUMERATE` keeps the machine's own drives,
+  serials included, out of the form, so the pictures are the same wherever they
+  are made.
 
 **12. A run outlives whatever started it, and every screen is only a viewer.**
 A scan or a format belongs to a supervisor process that `setsid()`s away from

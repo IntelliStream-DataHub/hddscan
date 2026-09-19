@@ -11,6 +11,9 @@ reallocated sector in its life, while its own error log showed 42.9 million
 reads that needed the slow recovery path, and its own long self-test had
 already failed.
 
+**Site and guide, with screenshots of every screen:**
+<https://intellistream-datahub.github.io/hddscan/>
+
 Single-file C, no dependencies beyond libc, so the binary works on a rescue
 system with nothing installed. `smartctl`, `sdparm`, `hdparm` and sg3-utils are
 used when present and done without when absent.
@@ -28,7 +31,7 @@ summary holds the verdicts on screen — `n` starts another test, `q` quits, and
 on a drive the scan found damage on, `h` hides it (below). If
 something is already running on the machine, it shows you that first.
 
-![The hddscan dashboard following a 24-drive write test](docs/tui-dashboard.svg)
+![The hddscan dashboard following a 24-drive write test](docs/img/tui-dashboard.svg)
 
 Each drive gets two rows — what it is doing, then how it is behaving — and the
 whole table fits an 80-column terminal. A shelf is more drives than any screen
@@ -104,7 +107,7 @@ twenty-four more being scanned are two runs, and the dashboard swaps between
 them with one keystroke. Start hddscan again on a machine with work in progress
 and it shows you that work before it offers to configure any more.
 
-![hddscan --status listing a scan and a format, then one run's drives](docs/cli-status.svg)
+![hddscan --status listing a scan and a format, then one run's drives](docs/img/cli-status.svg)
 
 Records live in `/var/lib/hddscan` as root, `~/.local/state/hddscan` otherwise,
 and are plain key-and-value text — `--status-json` if a script wants them, grep
@@ -165,11 +168,12 @@ mkfs.ext4 -b 4096 -l /root/sdb.bb /dev/sdb1
 e2fsck -l /root/sdb.bb /dev/sdb1     # add more, after a later scan
 ```
 
-Only ext2/3/4 can do this. XFS and btrfs have no equivalent, and mdraid and ZFS
-deliberately fault a drive out on a read error rather than routing around one —
-which is the right behaviour for redundancy and the wrong one for a drive you
-have decided to nurse. A drive kept this way belongs where a second copy exists:
-a backup target or a scratch disk, not an array or a pool. Re-scan every few
+Only ext2/3/4 keep such a list. For anything else, `--hide-bad` cuts the damage
+out one layer down (see *Using a damaged drive anyway* above). Never put the raw
+drive in mdraid or a ZFS pool: both deliberately fault a drive out on a read
+error rather than routing around one — the right behaviour for redundancy, the
+wrong one for a drive you have decided to nurse. A drive kept this way belongs
+where a second copy exists: a backup target or a scratch disk. Re-scan every few
 months and add what turns up; the list only covers damage that had already
 appeared when it was made.
 
@@ -221,7 +225,8 @@ Worth knowing before you reach for this:
   drives, and which paths are still unverified.
 - [AGENTS.md](AGENTS.md) — the invariants, and how to change this without
   making it quietly lie about drive health.
-- `make test` — 151 tests, no root and no real device required.
+- `make test` — about 360 tests across three suites, no root and no real
+  device required.
 
 ## Licence
 
