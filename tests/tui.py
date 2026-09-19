@@ -221,6 +221,19 @@ class Session:
         return None
 
 
+def drawn_widths(raw):
+    """How wide each row was as the program wrote it, from one cursor move to
+    the next.  A Screen wraps at its own width and the next absolute move then
+    writes over the spill, so a row wider than the terminal cannot be seen in
+    the grid at all -- it can only be measured in the stream."""
+    widths = []
+    for seg in re.split(rb"\x1b\[\d+;\d+H", bytes(raw))[1:]:
+        seg = CSI.sub(b"", OSC.sub(b"", seg))
+        seg = re.split(rb"[\r\n]", seg)[0]
+        widths.append(len(seg.decode("utf-8", "replace")))
+    return widths
+
+
 def img(d, name, mb):
     p = os.path.join(d, name)
     with open(p, "wb") as f:
@@ -617,7 +630,12 @@ def main():
         # would be a race anyway; the values themselves are covered by the
         # progress-line test below.  What is pinned here is that a finished
         # drive's second row says what the drive is rather than holding the
-        # latency it had while it was still running.
+        # latency it had while it was still running.  Which drives the last
+        # frame caught finished is a race too -- this check once passed on a
+        # frame whose only drive was still scanning, because a single read
+        # was not yet enough to show -- so it looks only at rows that say
+        # they are done, and the section on drilling drives below pins the
+        # same thing with a record written by hand.
         s.wait(lambda: s.on_screen("finished"), 12.0)
         raw = bytes(s.raw)
         fin = raw.find(b"finished")
@@ -632,10 +650,13 @@ def main():
                       if "DRIVE" in l and "STATE" in l), -1)
             return lines[h + 1:h + 8] if h >= 0 else []
 
-        check("a finished drive shows no stale latency numbers",
-              bool([l for l in rows_now() if l.strip()]) and
-              not any(" med " in l for l in rows_now()),
-              "\n".join(rows_now() or lines[:14]))
+        done_rows = rows_now()
+        check("a drive the last frame shows finished has no latency under it",
+              bool([l for l in done_rows if l.strip()]) and
+              not any(re.search(r"HEALTHY|SUSPECT|FAILING|STOPPED", l) and
+                      " med " in done_rows[k + 1]
+                      for k, l in enumerate(done_rows[:-1])),
+              "\n".join(done_rows or lines[:14]))
         hdr = [i for i, l in enumerate(lines) if "DRIVE" in l and "STATE" in l]
         if not hdr:
             bad("the dashboard renders a drive table", "\n".join(lines[:14]))
@@ -1107,6 +1128,159 @@ def main():
         cut = [l for l in grid if l.count("%") != l.count("]")]
         check("no grid cell is cut off at the edge of a 112-column terminal",
               grid and not cut, "\n".join(cut or grid or s.screen.lines()))
+        s.send(b"q", 0.4)
+        s.close()
+
+        print("== a drive drilling past the window keeps its latency row ==")
+
+        # REGRESSION: a drive drilling into one chunk for longer than the
+        # thirty-second window finished no chunk inside it, so its record
+        # carried no latency and the dashboard drew the row a drive that is
+        # not running gets -- model and size -- for the one drive on the
+        # screen in the worst trouble.  Records written by hand, since only
+        # a failing disk drills for that long.
+        run = os.path.join(STATE, "runs", "20200606-070809")
+        os.makedirs(run, exist_ok=True)
+        pst = int(open("/proc/self/stat").read().rsplit(")", 1)[1].split()[19])
+        now = int(time.time())
+        with open(os.path.join(run, "run"), "w") as f:
+            f.write("run 1\nid 20200606-070809\nkind scan\n"
+                    "what destructive write + verify\n"
+                    "detail destructive write + verify\n"
+                    "outdir %s\ncreated %d\nended 0\nsup %d\nsupstart %d\n"
+                    "njobs 4\n" % (tmp, now - 164, os.getpid(), pst))
+        for dev, bad_n, weak_n, lat in (
+                ("sdc", 0, 98, "lat 0.00 0.00 0.00 0.00\n"
+                               "blat 12.40 850.20 4.10 4800.20\n"),
+                ("sdd", 3, 7, "lat 0.00 0.00 0.00 0.00\nlatidle 1\n"),
+                ("sdf", 0, 0, "lat 30.20 28.00 18.40 72.00\nwlat 2.50\n"),
+                ("sdh", 0, 0, "lat 10.10 10.20 8.80 36.90\nwlat 7.20\n"),
+                # what a worker leaves behind: the latency it had while it
+                # ran, and the supervisor's verdict patched in on top
+                ("sdx", 0, 0, "lat 10.10 10.20 8.80 36.90\nwlat 7.20\n"
+                              "state 2\nverdict 0\n")):
+            with open(os.path.join(run, dev + ".job"), "w") as f:
+                # sdc's ETA is 42781h, ten characters: the width that once
+                # pushed its state word a column right of the header
+                f.write("job 1\ndevice %s\npath /dev/%s\n"
+                        "model ST14000NM0168\nsize 14000519643136\n"
+                        "state 1\nverdict -1\npid %d\npidstart %d\n"
+                        "started %d\nupdated %d\npct 0.0\nrate 90000\n"
+                        "eta %d\nbad %d\nweak %d\nbytes 2000000000\n%s"
+                        % (dev, dev, os.getpid(), pst, now - 164, now,
+                           154012000 if dev == "sdc" else 1000000,
+                           bad_n, weak_n, lat))
+
+        s = Session(["--attach", "20200606-070809", "--no-color"],
+                    rows=30, cols=80)
+        s.wait(lambda: s.on_screen("DRIVE"), 5.0)
+        lines = s.screen.lines()
+
+        def under(dev):
+            i = next((k for k, l in enumerate(lines)
+                      if l.lstrip().startswith(dev + " ")), -1)
+            return lines[i + 1] if 0 <= i < len(lines) - 1 else ""
+
+        check("a drive drilling past the window shows its sector reads",
+              re.search(r"sector med\s+12\.4 .*max 4800\.2", under("sdc"))
+              and "ST14000" not in under("sdc"),
+              "%r\n%s" % (under("sdc"), "\n".join(lines)))
+        check("a drive that finished no read in the window says so",
+              "no read finished in the last 30 seconds" in under("sdd"),
+              "%r" % under("sdd"))
+        check("a drive with chunks in the window is not labelled sector",
+              re.search(r"^\s+med\s+30\.2 ", under("sdf")) is not None,
+              "%r" % under("sdf"))
+        w80 = drawn_widths(s.raw)
+        check("the latency rows fit an 80-column terminal",
+              w80 and max(w80) <= 80, "widest row drawn: %d" % max(w80 or [0]))
+        check("a finished drive shows no stale latency numbers",
+              "ST14000" in under("sdx") and " med " not in under("sdx"),
+              "%r" % under("sdx"))
+
+        def state_cols(ls):
+            i = next((k for k, l in enumerate(ls)
+                      if "DRIVE" in l and "STATE" in l), -1)
+            if i < 0:
+                return -1, []
+            words = [m.start() for l in ls[i + 1:]
+                     for m in re.finditer(r"\b(scanning|HEALTHY)\b", l)]
+            return ls[i].find("STATE"), words
+
+        # REGRESSION: an ETA wider than its column pushed that drive's
+        # state a column right of the header, and every other one with it
+        h, w = state_cols(lines)
+        check("every state word starts under STATE",
+              h > 0 and len(w) == 5 and set(w) == {h},
+              "STATE at %d, state words at %r\n%s" % (h, w, "\n".join(lines)))
+        s.send(b"q", 0.4)
+        s.close()
+
+        # A terminal with room for both halves side by side gets them on one
+        # row -- measured, never cut: one column short of that, it is two.
+        def wide(cols):
+            s = Session(["--attach", "20200606-070809", "--no-color"],
+                        rows=24, cols=cols)
+            s.wait(lambda: s.on_screen("DRIVE"), 5.0)
+            s.pump(0.3)
+            ls, raw = s.screen.lines(), bytes(s.raw)
+            s.send(b"q", 0.4)
+            s.close()
+            return ls, raw
+
+        lines, raw = wide(134)
+        h, w = state_cols(lines)
+        check("a wide terminal puts each drive on one row",
+              any(l.lstrip().startswith("sdc ") and "4800.2" in l
+                  for l in lines) and
+              any(l.lstrip().startswith("sdx ") and "ST14000" in l
+                  for l in lines), "\n".join(lines))
+        check("one row per drive still lines its state up under STATE",
+              h > 0 and len(w) == 5 and set(w) == {h},
+              "STATE at %d, state words at %r" % (h, w))
+        check("one row per drive never runs past the terminal",
+              drawn_widths(raw) and max(drawn_widths(raw)) <= 134,
+              "widest row drawn: %d" % max(drawn_widths(raw) or [0]))
+        lines, raw = wide(133)
+        check("a terminal one column short keeps two rows",
+              not any(l.lstrip().startswith("sdc ") and "med" in l
+                      for l in lines) and
+              any(re.search(r"sector med\s+12\.4", l) for l in lines),
+              "\n".join(lines))
+
+        # The same screen in colour: a figure over 50 ms is yellow, over
+        # 100 ms red, and a bad or weak count is red or yellow once it is
+        # not zero.  Colour is separate bytes, so the padding before a
+        # number sits inside the colour and the width is unchanged.
+        s = Session(["--attach", "20200606-070809"], rows=24, cols=80)
+        s.wait(lambda: s.on_screen("DRIVE"), 5.0)
+        s.pump(0.4)
+        raw = bytes(s.raw)
+        red, yel = b"\x1b[31m", b"\x1b[33m"
+        check("a latency over 100 ms is red",
+              red + b"4800.2" in raw and red + b" 850.2" in raw,
+              "no red 4800.2 / 850.2 in the frame")
+        check("a latency over 50 ms is yellow",
+              yel + b"  72.0" in raw, "no yellow 72.0 in the frame")
+        check("a latency under 50 ms is not coloured",
+              b"med   10.1" in raw and b"med   30.2" in raw,
+              "10.1 or 30.2 carries a colour")
+        check("a weak count is yellow, a bad count red",
+              yel + b"      98" in raw and red + b"      3" in raw,
+              "weak 98 / bad 3 not coloured")
+        check("a zero count is not coloured",
+              red + b"      0" not in raw and yel + b"       0" not in raw,
+              "a zero count carries a colour")
+        check("the summary colours the totals",
+              b"bad sectors " + red + b"3" in raw and
+              b"weak " + yel + b"105" in raw,
+              "summary totals not coloured")
+        lines = s.screen.lines()
+        check("colour costs no columns: the stripes still line up",
+              max(drawn_widths(s.raw) or [0]) <= 80 and
+              any(re.search(r"sdc\s+0\.0%.*\s98\s", l) for l in lines),
+              "widest row drawn: %d\n%s"
+              % (max(drawn_widths(s.raw) or [0]), "\n".join(lines)))
         s.send(b"q", 0.4)
         s.close()
 

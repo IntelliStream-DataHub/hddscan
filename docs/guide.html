@@ -169,11 +169,15 @@ the drive asks again, and needs <kbd>y</kbd>.</p>
 	     alt="The dashboard's table: each drive's percentage, read rate, bad and weak sector counts and ETA, with a second row of latencies; finished drives show their verdict.">
 </figure>
 <figcaption>A 24-drive write test, 83 hours in. Each drive has two rows: what
-it is doing, then how it is behaving. Screenshots of runs come from a demo
+it is doing, then how it is behaving. A terminal wide enough for both puts
+them side by side on one. Screenshots of runs come from a demo
 record store, not a real shelf.</figcaption>
 <p>Rate, ETA and latency are measured over the last 30 seconds, so a drive
 that has just walked into a bad patch shows it now rather than hours later.
-Drives needing attention sort to the top. A shelf is more drives than a screen
+Latency is in milliseconds, yellow over 50 and red over 100; a drive that has
+spent the whole window drilling into one slow chunk shows its single-sector
+reads instead, marked <code>sector</code>. Bad and weak counts turn red and
+yellow once they are not zero. Drives needing attention sort to the top. A shelf is more drives than a screen
 holds, so the table pages with <kbd>&lt;</kbd> <kbd>&gt;</kbd>, and
 <kbd>g</kbd> swaps it for an overview with one line per drive:</p>
 <figure class="shot">

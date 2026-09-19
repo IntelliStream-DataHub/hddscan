@@ -44,10 +44,11 @@ something is already running on the machine, it shows you that first.
 
 ![The hddscan dashboard following a 24-drive write test](docs/img/tui-dashboard.svg)
 
-Each drive gets two rows — what it is doing, then how it is behaving — and the
-whole table fits an 80-column terminal. A shelf is more drives than any screen
-holds, so it pages: `<` and `>`, the arrow keys, page up and page down. `g`
-swaps the table for an overview that puts every drive on one line, and back.
+Each drive shows what it is doing, then how it is behaving: one row on a
+terminal wide enough for both, two otherwise, and the whole table fits an
+80-column terminal. A shelf is more drives than any screen holds, so it pages:
+`<` and `>`, the arrow keys, page up and page down. `g` swaps the table for an
+overview that puts every drive on one line, and back.
 
 `--check-deps` says which
 optional tools are missing and prints the `dnf`/`apt` line that installs them.

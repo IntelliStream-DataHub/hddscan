@@ -101,14 +101,28 @@ floor behind
 is deliberately not windowed that way \(em see
 .BR \-\-min\-rate .
 .PP
+The latency beside or under each drive is measured on the chunk reads that
+finished inside the window, in milliseconds, with
+.B wmed
+the median write. A drive drilling into a slow chunk for longer than the
+window finishes no chunk inside it, so the row shows the single\-block reads of
+the drill\-down instead, marked
+.BR sector ;
+a drive that finished no read at all says that. A figure over 50 ms is yellow
+and one over 100 ms red. The marks are fixed, so a number is the same colour
+on every drive, and they are a cue rather than a verdict: the budget that
+decides what is slow follows the platter, and a large chunk from the inner
+tracks of a healthy drive can take more than 50 ms.
+.PP
 .B BAD
 counts sectors that failed every attempt;
 .B WEAK
 counts sectors that were over the latency budget, or came back only on a
 retry. Both are counted in sectors of
 .BR \-\-block
-bytes. The end of scan report breaks the same sectors down by how many tries
-and how many errors each one took.
+bytes, and once either is not zero it is coloured, red and yellow. The end of
+scan report breaks the same sectors down by how many tries and how many errors
+each one took.
 .SS Thresholds
 Budgets are calibrated per drive, using the same access pattern the scan will
 use. Timing scattered reads and then scanning sequentially would produce a
@@ -247,11 +261,13 @@ starts another test and
 .B x
 stops the run after asking.
 .SS Reading the dashboard
-A drive is two rows: what it is doing \(em percentage, rate, bad and weak
-sector counts, ETA and state \(em and then how it is behaving, which for a
-running drive is its read latency over the last thirty seconds and for any
-other is what the drive is. A rule separates one drive from the next. The
-whole table fits eighty columns.
+A drive is what it is doing \(em percentage, rate, bad and weak sector
+counts, ETA and state \(em and then how it is behaving, which for a running
+drive is its read latency over the last thirty seconds and for any other is
+what the drive is. On a terminal wide enough for both, that is one row per
+drive; otherwise it is two, with a rule between one drive and the next, and
+the whole table fits eighty columns. The rate, count and ETA columns widen
+to fit what is in them, so the header stays over its values.
 .PP
 More drives than the screen holds is the normal case on a shelf, so the table
 pages:

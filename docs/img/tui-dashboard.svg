@@ -10,42 +10,54 @@
 <text y="79" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de"> [=========================================================================---]  95.7%              </tspan></text>
 <text y="115" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de">  5 scanning   0 queued   19 done   </tspan><tspan x="321.5" fill="#8fd66b">15 healthy</tspan><tspan x="422.6" fill="#e5c07b">4 suspect</tspan><tspan x="515.4" fill="#ff7b72">0 failing</tspan></text>
 <text y="133" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de">  905.75 MiB/s aggregate   472.63 TiB tested   eta 7h 36m                                           </tspan></text>
-<text y="151" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de">  bad sectors 3   weak 1051                                                                         </tspan></text>
+<text y="151" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de">  bad sectors </tspan><tspan x="136.0" fill="#ff7b72">3</tspan><tspan x="144.4" fill="#d0d4de">   weak </tspan><tspan x="211.9" fill="#e5c07b">1051</tspan></text>
 <text y="187" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de">  RATE, ETA and latency are measured over the last 30 seconds; latency in ms                        </tspan></text>
-<text y="205" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de">  DRIVE       PCT        RATE     BAD     WEAK       ETA STATE                                      </tspan></text>
-<text y="223" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de">  sdb       71.0% 169.75 MiB/s       0       40    5h 50m scanning                                  </tspan></text>
+<text y="205" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de">  DRIVE       PCT         RATE     BAD     WEAK        ETA STATE                                    </tspan></text>
+<text y="223" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de">  sdb       71.0% 169.75 MiB/s       0 </tspan><tspan x="346.8" fill="#e5c07b">      40</tspan><tspan x="414.2" fill="#d0d4de">     5h 50m scanning                                 </tspan></text>
 <text y="241" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de">             med   11.0  avg   12.8  min    7.5  max   26.7  wmed   21.4                            </tspan></text>
-<rect x="18.0" y="245.5" width="843.0" height="18" fill="#303640"/>
-<text y="259" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de">  sdc       75.1% 175.45 MiB/s       0       63    6h 16m scanning                                  </tspan></text>
+<rect x="18.0" y="245.5" width="328.8" height="18" fill="#303640"/>
+<rect x="346.8" y="245.5" width="67.4" height="18" fill="#303640"/>
+<rect x="414.2" y="245.5" width="446.8" height="18" fill="#303640"/>
+<text y="259" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de">  sdc       75.1% 175.45 MiB/s       0 </tspan><tspan x="346.8" fill="#e5c07b">      63</tspan><tspan x="414.2" fill="#d0d4de">     6h 16m scanning                                 </tspan></text>
 <rect x="18.0" y="263.5" width="843.0" height="18" fill="#303640"/>
 <text y="277" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de">             med   11.4  avg   13.4  min    7.5  max   35.7  wmed   21.4                            </tspan></text>
-<text y="295" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de">  sdd       79.2% 181.15 MiB/s       0       86    6h 43m scanning                                  </tspan></text>
+<text y="295" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de">  sdd       79.2% 181.15 MiB/s       0 </tspan><tspan x="346.8" fill="#e5c07b">      86</tspan><tspan x="414.2" fill="#d0d4de">     6h 43m scanning                                 </tspan></text>
 <text y="313" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de">             med   11.8  avg   14.0  min    7.5  max   44.7  wmed   21.4                            </tspan></text>
-<rect x="18.0" y="317.5" width="843.0" height="18" fill="#303640"/>
-<text y="331" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de">  sde       83.3% 186.85 MiB/s       0      109    7h 10m scanning                                  </tspan></text>
-<rect x="18.0" y="335.5" width="843.0" height="18" fill="#303640"/>
-<text y="349" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de">             med   12.2  avg   14.6  min    7.5  max   53.7  wmed   21.4                            </tspan></text>
-<text y="367" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de">  sdf       87.4% 192.55 MiB/s       0      132    7h 36m scanning                                  </tspan></text>
-<text y="385" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de">             med   12.6  avg   15.2  min    7.5  max   62.7  wmed   21.4                            </tspan></text>
-<rect x="18.0" y="389.5" width="480.5" height="18" fill="#303640"/>
-<rect x="498.5" y="389.5" width="59.0" height="18" fill="#303640"/>
-<rect x="557.5" y="389.5" width="303.5" height="18" fill="#303640"/>
-<text y="403" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de">  sdg      100.0%       0 B/s       3      612         - </tspan><tspan x="498.5" fill="#e5c07b">SUSPECT</tspan><tspan x="557.5" fill="#d0d4de">                                    </tspan></text>
+<rect x="18.0" y="317.5" width="328.8" height="18" fill="#303640"/>
+<rect x="346.8" y="317.5" width="67.4" height="18" fill="#303640"/>
+<rect x="414.2" y="317.5" width="446.8" height="18" fill="#303640"/>
+<text y="331" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de">  sde       83.3% 186.85 MiB/s       0 </tspan><tspan x="346.8" fill="#e5c07b">     109</tspan><tspan x="414.2" fill="#d0d4de">     7h 10m scanning                                 </tspan></text>
+<rect x="18.0" y="335.5" width="446.8" height="18" fill="#303640"/>
+<rect x="464.8" y="335.5" width="50.6" height="18" fill="#303640"/>
+<rect x="515.4" y="335.5" width="345.6" height="18" fill="#303640"/>
+<text y="349" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de">             med   12.2  avg   14.6  min    7.5  max </tspan><tspan x="464.8" fill="#e5c07b">  53.7</tspan><tspan x="515.4" fill="#d0d4de">  wmed   21.4                            </tspan></text>
+<text y="367" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de">  sdf       87.4% 192.55 MiB/s       0 </tspan><tspan x="346.8" fill="#e5c07b">     132</tspan><tspan x="414.2" fill="#d0d4de">     7h 36m scanning                                 </tspan></text>
+<text y="385" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de">             med   12.6  avg   15.2  min    7.5  max </tspan><tspan x="464.8" fill="#e5c07b">  62.7</tspan><tspan x="515.4" fill="#d0d4de">  wmed   21.4                            </tspan></text>
+<rect x="18.0" y="389.5" width="261.3" height="18" fill="#303640"/>
+<rect x="279.3" y="389.5" width="59.0" height="18" fill="#303640"/>
+<rect x="338.3" y="389.5" width="8.4" height="18" fill="#303640"/>
+<rect x="346.8" y="389.5" width="67.4" height="18" fill="#303640"/>
+<rect x="414.2" y="389.5" width="101.2" height="18" fill="#303640"/>
+<rect x="515.4" y="389.5" width="59.0" height="18" fill="#303640"/>
+<rect x="574.4" y="389.5" width="286.6" height="18" fill="#303640"/>
+<text y="403" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de">  sdg      100.0%        0 B/s </tspan><tspan x="279.3" fill="#ff7b72">      3</tspan><tspan x="338.3" fill="#d0d4de"> </tspan><tspan x="346.8" fill="#e5c07b">     612</tspan><tspan x="414.2" fill="#d0d4de">          - </tspan><tspan x="515.4" fill="#e5c07b">SUSPECT</tspan><tspan x="574.4" fill="#d0d4de">                                  </tspan></text>
 <rect x="18.0" y="407.5" width="109.6" height="18" fill="#303640"/>
 <rect x="127.6" y="407.5" width="261.3" height="18" fill="#303640"/>
 <rect x="388.9" y="407.5" width="472.1" height="18" fill="#303640"/>
 <text y="421" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de">             </tspan><tspan x="127.6" fill="#7d8595">HUH721010AL4200        9.10 TiB</tspan><tspan x="388.9" fill="#d0d4de">                                                        </tspan></text>
-<text y="439" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de">  sdi      100.0%       0 B/s       0        3         - </tspan><tspan x="498.5" fill="#e5c07b">SUSPECT</tspan></text>
+<text y="439" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de">  sdi      100.0%        0 B/s       0 </tspan><tspan x="346.8" fill="#e5c07b">       3</tspan><tspan x="414.2" fill="#d0d4de">          - </tspan><tspan x="515.4" fill="#e5c07b">SUSPECT</tspan></text>
 <text y="457" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="127.6" fill="#7d8595">HUH721010AL4200        9.10 TiB</tspan></text>
-<rect x="18.0" y="461.5" width="480.5" height="18" fill="#303640"/>
-<rect x="498.5" y="461.5" width="59.0" height="18" fill="#303640"/>
-<rect x="557.5" y="461.5" width="303.5" height="18" fill="#303640"/>
-<text y="475" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de">  sdp      100.0%       0 B/s       0        3         - </tspan><tspan x="498.5" fill="#e5c07b">SUSPECT</tspan><tspan x="557.5" fill="#d0d4de">                                    </tspan></text>
+<rect x="18.0" y="461.5" width="328.8" height="18" fill="#303640"/>
+<rect x="346.8" y="461.5" width="67.4" height="18" fill="#303640"/>
+<rect x="414.2" y="461.5" width="101.2" height="18" fill="#303640"/>
+<rect x="515.4" y="461.5" width="59.0" height="18" fill="#303640"/>
+<rect x="574.4" y="461.5" width="286.6" height="18" fill="#303640"/>
+<text y="475" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de">  sdp      100.0%        0 B/s       0 </tspan><tspan x="346.8" fill="#e5c07b">       3</tspan><tspan x="414.2" fill="#d0d4de">          - </tspan><tspan x="515.4" fill="#e5c07b">SUSPECT</tspan><tspan x="574.4" fill="#d0d4de">                                  </tspan></text>
 <rect x="18.0" y="479.5" width="109.6" height="18" fill="#303640"/>
 <rect x="127.6" y="479.5" width="261.3" height="18" fill="#303640"/>
 <rect x="388.9" y="479.5" width="472.1" height="18" fill="#303640"/>
 <text y="493" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de">             </tspan><tspan x="127.6" fill="#7d8595">HUH721010AL4200        9.10 TiB</tspan><tspan x="388.9" fill="#d0d4de">                                                        </tspan></text>
-<text y="511" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de">  sdw      100.0%       0 B/s       0        3         - </tspan><tspan x="498.5" fill="#e5c07b">SUSPECT</tspan></text>
+<text y="511" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de">  sdw      100.0%        0 B/s       0 </tspan><tspan x="346.8" fill="#e5c07b">       3</tspan><tspan x="414.2" fill="#d0d4de">          - </tspan><tspan x="515.4" fill="#e5c07b">SUSPECT</tspan></text>
 <text y="529" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="127.6" fill="#7d8595">ST14000NM0168         12.73 TiB</tspan></text>
 <text y="583" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de">  page 1/3  &lt; &gt; pages  g overview  </tspan><tspan x="313.1" fill="#d0d4de" font-weight="bold">r runs</tspan><tspan x="363.6" fill="#d0d4de">  n new test  x stop  q quit - the run keeps going         </tspan></text>
 </svg>

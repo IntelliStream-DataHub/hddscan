@@ -194,6 +194,20 @@ static const char *c_stripe(int on)
 	return g_term_light ? "\033[48;5;254m" : "\033[48;5;236m";
 }
 
+/*
+ * A count of bad or weak blocks is coloured only when it is not zero: a red 0
+ * on every healthy drive is noise that hides the one drive it should pick out.
+ */
+static const char *cnt_on(uint64_t v, const char *col)
+{
+	return v ? col : "";
+}
+
+static const char *cnt_off(uint64_t v)
+{
+	return v ? c_off() : "";
+}
+
 static uint64_t now_us(void)
 {
 	struct timespec ts;
@@ -430,6 +444,8 @@ typedef struct {
 	int too_slow;           /* under the throughput floor, see rate_judge() */
 	double lat_med, lat_avg, lat_min, lat_max;
 	double wlat_med;        /* 0 when nothing has been written */
+	double blat_med, blat_avg, blat_min, blat_max;  /* drill-down reads */
+	int lat_idle;           /* no read at all finished inside the window */
 	char report[PATH_MAX];
 	char note[160];         /* the last thing this job had to say */
 } jrec_t;
@@ -635,6 +651,11 @@ static void jrec_put(const jrec_t *j)
 		fprintf(f, "tooslow 1\n");
 	if (j->wlat_med > 0)
 		fprintf(f, "wlat %.2f\n", j->wlat_med);
+	if (j->blat_max > 0)
+		fprintf(f, "blat %.2f %.2f %.2f %.2f\n", j->blat_med,
+			j->blat_avg, j->blat_min, j->blat_max);
+	if (j->lat_idle)
+		fprintf(f, "latidle 1\n");
 	if (j->report[0])
 		fprintf(f, "report %s\n", j->report);
 	if (j->note[0])
@@ -693,6 +714,11 @@ static int jrec_get(const char *path, jrec_t *j)
 			j->too_slow = atoi(v);
 		else if (!strcmp(k, "wlat"))
 			j->wlat_med = atof(v);
+		else if (!strcmp(k, "blat"))
+			sscanf(v, "%lf %lf %lf %lf", &j->blat_med,
+			       &j->blat_avg, &j->blat_min, &j->blat_max);
+		else if (!strcmp(k, "latidle"))
+			j->lat_idle = atoi(v);
 		else if (!strcmp(k, "pid"))
 			j->pid = (pid_t)atoi(v);
 		else if (!strcmp(k, "pidstart"))
@@ -2809,6 +2835,15 @@ typedef struct {
 	latwin_t latwin;
 	latwin_t wlatwin;       /* the same for writes, which cost what a read
 				 * at the same place does -- see writes_slow */
+	/*
+	 * And for the single-block reads of a drill-down, kept apart because
+	 * a block is not a chunk: folded into latwin, the thousand quick
+	 * reads of one drilled chunk would pull the median *down* at the
+	 * moment the drive got into trouble.  They are what is shown when no
+	 * chunk finished inside the window -- a drive drilling for longer
+	 * than that is otherwise a drive with no latency at all.
+	 */
+	latwin_t blatwin;
 	int temp_abort;
 	const char *profile;    /* the named profile these defaults came from */
 	int la_disabled;        /* drive look-ahead was actually turned off */
@@ -3707,6 +3742,8 @@ static int cmp_u64(const void *a, const void *b)
 
 static uint64_t chunk_thr_at(const ctx_t *c, uint64_t off);
 static uint64_t block_thr_at(const ctx_t *c, uint64_t off);
+static void latwin_add(latwin_t *w, uint64_t us);
+static void progress(ctx_t *c, int final);
 
 static void analyze_block(ctx_t *c, uint64_t off, size_t len, void *buf,
 			  void *scratch, uint64_t first_us, int first_err)
@@ -3756,12 +3793,14 @@ static void analyze_block(ctx_t *c, uint64_t off, size_t len, void *buf,
 		} else {
 			lat[n_lat++] = us;
 			lat_add(&c->block_lat, us);
+			latwin_add(&c->blatwin, us);
 			if (!readable_copy) {
 				keep = alloc_aligned(len);
 				memcpy(keep, buf, len);
 				readable_copy = 1;
 			}
 		}
+		progress(c, 0);
 	}
 
 	if (n_lat) {
@@ -4032,6 +4071,10 @@ static void drill_chunk(ctx_t *c, uint64_t off, size_t len, void *buf,
 		int err;
 		ssize_t r;
 
+		/* a drill-down can outlast the latency window many times over,
+		 * so whoever is watching hears from it as it goes rather than
+		 * only once the whole chunk is done */
+		progress(c, 0);
 		r = timed_pread(c->fd, buf, bl, o, &us, &err);
 		/*
 		 * EINVAL is the kernel refusing a misaligned direct read, not
@@ -4059,6 +4102,7 @@ static void drill_chunk(ctx_t *c, uint64_t off, size_t len, void *buf,
 		c->blocks_drilled++;
 		if (r == (ssize_t)bl) {
 			lat_add(&c->block_lat, us);
+			latwin_add(&c->blatwin, us);
 			top_add(c, us, o);
 			if (us <= block_thr_at(c, o))
 				continue;
@@ -4114,7 +4158,9 @@ static int latwin_stats(const latwin_t *w, double *med, double *avg,
 		tmp[n++] = w->s[k].us;
 		oldest = w->s[k].at_us;
 	}
-	if (n < 2)
+	/* one read is a poor median, but on a drive that manages one read in
+	 * thirty seconds it is the only true one there is */
+	if (n < 1)
 		return 0;
 	qsort(tmp, (size_t)n, sizeof(tmp[0]), cmp_u32);
 	for (i = 0; i < n; i++)
@@ -4291,7 +4337,7 @@ static void progress(ctx_t *c, int final)
 	static uint64_t last;
 	uint64_t now = now_us();
 	double el, rate, avg_rate, eta, eta_avg, pct;
-	char b1[32], b2[32], b3[32], lw[96] = "";
+	char b1[32], b2[32], b3[32], lw[128] = "";
 	int tty = isatty(STDERR_FILENO);
 
 	/*
@@ -4360,12 +4406,20 @@ static void progress(ctx_t *c, int final)
 	 */
 	if (g_job_own) {
 		double med = 0, avg = 0, lo = 0, hi = 0, span = 0;
+		double bmed = 0, bavg = 0, blo = 0, bhi = 0, bspan;
 		double wmed = 0, wavg, wlo, whi, wspan;
+		int nc, nb;
 
-		latwin_stats(&c->latwin, &med, &avg, &lo, &hi, &span);
+		nc = latwin_stats(&c->latwin, &med, &avg, &lo, &hi, &span);
+		nb = latwin_stats(&c->blatwin, &bmed, &bavg, &blo, &bhi, &bspan);
 		if (!latwin_stats(&c->wlatwin, &wmed, &wavg, &wlo, &whi, &wspan))
 			wmed = 0;
 		g_job.wlat_med = wmed;
+		g_job.blat_med = bmed;
+		g_job.blat_avg = bavg;
+		g_job.blat_min = blo;
+		g_job.blat_max = bhi;
+		g_job.lat_idle = !nc && !nb && c->chunks_read;
 		g_job.pct = pct;
 		g_job.rate = rate;
 		g_job.eta = eta;
@@ -4390,10 +4444,17 @@ static void progress(ctx_t *c, int final)
 			snprintf(lw, sizeof(lw),
 				 "  last %.0fs med %.1f avg %.1f min %.1f "
 				 "max %.1f ms", span, med, avg, lo, hi);
+		else if (latwin_stats(&c->blatwin, &med, &avg, &lo, &hi, &span))
+			snprintf(lw, sizeof(lw),
+				 "  last %.0fs sector med %.1f avg %.1f "
+				 "min %.1f max %.1f ms", span, med, avg, lo, hi);
 		if (lw[0] && latwin_stats(&c->wlatwin, &wmed, &wavg, &wlo,
 					  &whi, &wspan))
 			snprintf(lw + strlen(lw) - 3, sizeof(lw) - (strlen(lw) - 3),
 				 ", write med %.1f ms", wmed);
+		if (!lw[0] && c->chunks_read)
+			snprintf(lw, sizeof(lw), "  no read finished in the "
+				 "last %ds", LATWIN_SECS);
 	}
 	fprintf(stderr, "\r%s  %5.1f%%  %s/s%s  bad:%" PRIu64 " weak:%" PRIu64
 		"%s  elapsed %s  eta %s   ",
@@ -8066,8 +8127,10 @@ static int render_parallel(const run_t *r, const jrec_t *j, int n,
 		fprintf(stderr, "\033[2K  [");
 		for (k = 0; k < w; k++)
 			fputc(k < filled ? '=' : '-', stderr);
-		fprintf(stderr, "]  bad sectors %" PRIu64 ", weak %" PRIu64
-			"   \n", t.bad, t.weak);
+		fprintf(stderr, "]  bad sectors %s%" PRIu64 "%s, weak %s%"
+			PRIu64 "%s   \n",
+			cnt_on(t.bad, c_red()), t.bad, cnt_off(t.bad),
+			cnt_on(t.weak, c_yel()), t.weak, cnt_off(t.weak));
 		lines++;
 	}
 	LINE("  run %s   hddscan --status %s   %s\n", r->id, r->id,
@@ -8085,12 +8148,14 @@ static int render_parallel(const run_t *r, const jrec_t *j, int n,
 			for (i = 0; i < shown; i++) {
 				jrec_t *x = &sorted[i];
 
-				LINE("    %-8s %5.1f%% %9s/s  bad %-5" PRIu64
-				     " weak %-7" PRIu64 " %s%-10s%s        \n",
+				LINE("    %-8s %5.1f%% %9s/s  bad %s%-5" PRIu64
+				     "%s weak %s%-7" PRIu64 "%s %s%-10s%s        \n",
 				     jrec_name(x),
 				     x->state == JS_DONE ? 100.0 : x->pct,
 				     human_size((uint64_t)x->rate, b1, sizeof(b1)),
-				     x->bad, x->weak,
+				     cnt_on(x->bad, c_red()), x->bad,
+				     cnt_off(x->bad), cnt_on(x->weak, c_yel()),
+				     x->weak, cnt_off(x->weak),
 				     jrec_color(x), jrec_word(x, format), c_off());
 			}
 			free(sorted);
@@ -8099,11 +8164,12 @@ static int render_parallel(const run_t *r, const jrec_t *j, int n,
 		for (i = 0; i < n; i++) {
 			const jrec_t *x = &j[i];
 
-			LINE("    %-8s %5.1f%% %9s/s  bad %-5" PRIu64
-			     " weak %-7" PRIu64 " eta %-10s %s%s%s   \n",
+			LINE("    %-8s %5.1f%% %9s/s  bad %s%-5" PRIu64
+			     "%s weak %s%-7" PRIu64 "%s eta %-10s %s%s%s   \n",
 			     jrec_name(x), x->state == JS_DONE ? 100.0 : x->pct,
 			     human_size((uint64_t)x->rate, b1, sizeof(b1)),
-			     x->bad, x->weak,
+			     cnt_on(x->bad, c_red()), x->bad, cnt_off(x->bad),
+			     cnt_on(x->weak, c_yel()), x->weak, cnt_off(x->weak),
 			     x->state == JS_RUNNING ?
 			     human_time(x->eta, b2, sizeof(b2)) : "-",
 			     jrec_color(x), jrec_word(x, format), c_off());
@@ -8330,6 +8396,187 @@ static void tui_row_end(int used, int cols, int striped)
 		fputs("\033[0m", stdout);
 }
 
+/*
+ * Figures that are coloured by what they mean.  Colour costs bytes but no
+ * columns, so each returns only the width it printed, which is what
+ * tui_row_end() pads by; and inside a stripe the colour is ended with
+ * c_plain(), since a reset would end the stripe along with it.
+ *
+ * The latency marks are fixed rather than taken from each drive's budget, so
+ * that one number is one colour on every drive on the screen.  They are a cue
+ * for the eye and not a verdict: the budget that decides what is slow follows
+ * the platter (thr_at()), and a large chunk from the inner tracks of a
+ * healthy drive can take longer than 50 ms by itself.
+ */
+#define LAT_WARN_MS 50.0
+#define LAT_BAD_MS 100.0
+
+static int tui_count(uint64_t v, int width, const char *col, int striped)
+{
+	int used;
+
+	col = cnt_on(v, col);
+	printf("%s", col);
+	used = printf("%*" PRIu64, width, v);
+	if (col[0])
+		printf("%s", striped ? c_plain() : c_off());
+	return used;
+}
+
+/*
+ * printf(), or -- with draw off -- only the width printf() would have used.
+ * A layout decided by measuring one thing and then drawing another is a
+ * layout that wraps the day the two disagree, so the tail of a drive's row is
+ * measured by running the code that draws it.
+ */
+static int tui_put(int draw, const char *fmt, ...)
+	__attribute__((format(printf, 2, 3)));
+
+static int tui_put(int draw, const char *fmt, ...)
+{
+	va_list ap;
+	int n;
+
+	va_start(ap, fmt);
+	n = draw ? vprintf(fmt, ap) : vsnprintf(NULL, 0, fmt, ap);
+	va_end(ap);
+	return n;
+}
+
+static int tui_ms(double ms, int striped, int draw)
+{
+	const char *col = ms > LAT_BAD_MS ? c_red() :
+			  ms > LAT_WARN_MS ? c_yel() : "";
+	int used;
+
+	tui_put(draw, "%s", col);
+	used = tui_put(draw, "%6.1f", ms);
+	if (col[0])
+		tui_put(draw, "%s", striped ? c_plain() : c_off());
+	return used;
+}
+
+/*
+ * The part of a drive's row that says how it is behaving: on a line of its
+ * own under the drive at eighty columns, beside it on a terminal with room.
+ * pw is the width of the slot the "sector" label goes in, and room is how
+ * much of the line is left, which only a note is ever cut to fit.
+ *
+ * Writes are timed on their own, because a drive whose writes crawl reads
+ * back at full speed.  A drive drilling for longer than the window finishes
+ * no chunk inside it, so its single-sector reads stand in, labelled as such;
+ * one that finished no read at all says that.  Neither may fall through to
+ * the last case, which is how a drive that is not running says what it is --
+ * and how the one in the worst trouble on the screen once looked like one
+ * that had not started.
+ */
+static int tui_drive_tail(const jrec_t *x, int pw, int room, int striped,
+			  int draw)
+{
+	char b[32];
+	int used;
+
+	if (x->state == JS_RUNNING && (x->lat_max > 0 || x->blat_max > 0)) {
+		static const char *const lbl[4] = {
+			" med ", "  avg ", "  min ", "  max "
+		};
+		int blk = !(x->lat_max > 0), k;
+		double ms[4];
+
+		ms[0] = blk ? x->blat_med : x->lat_med;
+		ms[1] = blk ? x->blat_avg : x->lat_avg;
+		ms[2] = blk ? x->blat_min : x->lat_min;
+		ms[3] = blk ? x->blat_max : x->lat_max;
+		used = tui_put(draw, "  %*s", pw, blk ? "sector" : "");
+		for (k = 0; k < 4; k++) {
+			used += tui_put(draw, "%s", lbl[k]);
+			used += tui_ms(ms[k], striped, draw);
+		}
+		used += tui_put(draw, "  wmed ");
+		if (x->wlat_med > 0)
+			used += tui_ms(x->wlat_med, striped, draw);
+		else
+			used += tui_put(draw, "%6s", "-");
+		return used;
+	}
+	used = tui_put(draw, "  %*s ", pw, "");
+	if (x->state == JS_RUNNING && x->lat_idle) {
+		tui_put(draw, "%s", c_red());
+		used += tui_put(draw, "no read finished in the last %d seconds",
+				LATWIN_SECS);
+	} else {
+		tui_put(draw, "%s", c_dim());
+		used += tui_put(draw, "%-20.20s  %9s",
+				x->model[0] ? x->model : "?",
+				human_size(x->size, b, sizeof(b)));
+		if (x->note[0] && room - used > 2)
+			used += tui_put(draw, "  %.*s", room - used - 2,
+					x->note);
+	}
+	tui_put(draw, "%s", striped ? c_plain() : c_off());
+	return used;
+}
+
+/*
+ * How wide each column of the scan table has to be for what is in it this
+ * frame.  The widths it has always had are the floor, so an ordinary frame
+ * looks as it did; a value that needs more -- an ETA of 42781h 26m, a rate
+ * over 100 MiB/s -- widens its column, header included, instead of pushing
+ * every column after it out of line.  Measured across every drive rather
+ * than the page, so paging does not move the columns.
+ *
+ * Then whether each drive fits on one row.  That is decided by width, never
+ * by truncating: the table was one row once, ran to a hundred columns and
+ * was cut off on anything narrower, which is why it is two rows at eighty.
+ */
+typedef struct {
+	int rate, bad, weak, eta, state;
+	int one;                /* each drive on a single row */
+} dcols_t;
+
+static void tui_dcols(const jrec_t *j, int n, int cols, dcols_t *dc)
+{
+	char b1[32], b2[32];
+	int i, left, tail = 0;
+
+	dc->rate = 11;
+	dc->bad = 7;
+	dc->weak = 8;
+	dc->eta = 10;
+	dc->state = 5;
+	for (i = 0; i < n; i++) {
+		const jrec_t *x = &j[i];
+		int w;
+
+		/* the rate is printed with "/s" after it */
+		w = (int)strlen(human_size((uint64_t)x->rate, b2,
+					   sizeof(b2))) + 2;
+		if (w > dc->rate)
+			dc->rate = w;
+		w = snprintf(b1, sizeof(b1), "%" PRIu64, x->bad);
+		if (w > dc->bad)
+			dc->bad = w;
+		w = snprintf(b1, sizeof(b1), "%" PRIu64, x->weak);
+		if (w > dc->weak)
+			dc->weak = w;
+		if (x->state == JS_RUNNING) {
+			w = (int)strlen(human_time(x->eta, b2, sizeof(b2)));
+			if (w > dc->eta)
+				dc->eta = w;
+		}
+		w = (int)strlen(jrec_word(x, 0));
+		if (w > dc->state)
+			dc->state = w;
+		w = tui_drive_tail(x, 6, 0, 0, 0);
+		if (w > tail)
+			tail = w;
+	}
+	/* "  name(8) pct(6) rate bad weak eta state" */
+	left = 2 + 8 + 1 + 6 + 1 + dc->rate + 1 + dc->bad + 1 + dc->weak +
+	       1 + dc->eta + 1 + dc->state;
+	dc->one = left + tail <= cols;
+}
+
 static void tui_bar(int width, double frac)
 {
 	int i, filled;
@@ -8375,10 +8622,12 @@ static void tui_dashboard(const run_t *r, const jrec_t *j, int n, int nruns,
 	int rows, cols, i, avail, per_page, start, rec, sep, grid, row = 1;
 	int format = !strcmp(r->kind, "format");
 	tally_t t;
+	dcols_t dc;
 	char b1[32], b2[32];
 
 	tui_size(&rows, &cols);
 	tally(j, n, &t);
+	tui_dcols(j, n, cols, &dc);
 
 	tui_at(row++, 1);
 	printf("\033[1m hddscan " VERSION "\033[0m   %s   %d drive%s   "
@@ -8420,8 +8669,9 @@ static void tui_dashboard(const run_t *r, const jrec_t *j, int n, int nruns,
 		printf("  a format cannot be interrupted once the drive has "
 		       "started it");
 	else
-		printf("  bad sectors %" PRIu64 "   weak %" PRIu64,
-		       t.bad, t.weak);
+		printf("  bad sectors %s%" PRIu64 "%s   weak %s%" PRIu64 "%s",
+		       cnt_on(t.bad, c_red()), t.bad, cnt_off(t.bad),
+		       cnt_on(t.weak, c_yel()), t.weak, cnt_off(t.weak));
 	tui_eol();
 	tui_at(row++, 1);
 	tui_eol();
@@ -8438,21 +8688,21 @@ static void tui_dashboard(const run_t *r, const jrec_t *j, int n, int nruns,
 		printf("  %-8s %6s %-10s %-20s %-10s %s", "DRIVE", "PCT",
 		       "SIZE", "MODEL", "STATE", "LAST MESSAGE");
 	else
-		printf("  %-8s %6s %11s %7s %8s %9s %s",
-		       "DRIVE", "PCT", "RATE", "BAD", "WEAK", "ETA", "STATE");
+		printf("  %-8s %6s %*s %*s %*s %*s %s", "DRIVE", "PCT",
+		       dc.rate, "RATE", dc.bad, "BAD", dc.weak, "WEAK",
+		       dc.eta, "ETA", "STATE");
 	tui_eol();
 
 	avail = rows - row - g_msg_count - 2;
 	if (avail < 1)
 		avail = 1;
 	/*
-	 * A drive is two rows in the scan table -- what it is doing, then how
-	 * it is behaving -- separated by a rule.  One row per drive did fit
-	 * once, but only by running to a hundred columns and truncating on
-	 * anything narrower; splitting it is what makes the table honest at
-	 * eighty.  A format has no latency to report and stays one row.
+	 * A drive is two rows in the scan table at eighty columns -- what it
+	 * is doing, then how it is behaving -- and one where the terminal has
+	 * room for both side by side; see tui_dcols().  A format has no
+	 * latency to report and is always one row.
 	 */
-	rec = format ? 1 : 2;
+	rec = (format || dc.one) ? 1 : 2;
 	/*
 	 * With colour, one drive of every two sits on a shaded background and
 	 * the next line belongs to the next drive.  Without it there is
@@ -8558,47 +8808,25 @@ static void tui_dashboard(const run_t *r, const jrec_t *j, int n, int nruns,
 			tui_row_end(used, cols, striped);
 			continue;
 		}
-		used = printf("  %-8.8s %5.1f%% %9s/s %7" PRIu64 " %8" PRIu64
-			      " %9s ",
-			      jrec_name(x), x->state == JS_DONE ? 100.0 : x->pct,
-			      human_size((uint64_t)x->rate, b1, sizeof(b1)),
-			      x->bad, x->weak,
-			      x->state == JS_RUNNING ?
-			      human_time(x->eta, b2, sizeof(b2)) : "-");
+		used = printf("  %-8.8s %5.1f%% %*s/s ", jrec_name(x),
+			      x->state == JS_DONE ? 100.0 : x->pct, dc.rate - 2,
+			      human_size((uint64_t)x->rate, b1, sizeof(b1)));
+		used += tui_count(x->bad, dc.bad, c_red(), striped);
+		used += printf(" ");
+		used += tui_count(x->weak, dc.weak, c_yel(), striped);
+		used += printf(" %*s ", dc.eta, x->state == JS_RUNNING ?
+			       human_time(x->eta, b2, sizeof(b2)) : "-");
 		printf("%s", col);
-		used += printf("%s", jrec_word(x, 0));
+		used += printf("%-*s", dc.one ? dc.state : 0, jrec_word(x, 0));
 		printf("%s", striped ? c_plain() : c_off());
-		tui_row_end(used, cols, striped);
-		/*
-		 * The second row is what the drive is doing now, which only a
-		 * running drive has: writes are timed on their own, because a
-		 * drive whose writes crawl reads back at full speed.  A drive
-		 * that is not running says what it is instead.
-		 */
-		tui_at(row++, 1);
-		printf("%s", bg);
-		if (x->state == JS_RUNNING && x->lat_max > 0) {
-			char wm[16];
-
-			if (x->wlat_med > 0)
-				snprintf(wm, sizeof(wm), "%6.1f", x->wlat_med);
-			else
-				snprintf(wm, sizeof(wm), "%6s", "-");
-			used = printf("  %10s med %6.1f  avg %6.1f  min %6.1f  "
-				      "max %6.1f  wmed %s", "", x->lat_med,
-				      x->lat_avg, x->lat_min, x->lat_max, wm);
-		} else {
-			used = printf("  %10s ", "");
-			printf("%s", c_dim());
-			used += printf("%-20.20s  %9s",
-				       x->model[0] ? x->model : "?",
-				       human_size(x->size, b1, sizeof(b1)));
-			if (x->note[0])
-				used += printf("  %.*s",
-					       cols > 50 ? cols - 48 : 20,
-					       x->note);
-			printf("%s", striped ? c_plain() : c_off());
+		if (!dc.one) {
+			tui_row_end(used, cols, striped);
+			tui_at(row++, 1);
+			printf("%s", bg);
+			used = 0;
 		}
+		used += tui_drive_tail(x, dc.one ? 6 : 10, cols - used,
+				       striped, 1);
 		tui_row_end(used, cols, striped);
 	}
 
