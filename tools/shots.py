@@ -472,8 +472,10 @@ def shoot(tmp, state, work, env, live):
         with open(os.path.join(work, n), "wb") as f:
             f.truncate(int(12.73 * (1 << 40)) if n != "sde.img"
                        else int(9.1 * (1 << 40)))
+    # the form says which optional tools are missing, and a picture of it
+    # must not depend on which ones the machine drawing it has installed
     p = Pty(["-i", "sdb.img", "sdc.img", "sdd.img", "sde.img"], 44, 100,
-            env, work)
+            dict(env, HDDSCAN_TOOLS="all"), work)
     p.wait("Protection info")
     svg(p.screen().grid, "sudo hddscan", img("tui-form.svg"))
     p.close()

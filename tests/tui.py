@@ -1337,7 +1337,7 @@ def main():
         # eighty columns, a wrapped row the budget cannot see.  The runs
         # written by hand above are still live -- their supervisor is this
         # process -- so the program opens on them and 'n' goes to the form.
-        os.environ["HDDSCAN_NO_TOOLS"] = "1"
+        os.environ["HDDSCAN_TOOLS"] = "none"
         os.environ["HDDSCAN_NO_ENUMERATE"] = "1"
         lost, wrapped = [], []
         try:
@@ -1361,7 +1361,7 @@ def main():
                 s.send(b"q", 0.2)
                 s.close()
         finally:
-            del os.environ["HDDSCAN_NO_TOOLS"]
+            del os.environ["HDDSCAN_TOOLS"]
             del os.environ["HDDSCAN_NO_ENUMERATE"]
         check("the banner stays on the form with a run going and no tools",
               not lost, "banner scrolled away at %r rows" % lost)

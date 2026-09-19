@@ -423,13 +423,18 @@ echo "== over budget now and then is not a verdict =="
 # moment, and every drive has those.  One in a thousand is the line.  The
 # counts that decide it are loaded from a checkpoint written by hand, resumed
 # at the last chunk, so the test does not depend on how fast this machine is.
+# That last chunk is still read for real, cold, from a file dd has only just
+# written, and on a slow runner that can go over an auto-calibrated budget --
+# a 6 where the test wants 5.  A budget of a minute leaves the counts to the
+# checkpoint alone.
 f=$(image 32 over.bin)
 ckpt() {
 	printf 'hddscan-state 2\npos %s\nstep 255\nbytes 13090422784\n' \
 		$((255 * 131072)) > "$TMP/over.ckpt"
 	printf 'counters 100000 %s 0 0 0 0 0 0 0\nwrites %s\n' \
 		"$1" "$2" >> "$TMP/over.ckpt"
-	run --state "$TMP/over.ckpt" --resume "$f"
+	run --chunk-slow-ms 60000 --sector-slow-ms 60000 \
+		--state "$TMP/over.ckpt" --resume "$f"
 }
 out=$(ckpt 5 "0 0")
 assert_has "a few chunks over budget in 100000 leave a drive HEALTHY" \
@@ -449,8 +454,10 @@ assert_has "every chunk over budget is SUSPECT even with clean sectors" \
 out=$(runp --profile predeploy --confirm "$f" --json "$TMP/w.json" "$f")
 assert_has "a write scan reports its writes over budget" "$out" \
 	"writes over budget"
-assert_has "the JSON counts writes over budget" "$(cat "$TMP/w.json")" \
-	'"writes_over_budget": 0'
+# REGRESSION: this asserted 0, which is a claim about how fast a runner
+# writes, not about the JSON -- and a write on aarch64 CI went over budget.
+assert_eq "the JSON counts writes over budget" \
+	"$(grep -cE '"writes_over_budget": [0-9]+,' "$TMP/w.json")" "1"
 
 echo "== a stretch of the surface far slower than expected =="
 

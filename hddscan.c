@@ -1981,13 +1981,20 @@ static int tool_present(const char *tool)
 {
 	static const char *dirs[] = { "/usr/bin", "/usr/sbin", "/bin", "/sbin",
 				      "/usr/local/bin", "/usr/local/sbin" };
+	const char *force = getenv("HDDSCAN_TOOLS");
 	char path[128];
 	size_t i;
 
-	/* for the suite: the rescue system this is built for, with none of
-	 * them installed, whatever the machine running the tests has */
-	if (getenv("HDDSCAN_NO_TOOLS"))
+	/*
+	 * For the suite and the screenshots, whatever the machine running
+	 * them has: "none" is the rescue system this is built for, with not
+	 * one of them installed; "all" is a form whose picture does not change
+	 * with the machine it was drawn on.
+	 */
+	if (force && !strcmp(force, "none"))
 		return 0;
+	if (force && !strcmp(force, "all"))
+		return 1;
 	for (i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
 		snprintf(path, sizeof(path), "%s/%s", dirs[i], tool);
 		if (access(path, X_OK) == 0)
@@ -7934,6 +7941,8 @@ static int resolve_target(const char *arg, device_t *d)
 		d->logical_bs = dio_alignment(arg, &st);
 		d->physical_bs = d->logical_bs;
 		d->rotational = 1;
+		/* images are a group of their own in the picker, and say so */
+		probe_group(d);
 		return 0;
 	}
 	if (S_ISBLK(st.st_mode)) {

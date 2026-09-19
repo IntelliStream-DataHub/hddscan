@@ -238,8 +238,9 @@ The form's height also depends on the machine: its drive list includes the
 machine's own drives, and a missing optional tool adds a line. Read what the
 drive keys selected from the `N drives selected` line, not from the ticks that
 happen to be in view, and walk to a drive with `goto()` before looking at its
-row. `HDDSCAN_NO_TOOLS` makes every optional tool look absent, which is the
-only way to put the longest missing-tools line on the form on purpose.
+row. `HDDSCAN_TOOLS=none` makes every optional tool look absent, which is
+the only way to put the longest missing-tools line on the form on purpose;
+`HDDSCAN_TOOLS=all` keeps the line off the screenshots.
 
 **Never assert with a fixed sleep.** The form repaints on its own 200 ms tick,
 so a key pressed just after a repaint is invisible until the next one, and
