@@ -8660,6 +8660,80 @@ static void forward_stop(job_t *jobs, int n)
 	}
 }
 
+static int ckpt_whole(const char *path, uint64_t size);
+static int hide_bad(device_t *t, int n, const opts_t *o);
+
+/*
+ * Can the damage this drive's scan found be handed to --hide-bad from the
+ * summary?  Only for a scan that finished, found something, and covered the
+ * whole drive -- the same test --hide-bad itself applies, asked of this run's
+ * own checkpoint so the offer is never made for a list it would refuse.
+ */
+static int summary_can_hide(const run_t *r, const jrec_t *x)
+{
+	char ck[STORE_MAX + 128];
+
+	if (strcmp(r->kind, "scan") || x->state != JS_DONE ||
+	    !(x->bad + x->weak))
+		return 0;
+	if (snprintf(ck, sizeof(ck), "%s/%s.ckpt", r->dir, x->slug) >=
+	    (int)sizeof(ck))
+		return 0;
+	return ckpt_whole(ck, x->size);
+}
+
+/*
+ * Hide one drive's damage, from the summary.  The work happens in a child:
+ * the map code dies on a refusal (a drive that already has a map, damage
+ * where the map would live), and a refusal must cost this one attempt, not
+ * the summary of a run that took days.  The child writes to the screen as
+ * plain lines; the terminal is not cooked around it, only told nothing is
+ * left to restore, so its exit cannot pull the summary out of the alternate
+ * screen.  Returns the child's status, 0 when the device is there.
+ */
+static int summary_hide(const jrec_t *x)
+{
+	pid_t pid;
+	int st = 0, rc = -1;
+
+	tui_clear();
+	printf("\033[?25h\n  Hiding the damage on %s\n", jrec_name(x));
+	fflush(stdout);
+	pid = fork();
+	if (pid == 0) {
+		device_t d;
+		opts_t ho;
+
+		g_tty_raw = 0;
+		g_dash = 0;
+		g_quiet = 0;
+		g_log = NULL;
+		if (resolve_target(x->path, &d) < 0)
+			_exit(2);
+		memset(&ho, 0, sizeof(ho));
+		ho.tui = 1;     /* the y on the summary was the confirmation */
+		st = hide_bad(&d, 1, &ho);
+		fflush(stdout);
+		fflush(stderr);
+		_exit(st);
+	}
+	if (pid > 0) {
+		while (waitpid(pid, &st, 0) < 0 && errno == EINTR)
+			;
+		rc = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+	}
+	printf("\n  %s%s%s\n\n  press any key to return to the summary",
+	       rc == 0 ? c_grn() : c_red(),
+	       rc == 0 ? "done" : "nothing was changed by the step that failed",
+	       c_off());
+	fflush(stdout);
+	while (tui_key(1000) < 0 && !g_stop)
+		;
+	printf("\033[?25l");
+	tui_clear();
+	return rc;
+}
+
 /*
  * The end-of-run summary screen.  A scan can run for days, so its result must
  * not scroll away the moment the last drive finishes: hold the verdicts on
@@ -8669,7 +8743,19 @@ static void forward_stop(job_t *jobs, int n)
 static int tui_summary(const run_t *r, const jrec_t *j, int n, int nruns)
 {
 	int format = !strcmp(r->kind, "format");
-	int page = 0, npages = 1;
+	int page = 0, npages = 1, sel = 0, arm = 0, anyhide = 0, i0;
+	unsigned char *can = calloc((size_t)(n > 0 ? n : 1), 1);
+
+	/*
+	 * Which drives can have their damage hidden is settled once: the run
+	 * is over, so nothing it decides from can change, and a checkpoint
+	 * read per drive per 200 ms repaint would be a shelf's worth of I/O
+	 * for a screen that is only waiting for a key.
+	 */
+	for (i0 = 0; can && i0 < n; i0++)
+		if ((can[i0] = (unsigned char)summary_can_hide(r, &j[i0])) &&
+		    !anyhide++)
+			sel = i0;
 
 	/*
 	 * The stop that ended the scan is spent; the workers are gone.  Clear
@@ -8733,7 +8819,9 @@ static int tui_summary(const run_t *r, const jrec_t *j, int n, int nruns)
 			const jrec_t *x = &j[i];
 
 			tui_at(row++, 1);
-			printf("  %-8.8s %-10s %-20.20s %s%-10s%s %.*s",
+			/* a cursor only when there is something to point at */
+			printf("%s %-8.8s %-10s %-20.20s %s%-10s%s %.*s",
+			       anyhide && i == sel ? ">" : " ",
 			       jrec_name(x), human_size(x->size, b2, sizeof(b2)),
 			       x->model[0] ? x->model : "?",
 			       jrec_color(x), jrec_word(x, format), c_off(),
@@ -8755,9 +8843,19 @@ static int tui_summary(const run_t *r, const jrec_t *j, int n, int nruns)
 			tui_eol();
 		}
 		tui_at(rows, 1);
-		{
+		if (arm) {
+			printf("  %spress y to hide the damage on %s; whatever is "
+			       "on it becomes unreachable%s", c_red(),
+			       jrec_name(&j[sel]), c_off());
+		} else {
 			int w = printf("  ");
 
+			if (anyhide && can[sel]) {
+				printf("%s", c_bold());
+				w += printf("h");
+				printf("%s", c_off());
+				w += printf(" hide bad blocks  ");
+			}
 			if (npages > 1)
 				w += printf("page %d/%d  < > pages  ",
 					    page + 1, npages);
@@ -8783,32 +8881,64 @@ static int tui_summary(const run_t *r, const jrec_t *j, int n, int nruns)
 		fflush(stdout);
 
 		k = tui_key(200);
+		if (k < 0 && !g_stop)
+			continue;
+		if (arm && k >= 0) {
+			arm = 0;
+			if (k == 'y' && summary_hide(&j[sel]) == 0)
+				can[sel] = 0;   /* it has a map now */
+			continue;
+		}
+		if (anyhide && (k == K_UP || k == K_DOWN)) {
+			sel += k == K_UP ? -1 : 1;
+			if (sel < 0)
+				sel = 0;
+			if (sel >= n)
+				sel = n - 1;
+			page = sel / listrows;
+			continue;
+		}
+		if (k == 'h' || k == 'H') {
+			if (anyhide && can[sel])
+				arm = 1;
+			continue;
+		}
 		if (k == K_RIGHT || k == K_PGDN || k == '>' || k == '.' ||
 		    k == ']' || k == ' ') {
 			if (page + 1 < npages)
 				page++;
+			sel = page * listrows;
 			continue;
 		}
 		if (k == K_LEFT || k == K_PGUP || k == '<' || k == ',' ||
 		    k == '[') {
 			if (page > 0)
 				page--;
+			sel = page * listrows;
 			continue;
 		}
 		if (k == K_HOME) {
 			page = 0;
+			sel = 0;
 			continue;
 		}
 		if (k == K_END) {
 			page = npages - 1;
+			sel = page * listrows;
 			continue;
 		}
-		if (k == 'n' || k == 'N' || k == '\r' || k == '\n')
+		if (k == 'n' || k == 'N' || k == '\r' || k == '\n') {
+			free(can);
 			return 1;
-		if (k == 'r' || k == 'R')
+		}
+		if (k == 'r' || k == 'R') {
+			free(can);
 			return 2;
-		if (k == 'q' || k == 'Q' || k == 27 || k == 3 || g_stop)
+		}
+		if (k == 'q' || k == 'Q' || k == 27 || k == 3 || g_stop) {
+			free(can);
 			return 0;
+		}
 	}
 }
 

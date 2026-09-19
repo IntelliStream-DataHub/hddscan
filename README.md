@@ -24,7 +24,8 @@ sudo ./hddscan            # opens the form
 
 Run it on a terminal with no arguments and it opens a picker: choose drives,
 choose what you are doing, watch a live dashboard. When the scan finishes a
-summary holds the verdicts on screen — `n` starts another test, `q` quits. If
+summary holds the verdicts on screen — `n` starts another test, `q` quits, and
+on a drive the scan found damage on, `h` hides it (below). If
 something is already running on the machine, it shows you that first.
 
 ![The hddscan dashboard following a 24-drive write test](docs/tui-dashboard.svg)
@@ -79,7 +80,9 @@ sudo zpool create -o ashift=12 -O compression=zstd backup /dev/mapper/bb-<serial
 drive itself, and loads it with device-mapper: no kernel module. Damage found
 later is moved to spares held back for it (`hddscan dm remap`), and
 `contrib/dm-badblocks.service` sets the devices up again at boot. The form
-offers it as **Mode → hide bad**. See `DESIGN.md` for how the map works.
+offers it as **Mode → hide bad**, and the summary a scan ends on offers it as
+`h` for any drive the scan found damage on: pick the drive with ↑/↓, press `h`,
+confirm with `y`. See `DESIGN.md` for how the map works.
 
 ## Runs keep going without you
 

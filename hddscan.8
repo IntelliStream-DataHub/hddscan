@@ -36,7 +36,16 @@ pressed:
 .B n
 returns to the form to start another test,
 .B q
-quits and leaves the last run's full reports in the terminal.
+quits and leaves the last run's full reports in the terminal. On a drive the
+scan found damage on, having covered the whole drive,
+.B h
+hides that damage behind a device-mapper device, as
+.B \-\-hide\-bad
+does, after a
+.B y
+to confirm;
+.BR Up / Down
+choose the drive.
 .PP
 The work itself does not belong to that terminal. Each scan or format is a run
 owned by a supervisor process of its own, so quitting, closing the window or

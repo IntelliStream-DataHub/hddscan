@@ -692,6 +692,76 @@ def main():
         check("q on the re-entered form exits", not s.alive)
         s.close()
 
+        print("== hiding a drive's damage from the summary ==")
+
+        # A scan that found damage offers 'h' on its summary; y hands that
+        # drive to --hide-bad.  An image gets its map written and stops short
+        # of activating, which needs a loop device -- so the map is read back
+        # with 'hddscan dm' to prove the key did the real thing.
+        def patterned(name):
+            p = img(tmp, name, 16)
+            subprocess.run([HDDSCAN, "--no-color", "--outdir", tmp, "--mode",
+                            "write", "--confirm", p, p],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return p
+
+        hurt = patterned("hurt.bin")
+        with open(hurt, "r+b") as f:
+            f.seek(8 << 20)
+            f.write(b"BADBADBAD")
+        s = Session(["-i", "--no-color", "--profile", "inservice", "--mode",
+                     "check", "--outdir", tmp, hurt])
+        s.send(b"s", 0.6)
+        s.wait(lambda: s.on_screen("finished"), 12.0)
+        check("a summary with damage on it offers h",
+              s.wait(lambda: s.on_screen("h hide bad blocks")),
+              "\n".join(l for l in s.screen.lines() if l.strip()))
+        check("and points at the drive it would act on",
+              any(l.startswith(">") and "hurt.bin" in l
+                  for l in s.screen.lines()),
+              "\n".join(l for l in s.screen.lines() if "hurt" in l))
+        s.send(b"h", 0.3)
+        check("h asks before doing anything",
+              s.wait(lambda: s.on_screen("press y to hide the damage")))
+        s.send(b"n", 0.3)
+        check("any other key backs out",
+              s.wait(lambda: s.on_screen("h hide bad blocks")))
+        before = subprocess.run([HDDSCAN, "dm", "status", hurt],
+                                capture_output=True, text=True)
+        check("and has written nothing",
+              "no dm-badblocks map" in before.stderr, before.stderr)
+        s.send(b"h", 0.3)
+        s.wait(lambda: s.on_screen("press y to hide the damage"))
+        s.send(b"y", 0.3)
+        check("y hides the damage and says how it went",
+              s.wait(lambda: s.on_screen("press any key to return"), 8.0)
+              and s.on_screen("needs a loop device") and s.on_screen("done"),
+              "\n".join(l for l in s.screen.lines() if l.strip()))
+        after = subprocess.run([HDDSCAN, "dm", "status", hurt],
+                               capture_output=True, text=True)
+        check("the map on the drive skips the extent the scan found bad",
+              "1 extent bad when the map was made" in after.stdout,
+              after.stdout + after.stderr)
+        s.send(b" ", 0.3)
+        check("a key returns to the summary, which no longer offers h",
+              s.wait(lambda: s.on_screen("n new test"))
+              and not s.on_screen("hide bad blocks"),
+              "\n".join(l for l in s.screen.lines() if l.strip()))
+        s.send(b"q", 0.5)
+        s.close()
+
+        clean = patterned("clean.bin")
+        s = Session(["-i", "--no-color", "--profile", "inservice", "--mode",
+                     "check", "--outdir", tmp, clean])
+        s.send(b"s", 0.6)
+        s.wait(lambda: s.on_screen("n new test"), 12.0)
+        check("a clean drive's summary offers nothing to hide",
+              not s.on_screen("hide bad blocks")
+              and not any(l.startswith(">") for l in s.screen.lines()),
+              "\n".join(l for l in s.screen.lines() if l.strip()))
+        s.send(b"q", 0.5)
+        s.close()
+
         print("== a run's dispatch flags do not leak into the next ==")
 
         # The form comes back after every run, so an accept must not inherit

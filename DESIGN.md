@@ -758,7 +758,11 @@ device-mapper already does the remapping, and this only decides what the table
 says. `--hide-bad` is the one-step version. It takes the damage from the
 newest finished whole-drive scan of that drive, matched by serial because
 `sdc` may be `sdd` after a reboot, then writes the map and activates
-`/dev/mapper/bb-<serial>`.
+`/dev/mapper/bb-<serial>`. The summary a scan ends on offers the same thing
+as one key: `h` on a drive whose scan finished, covered the whole drive and
+found damage, then `y`. The work runs in a child process, because the map
+code exits on a refusal, and a refusal should cost that one attempt, not the
+summary of a run that took days.
 
 The drive is divided into extents, 1 MiB by default:
 
