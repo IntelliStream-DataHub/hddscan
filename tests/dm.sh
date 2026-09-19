@@ -187,7 +187,11 @@ assert_has "a name that would reach the shell is refused" "$out" "--name may onl
 
 echo "== one binary =="
 
-ln -s "$PWD/hddscan" "$TMP/dm-badblocks"
+# REGRESSION: this linked "$PWD/hddscan" whatever $BIN named, which exists in
+# a tree that has run make and nowhere else -- the release job tests the
+# binary unpacked from its tarball, found the link dangling, and cancelled
+# the release.  Link the binary under test.
+ln -s "$(realpath "${BIN%% *}")" "$TMP/dm-badblocks"
 assert_has "a link named dm-badblocks runs the maps" \
 	"$("$TMP/dm-badblocks" status "$img" 2>&1)" "(239 extents)"
 assert_has "and names itself that way in its advice" \
