@@ -828,12 +828,17 @@ assert_has "a running drive under the floor says too slow" \
 kill $sp 2>/dev/null; wait $sp 2>/dev/null
 run --forget 20200303-000000 >/dev/null
 
-# The verdict itself needs a scan that outlasts the settle time.  A 1 TiB
-# sparse image drilled chunk by chunk takes that long, and an unreachable
-# floor stands in for a drive that is genuinely too slow.  Drilling needs the
-# default chunk: the budget floor's allowance for a bigger one keeps a sparse
-# read under any budget.
-truncate -s 1T "$TMP/rate.big"
+# The verdict itself needs a scan that outlasts the settle time, and an
+# unreachable floor stands in for a drive that is genuinely too slow.
+# Drilling needs the default chunk: the budget floor's allowance for a bigger
+# one keeps a sparse read under any budget.
+#
+# REGRESSION: the image was 1 TiB, which drilled chunk by chunk took about
+# three minutes on the machine this was written on -- and under two on a
+# faster CI runner, which then finished before the floor was allowed to
+# judge and reported SUSPECT for the chunks over budget alone.  8 TiB, still
+# under ext4's 16, would need 68 GiB/s to finish inside the settle time.
+truncate -s 8T "$TMP/rate.big"
 out=$(run --chunk-slow-ms 0.001 --floor-ms 0 --retries 0 --max-time 130 \
 	--min-rate 1000000 --json "$TMP/rate.json" "$TMP/rate.big"); rc=$?
 assert_has "a drive under the floor is FAILING" "$out" "VERDICT: FAILING"
