@@ -1984,6 +1984,10 @@ static int tool_present(const char *tool)
 	char path[128];
 	size_t i;
 
+	/* for the suite: the rescue system this is built for, with none of
+	 * them installed, whatever the machine running the tests has */
+	if (getenv("HDDSCAN_NO_TOOLS"))
+		return 0;
 	for (i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
 		snprintf(path, sizeof(path), "%s/%s", dirs[i], tool);
 		if (access(path, X_OK) == 0)
@@ -9318,6 +9322,9 @@ static int tui_watch(const char *id, int nruns)
  *
  * Returns 1 for the form (a new test), 0 to quit.
  */
+static int run_interrupted(const run_t *r, const tally_t *t);
+static const char *run_state_word(const run_t *r, const tally_t *t);
+
 static int tui_runs(void)
 {
 	int cur = 0, top = 0, arm = 0;
@@ -9362,22 +9369,17 @@ static int tui_runs(void)
 			tally_t t;
 			char b1[32];
 			const char *state;
+			int intr;
 
 			tally(j, nj, &t);
-			if (r->live)
-				state = t.running ? "running" : "starting";
-			else if (t.running || t.queued || t.orphaned)
-				state = "interrupted";
-			else
-				state = "finished";
+			state = run_state_word(r, &t);
+			intr = run_interrupted(r, &t);
 			tui_at(row++, 1);
 			printf("%s  %-17.17s %-7.7s %-22.22s %6d %6.1f%%  "
 			       "%s%-9s%s %s%s",
 			       i == cur ? "\033[7m" : "",
 			       r->id, r->kind, r->what, nj, t.pct,
-			       !strcmp(state, "interrupted") ? c_yel() : "",
-			       state,
-			       !strcmp(state, "interrupted") ? c_off() : "",
+			       intr ? c_yel() : "", state, intr ? c_off() : "",
 			       human_time(run_elapsed(r), b1, sizeof(b1)),
 			       i == cur ? "\033[0m" : "");
 			tui_eol();
@@ -9614,7 +9616,7 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 	long long retries = o->retries, segment_mb = (long long)(o->segment >> 20);
 	long long parallel = o->max_parallel, sample = (long long)o->sample;
 	int cur = 0, sec = 0, arm = 0, i, rows, cols, dtop = 0;
-	int ftop = 0, fshow = 0, depline = 0, nscroll = 0;
+	int ftop = 0, fshow = 0, dshow = 0, depline = 0, nscroll = 0;
 	int nlive = store_live_count();
 	field_t f[] = {
 	/*
@@ -9816,62 +9818,91 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 		{
 			char dep[256];
 
+			/*
+			 * Counted with the runs line above, not instead of
+			 * it: with both showing, a budget of one scrolled the
+			 * banner off the top.  And cut to the width, since a
+			 * rescue system missing every tool has a list that
+			 * wraps at eighty -- a row the budget cannot see.
+			 */
 			if (deps_missing_str(dep, sizeof(dep))) {
-				depline = 1;
-				printf(" %smissing: %s%s   ('hddscan --check-deps' "
-				       "prints the install command)\n", c_yel(),
-				       dep, c_off());
+				static const char hint[] = "   ('hddscan "
+					"--check-deps' prints the install command)";
+				/* " missing: ", and the last column left free */
+				int w = cols - 11;
+
+				depline++;
+				printf(" %smissing: %.*s%s%s\n", c_yel(),
+				       w > 0 ? w : 0, dep, c_off(),
+				       (int)(strlen(dep) + sizeof(hint) - 1) <= w ?
+				       hint : "");
 			}
+		}
+		/*
+		 * Everything that is not a scrolling row: the banner, the
+		 * optional missing-tools and runs lines, a blank, the Drives
+		 * heading, a blank, the Settings heading, the two group
+		 * headings inside it, a blank, the profile line, the selection
+		 * line, a blank, the key hints and the newline after them --
+		 * and the format section's blank, heading and fields.  The
+		 * drive list and the settings share what is left, and both
+		 * scroll.
+		 *
+		 * The drive list takes up to eight rows, but not past the
+		 * bottom of the terminal: a few drives and a missing tool on
+		 * a 24-row terminal once left the settings less than the two
+		 * rows they are drawn in however short it is, and the form
+		 * ran off the top.  So the list gives back only what the
+		 * settings' two need, keeping two of its own.
+		 */
+		{
+			int room = rows - 13 - depline - (nvis - nscroll + 2);
+			int smin = nscroll < 2 ? nscroll : 2;
+			int dmin = ndev < 2 ? ndev : 2;
+
+			dshow = ndev < 8 ? ndev : 8;
+			if (dshow > room - smin)
+				dshow = room - smin;
+			if (dshow < dmin)
+				dshow = dmin;
+			fshow = room - dshow;
+			if (fshow < 2)
+				fshow = 2;
+			if (fshow > nscroll)
+				fshow = nscroll;
 		}
 		printf("\n");
 
 		printf(" %sDrives%s   (space one, a all free HDDs, g this "
-		       "controller, n none)\n",
+		       "controller, n none)",
 		       sec == 0 ? "\033[7m" : "", sec == 0 ? "\033[0m" : "");
-		{
-			int show = ndev < 8 ? ndev : 8;
-
-			if (dcur >= 0) {
-				if (dcur >= dtop + show)
-					dtop = dcur - show + 1;
-				if (dcur < dtop)
-					dtop = dcur;
-			}
-			if (dtop > ndev - show)
-				dtop = ndev - show;
-			if (dtop < 0)
-				dtop = 0;
-			tui_devices(devs, ndev, pick, dcur, dtop, show);
+		/* a list cut short says so, or the drives past it are simply
+		 * not there as far as anyone looking can tell */
+		if (dshow < ndev)
+			printf("  %d of %d", dshow, ndev);
+		printf("\n");
+		if (dcur >= 0) {
+			if (dcur >= dtop + dshow)
+				dtop = dcur - dshow + 1;
+			if (dcur < dtop)
+				dtop = dcur;
 		}
+		if (dtop > ndev - dshow)
+			dtop = ndev - dshow;
+		if (dtop < 0)
+			dtop = 0;
+		tui_devices(devs, ndev, pick, dcur, dtop, dshow);
 		for (i = 0; i < ndev; i++)
 			if (pick[i])
 				nsel++;
 
 		{
 			/*
-			 * Reserve what the drives, the headings, the profile
-			 * line and the footer need; the settings get the rest
-			 * and scroll inside it.  Without this the form simply
-			 * ran off the bottom of anything shorter than about
-			 * thirty rows, taking the profile description and the
-			 * start/quit hint with it.
+			 * The settings scroll inside what the budget above left
+			 * them.  Without one the form simply ran off the bottom
+			 * of anything shorter than about thirty rows, taking the
+			 * profile description and the start/quit hint with it.
 			 */
-			int show = ndev < 8 ? ndev : 8;
-
-			/*
-			 * Everything that is not a scrolling settings row: the
-			 * banner, the optional missing-tools and runs lines, a
-			 * blank, the Drives heading, the drive rows, a blank,
-			 * the Settings heading, the two group headings inside
-			 * it, a blank, the profile line, the selection line, a
-			 * blank, the key hints and the newline after them --
-			 * and the format section's blank, heading and fields.
-			 */
-			fshow = rows - show - 13 - depline - (nvis - nscroll + 2);
-			if (fshow < 2)
-				fshow = 2;
-			if (fshow > nscroll)
-				fshow = nscroll;
 			if (fcur >= 0 && fcur < nscroll) {
 				if (fcur >= ftop + fshow)
 					ftop = fcur - fshow + 1;
@@ -12866,11 +12897,21 @@ static int run_follow(run_t *rin, const opts_t *o)
  * --status: the same records, for a script or a second terminal
  * ------------------------------------------------------------------ */
 
+/*
+ * Asked as a question of its own rather than by strcmp() on the word: GCC
+ * follows each literal the word can be into the comparison, and on some
+ * versions -Wstring-compare calls "finished" against "interrupted" an error.
+ */
+static int run_interrupted(const run_t *r, const tally_t *t)
+{
+	return !r->live && (t->running || t->queued || t->orphaned);
+}
+
 static const char *run_state_word(const run_t *r, const tally_t *t)
 {
 	if (r->live)
 		return t->running ? "running" : "starting";
-	if (t->running || t->queued || t->orphaned)
+	if (run_interrupted(r, t))
 		return "interrupted";
 	return "finished";
 }
@@ -13018,14 +13059,15 @@ static int status_print(const char *want, int json)
 		tally_t t;
 		char b1[32];
 		const char *state;
+		int intr;
 
 		tally(j, nj, &t);
 		state = run_state_word(&v[i], &t);
+		intr = run_interrupted(&v[i], &t);
 		out("  %-17s %-7s %-22.22s %6d %7.1f%%  %s%-12s%s %s",
 		    v[i].id, v[i].kind, v[i].what, nj, t.pct,
-		    !strcmp(state, "interrupted") ? c_yel() :
-		    v[i].live ? c_grn() : "", state,
-		    (v[i].live || !strcmp(state, "interrupted")) ? c_off() : "",
+		    intr ? c_yel() : v[i].live ? c_grn() : "", state,
+		    (v[i].live || intr) ? c_off() : "",
 		    human_time(run_elapsed(&v[i]), b1, sizeof(b1)));
 		if (!v[i].live && nj) {
 			out("   %d ok, %d suspect, %d failing", t.healthy,

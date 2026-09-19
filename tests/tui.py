@@ -320,8 +320,12 @@ def main():
 
         print("== the form is grouped by what a setting changes ==")
 
+        # Tall enough for every setting at once on any machine: the drive
+        # list above them holds the machine's own drives too, up to eight
+        # rows, and at forty rows a machine with four of them scrolled
+        # "Save to drive" out of sight.
         s = Session(["-i", "--no-color", "--profile", "inservice",
-                     "--outdir", tmp, a], rows=40, cols=110)
+                     "--outdir", tmp, a], rows=48, cols=110)
         s.wait(lambda: s.on_screen("Protection info"))
         lines = s.screen.lines()
         idx = lambda t: next((i for i, l in enumerate(lines) if t in l), -1)
@@ -462,24 +466,37 @@ def main():
 
         s = Session(["-i", "--no-color", "--profile", "inservice",
                      "--outdir", tmp, a, b])
-        s.wait(lambda: s.on_screen("Drives"))
-        rows = [l for l in s.screen.lines() if "[" in l and "]" in l]
+        # the form draws top to bottom, so the heading is on screen before
+        # the rows under it: wait for the rows themselves
+        picked = lambda: [l for l in s.screen.lines() if "[" in l and "]" in l]
         check("the picker shows which controller each drive is on",
-              any(re.search(r"\[.\]\s+\S+\s+(host\d+|file)", l) for l in rows),
-              "\n".join(rows))
+              s.wait(lambda: any(re.search(r"\[.\]\s+\S+\s+(host\d+|file)",
+                                           l) for l in picked())),
+              "\n".join(picked()))
+        # The drive list scrolls once the machine's own drives and these two
+        # do not fit, so what a key selected is read from the count under
+        # the settings, which is always on the form, rather than from
+        # whichever ticks happen to be in view.
+        def nsel():
+            m = [re.search(r"(\d+) drives? selected", l)
+                 for l in s.screen.lines()]
+            m = [x for x in m if x]
+            return int(m[0].group(1)) if m else -1
+
         s.send(b"n", 0.3)
-        check("n clears the selection",
-              s.wait(lambda: not any("[x]" in l for l in s.screen.lines())))
+        check("n clears the selection", s.wait(lambda: nsel() == 0),
+              "%d selected" % nsel())
         s.send(b"a", 0.3)
-        check("a selects every free HDD",
-              s.wait(lambda: sum("[x]" in l for l in s.screen.lines()) >= 2))
+        check("a selects every free HDD", s.wait(lambda: nsel() >= 2),
+              "%d selected" % nsel())
         s.send(b"n", 0.3)
         s.goto(os.path.basename(a), 14)
         s.send(b"g", 0.3)
+        s.wait(lambda: nsel() == 2)
         picked = [l for l in s.screen.lines() if "[x]" in l]
         check("g selects every free drive on that controller",
-              len(picked) >= 2 and all("file" in l for l in picked),
-              "\n".join(picked))
+              nsel() == 2 and picked and all("file" in l for l in picked),
+              "%d selected\n%s" % (nsel(), "\n".join(picked)))
         check("g does not select drives that are in use",
               not any("IN USE" in l for l in picked), "\n".join(picked))
         s.send(b"q"); s.close()
@@ -940,13 +957,19 @@ def main():
         check("a run can be left for the form to start another",
               s.wait(lambda: s.on_screen("configure a run")),
               "\n".join(l for l in s.screen.lines() if l.strip())[:400])
+        # REGRESSION: both of these were asserted the moment the form's
+        # heading appeared, before the rows under it had been drawn, and
+        # failed in CI whenever the frame arrived in two reads
         check("the form says work is already in progress",
-              s.on_screen("already in progress"),
+              s.wait(lambda: s.on_screen("already in progress")),
               "\n".join(l for l in s.screen.lines() if l.strip())[:400])
-        # the picker's name column is 8 wide, so match what it shows
+        # the picker's name column is 8 wide, so match what it shows; and
+        # it scrolls when the machine has drives of its own, so walk to it
+        s.wait(lambda: s.on_screen("q quit"))
+        s.goto("sparse1")
         check("a drive already in a run is not offered as free",
-              any("sparse1" in l and "IN USE" in l
-                  for l in s.screen.lines()),
+              s.wait(lambda: any("sparse1" in l and "IN USE" in l
+                                 for l in s.screen.lines())),
               "\n".join(l for l in s.screen.lines() if "sparse" in l))
         s.send(b"r", 0.8)
         check("'r' on the form goes back to the list of runs",
@@ -1283,6 +1306,51 @@ def main():
               % (max(drawn_widths(s.raw) or [0]), "\n".join(lines)))
         s.send(b"q", 0.4)
         s.close()
+
+        print("== the form's banner survives a short terminal ==")
+
+        # REGRESSION: with a run in progress and a tool missing, the form
+        # printed two banner lines and budgeted for one, and the terminal
+        # scrolled "configure a run" off the top.  Only at heights where
+        # both settings groups are in view does the budget have no slack to
+        # hide that in -- 29 to 37 rows when this was found -- so every
+        # height from 24 up is tried rather than one that happens to pass.
+        # The machine's own drives are left out so those heights do not
+        # move with it, and every tool is made to look absent: that is a
+        # rescue system, and its list of missing tools is too long for
+        # eighty columns, a wrapped row the budget cannot see.  The runs
+        # written by hand above are still live -- their supervisor is this
+        # process -- so the program opens on them and 'n' goes to the form.
+        os.environ["HDDSCAN_NO_TOOLS"] = "1"
+        os.environ["HDDSCAN_NO_ENUMERATE"] = "1"
+        lost, wrapped = [], []
+        try:
+            for h in range(24, 41):
+                s = Session(["-i", "--no-color", "--outdir", tmp, a],
+                            rows=h, cols=80)
+                s.wait(lambda: s.on_screen("runs on this machine"), 5.0)
+                s.send(b"n", 0.3)
+                s.wait(lambda: s.on_screen("q quit"), 5.0)
+                s.pump(0.4)
+                lines = s.screen.lines()
+                if not (lines[0].strip().endswith("configure a run") and
+                        "already in progress" in lines[1]):
+                    lost.append(h)
+                miss = next((k for k, l in enumerate(lines)
+                             if "missing:" in l), -1)
+                if not (0 < miss and len(lines[miss]) < 80 and
+                        "hdparm" in lines[miss] and
+                        not lines[miss + 1].strip()):
+                    wrapped.append(h)
+                s.send(b"q", 0.2)
+                s.close()
+        finally:
+            del os.environ["HDDSCAN_NO_TOOLS"]
+            del os.environ["HDDSCAN_NO_ENUMERATE"]
+        check("the banner stays on the form with a run going and no tools",
+              not lost, "banner scrolled away at %r rows" % lost)
+        check("a long missing-tools line is cut to the width, not wrapped",
+              not wrapped, "missing-tools line wrong at %r rows" % wrapped)
 
         print("== --no-tui is honoured on a terminal ==")
 
