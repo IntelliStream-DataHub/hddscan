@@ -234,6 +234,12 @@ undo exactly the scrolling being tested -- step with raw keys and watch a line
 that does not move, such as the selection line's warning. And every line the
 form prints must fit the terminal width: a wrapped row is a row the budget did
 not count, and the terminal answers by scrolling the top of the form away.
+The form's height also depends on the machine: its drive list includes the
+machine's own drives, and a missing optional tool adds a line. Read what the
+drive keys selected from the `N drives selected` line, not from the ticks that
+happen to be in view, and walk to a drive with `goto()` before looking at its
+row. `HDDSCAN_NO_TOOLS` makes every optional tool look absent, which is the
+only way to put the longest missing-tools line on the form on purpose.
 
 **Never assert with a fixed sleep.** The form repaints on its own 200 ms tick,
 so a key pressed just after a repaint is invisible until the next one, and
