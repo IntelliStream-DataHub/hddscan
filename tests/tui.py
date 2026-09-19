@@ -1264,6 +1264,22 @@ def main():
         check("one row per drive never runs past the terminal",
               drawn_widths(raw) and max(drawn_widths(raw)) <= 134,
               "widest row drawn: %d" % max(drawn_widths(raw) or [0]))
+        # and a terminal wider still is not left half empty: the model and
+        # size go beside the name, then a bar of each drive's progress
+        lines, raw = wide(214)
+        h, w = state_cols(lines)
+        row = lambda d: next((l for l in lines
+                              if l.lstrip().startswith(d + " ")), "")
+        check("a wide terminal gives every drive its model and a bar",
+              "ST14000" in row("sdc") and "[---" in row("sdc") and
+              "4800.2" in row("sdc") and "[====" in row("sdx"),
+              "\n".join(lines))
+        check("the widest layout still lines its state up under STATE",
+              h > 0 and len(w) == 5 and set(w) == {h},
+              "STATE at %d, state words at %r" % (h, w))
+        check("the widest layout fills the terminal and no more",
+              max(drawn_widths(raw) or [0]) == 214,
+              "widest row drawn: %d" % max(drawn_widths(raw) or [0]))
         lines, raw = wide(133)
         check("a terminal one column short keeps two rows",
               not any(l.lstrip().startswith("sdc ") and "med" in l
