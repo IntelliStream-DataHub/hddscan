@@ -270,6 +270,28 @@ def main():
         check("the profile explains itself in words",
               s.wait(lambda: s.on_screen("no data on it yet")),
               "\n".join(s.screen.lines()))
+        # predeploy leaves the drive configured for service, and the form
+        # has to show the same defaults the command line uses
+        for field, want in (("Chunk size", "1M"), ("Write cache", "off"),
+                            ("Recommended config", "yes"),
+                            ("Background scan", "enable"),
+                            ("Scan interval (hours)", "168"),
+                            ("Save to drive", "this run")):
+            check("predeploy sets %s to %s" % (field, want),
+                  s.wait(lambda: s.value_of(field) == want),
+                  "got %r" % s.value_of(field))
+        check("a read pass under predeploy saves nothing",
+              s.set_choice("Mode", "read")
+              and s.wait(lambda: s.value_of("Recommended config") == "no")
+              and s.value_of("Background scan") == "keep"
+              and s.value_of("Write cache") == "keep",
+              "config %r, bms %r, wc %r" % (
+                  s.value_of("Recommended config"),
+                  s.value_of("Background scan"), s.value_of("Write cache")))
+        check("going back to write restores them",
+              s.set_choice("Mode", "write")
+              and s.wait(lambda: s.value_of("Recommended config") == "yes"),
+              "config %r" % s.value_of("Recommended config"))
         check("switching to inservice makes the mode read-only",
               s.set_choice("Profile", "inservice")
               and s.wait(lambda: s.value_of("Mode") == "read"),
@@ -405,6 +427,22 @@ def main():
         check("the form fits a 24x80 terminal with format chosen",
               s.on_screen("configure a run") and s.on_screen("q quit"),
               "\n".join(l for l in s.screen.lines() if l.strip()))
+        s.send(b"q"); s.close()
+
+        # the default profile writes AND saves settings, and its warnings
+        # side by side once ran past eighty columns
+        s = Session(["-i", "--no-color", "--dry-run", "--outdir", tmp, a],
+                    rows=24, cols=80)
+        check("predeploy's footer fits a 24x80 terminal",
+              s.wait(lambda: s.on_screen("saves drive settings"))
+              and s.on_screen("configure a run") and s.on_screen("q quit"),
+              "\n".join(l for l in s.screen.lines() if l.strip()))
+        s.send(b"s", 0.2)
+        check("predeploy's confirmation fits a 24x80 terminal",
+              s.wait(lambda: s.on_screen("and save settings, other keys"))
+              and s.on_screen("configure a run"),
+              "\n".join(l for l in s.screen.lines() if l.strip()))
+        s.send(b"n", 0.2)
         s.send(b"q"); s.close()
 
         print("== bulk selection, for a shelf rather than a drive ==")

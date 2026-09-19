@@ -5889,8 +5889,6 @@ static void fs_plan(const ctx_t *c)
 	out("\n   3. e2fsck -l /root/%s.bb %s\n", slug, target);
 	out("      the same list, added to a filesystem that already exists, for\n"
 	    "      when a later scan finds more.\n");
-	out("\n   Re-scan every few months and add what it finds: the list only\n"
-	    "   covers damage that had already appeared by the time it was made.\n");
 }
 
 static void report(ctx_t *c)
@@ -6851,8 +6849,10 @@ typedef struct {
 	int force;
 	int no_direct;
 	int write_cache;        /* -1 keep, 0 off, 1 on */
+	int write_cache_set;    /* named on the command line */
 	int persist;            /* save changed settings to the drive */
 	int fix_config;         /* apply the configuration the report advises */
+	int fix_config_set;     /* named on the command line, either way */
 	int apply_only;         /* apply the settings and stop, do not scan */
 	int format;             /* low level format instead of a scan */
 	int fmt_bs;             /* 0 keep, else the logical block size to set */
@@ -6876,6 +6876,9 @@ typedef struct {
 	int io_timeout;
 	int lookahead;          /* -1 keep, 0 disable for the run */
 	int bms;                /* 0 keep, 1 turn the background scan on */
+	int bms_set;            /* named on the command line */
+	int bms_interval;       /* hours between background scans, 0 keep */
+	int bms_interval_set;
 	int map_width;
 	int no_smart;
 	int dry_run;
@@ -6940,24 +6943,38 @@ typedef struct {
 	int second_pass;
 	uint64_t sample;
 	size_t chunk;
+	/*
+	 * What the drive should be left as.  A drive being prepared for
+	 * service is the one moment somebody is deliberately configuring it,
+	 * and drives arrive misconfigured often enough (auto-reallocation
+	 * off, the read cache disabled by the array they came out of, the
+	 * background scan never turned on) that leaving that to a flag nobody
+	 * knows about means it mostly does not happen.  The write cache is
+	 * the odd one out: off is how the write pass has to be *measured*,
+	 * not how the drive should run, so it is only ever for the run.
+	 */
+	int write_cache;        /* -1 keep, 0 off for the run */
+	int fix_config;         /* save the recommended configuration */
+	int bms;                /* turn the background scan on, saved */
+	int bms_interval;       /* its interval in hours, 0 keep */
 } profile_t;
 
 static const profile_t g_profiles[] = {
 	{ "predeploy",
 	  "no data on it yet: write every sector and verify it reads back",
-	  MODE_WRITE, 1, 0, 1, 0, 0 },
+	  MODE_WRITE, 1, 0, 1, 0, 1024u * 1024, 0, 1, 1, 168 },
 	{ "inservice",
 	  "it holds data you want to keep: never writes anything",
-	  MODE_READ,  0, 0, 0, 0, 0 },
+	  MODE_READ,  0, 0, 0, 0, 0, -1, 0, 0, 0 },
 	{ "survey",
 	  "quick triage of a shelf: samples the surface, read only",
-	  MODE_READ,  0, 0, 0, 64, 1024u * 1024 },
+	  MODE_READ,  0, 0, 0, 64, 1024u * 1024, -1, 0, 0, 0 },
 	{ "decay",
 	  "weeks after a predeploy run: has the pattern rotted?",
-	  MODE_CHECK, 0, 0, 0, 0, 0 },
+	  MODE_CHECK, 0, 0, 0, 0, 0, -1, 0, 0, 0 },
 	{ "repair",
 	  "predeploy, plus forcing a reallocation of anything unreadable",
-	  MODE_WRITE, 1, 1, 1, 0, 0 },
+	  MODE_WRITE, 1, 1, 1, 0, 1024u * 1024, 0, 1, 1, 168 },
 };
 #define NPROFILES ((int)(sizeof(g_profiles) / sizeof(g_profiles[0])))
 
@@ -6991,7 +7008,11 @@ static void usage(void)
 "                         'predeploy', so a bare run stops and asks for\n"
 "                         --confirm rather than doing anything:\n"
 "                           predeploy  no data on it yet: write every sector\n"
-"                                      and verify it reads back\n"
+"                                      and verify it reads back, 1M chunks,\n"
+"                                      write cache off for the run.  Leaves\n"
+"                                      the drive configured for service:\n"
+"                                      --fix-config and --bms on, weekly,\n"
+"                                      SAVED on SAS drives\n"
 "                           inservice  it holds data you want to keep: never\n"
 "                                      writes anything\n"
 "                           survey     quick triage of a shelf: samples the\n"
@@ -7000,7 +7021,9 @@ static void usage(void)
 "                           repair     predeploy, plus forcing a reallocation\n"
 "                                      of anything unreadable\n"
 "                         Any explicit flag overrides what the profile set,\n"
-"                         whichever order they appear in\n"
+"                         whichever order they appear in.  The drive\n"
+"                         settings a profile carries apply only in its own\n"
+"                         mode: --mode read on predeploy saves nothing\n"
 "  -i, --tui              interactive terminal UI: pick drives and settings on\n"
 "                         one form, then watch a live dashboard while it runs.\n"
 "                         A summary holds the verdicts when the scan finishes;\n"
@@ -7084,7 +7107,8 @@ static void usage(void)
 "Range and sizing\n"
 "  --start SIZE           first byte to test (default 0)\n"
 "  --end SIZE             last byte to test (default end of device)\n"
-"  --chunk SIZE           bulk read size, default 128K\n"
+"  --chunk SIZE           bulk read size, default 128K, 1M under predeploy\n"
+"                         and repair\n"
 "  --block SIZE           drill-down granularity, default 4K\n"
 "  --sample N             only test every Nth chunk (fast surface survey)\n"
 "  --order ORDER          sequential (default), reverse, or random.  Sequential\n"
@@ -7157,7 +7181,9 @@ static void usage(void)
 "                         both reads and writes, read cache on.  Only the\n"
 "                         parts actually wrong are touched, each is printed,\n"
 "                         and they are SAVED -- a fix that reverted when the\n"
-"                         scan ended would not be a fix\n"
+"                         scan ended would not be a fix.  On by default\n"
+"                         under predeploy and repair\n"
+"  --no-fix-config        leave the configuration alone under those profiles\n"
 "  --awre on|off|keep     let the drive retire a sector it struggles to write\n"
 "  --arre on|off|keep     the same on read.  With both off the firmware never\n"
 "                         reallocates, so --rewrite-weak and --force-remap\n"
@@ -7185,8 +7211,9 @@ static void usage(void)
 "                         back when the scan ends.  Needs a SAS/SCSI drive and\n"
 "                         sdparm; anything else is applied for the run only and\n"
 "                         says so.  Only settings you named are saved -- the\n"
-"                         look-ahead default is not, or every scanned drive\n"
-"                         would be left permanently slower\n"
+"                         look-ahead, read cache and write cache defaults are\n"
+"                         not, or every scanned drive would be left\n"
+"                         permanently slower\n"
 "  --write-cache on|off|keep\n"
 "                         with the cache on a write returns as soon as the\n"
 "                         drive has it in DRAM, so a write mode times the\n"
@@ -7194,7 +7221,9 @@ static void usage(void)
 "                         and much slower.  Also the other half of the\n"
 "                         ex-array fault where RCD and WCE together give a\n"
 "                         drive that writes fast and reads like treacle.\n"
-"                         Restored on exit.  Default 'keep' touches nothing\n"
+"                         Restored on exit, and never saved by --persist\n"
+"                         unless named here.  Default 'off' under predeploy\n"
+"                         and repair, 'keep' otherwise\n"
 "  --bms on|keep          'on' tells every selected SAS/SCSI drive to run its\n"
 "                         own background medium scan: the firmware sweeps the\n"
 "                         platters whenever the drive is idle, logs what it\n"
@@ -7202,7 +7231,12 @@ static void usage(void)
 "                         recover.  Unlike every other setting here this one\n"
 "                         is SAVED ON THE DRIVE and is not undone afterwards;\n"
 "                         'sdparm --clear=EN_BMS --save /dev/sdX' turns it\n"
-"                         back off.  Default 'keep' touches nothing\n"
+"                         back off.  Default 'on' under predeploy and repair,\n"
+"                         'keep' otherwise, which touches nothing\n"
+"  --bms-interval HOURS   how often that background scan sweeps the media,\n"
+"                         saved with it (SCSI BMS_I).  Default 168, weekly,\n"
+"                         under predeploy and repair; otherwise the drive's\n"
+"                         own.  Needs --bms on\n"
 "  --io-timeout SEC       lower the kernel's per-command timeout during the\n"
 "                         scan so a dying sector fails fast (restored after)\n"
 "  --max-temp C           abort if the drive gets this hot (default 58, 0=off)\n"
@@ -9167,6 +9201,9 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 	int rc_sel = o->read_cache < 0 ? 0 : o->read_cache + 1;
 	long long rtl = o->recovery_ms;
 	int la_init = la_sel;   /* to tell "chose off" from "left at off" */
+	int rc_init = rc_sel, wc_init = wc_sel, wc_named = o->write_cache_set;
+	long long bmsi = o->bms_interval;
+	int in_was = -1;        /* Mode was the profile's own last time round */
 	long long retries = o->retries, segment_mb = (long long)(o->segment >> 20);
 	long long parallel = o->max_parallel, sample = (long long)o->sample;
 	int cur = 0, sec = 0, arm = 0, i, rows, cols, dtop = 0;
@@ -9214,6 +9251,8 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 	  1, 0, { 0 }, &rtl, -1, 65535, 500, NULL },
 	{ NULL, 0, "Background scan", "SAS: drive sweeps its own media when idle; stays on",
 	  0, 2, { "keep", "enable" }, NULL, 0, 0, 0, &bms_sel },
+	{ NULL, 0, "Scan interval (hours)", "how often it sweeps, saved; 168 is weekly, 0 keeps",
+	  1, 0, { 0 }, &bmsi, 0, 65535, 24, NULL },
 	{ NULL, 0, "Recommended config", "auto-reallocate on, read cache on; saved",
 	  0, 2, { "no", "yes" }, NULL, 0, 0, 0, &fix_sel },
 	{ NULL, 0, "Save to drive", "permanently keeps the settings above after the scan",
@@ -9306,6 +9345,7 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 			const profile_t *p = &g_profiles[prof_sel];
 
 			prof_was = prof_sel;
+			in_was = 0;     /* take this profile's drive settings */
 			mode_sel = 0;
 			for (i = 0; i < nmode; i++)
 				if (mode_v[i] == p->mode)
@@ -9321,6 +9361,30 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 							  sizeof(chunk_v[0])); i++)
 				if (chunk_v[i] == p->chunk)
 					chunk_sel = i;
+		}
+		{
+			/*
+			 * The drive settings follow the profile only while
+			 * Mode is the profile's own, exactly as on the command
+			 * line: predeploy saves a configuration because the
+			 * drive is being prepared, and a read pass chosen
+			 * under it is not that.  Moving Mode away clears them;
+			 * moving it back restores them.
+			 */
+			const profile_t *p = &g_profiles[prof_sel];
+			int in = mode_sel < nmode ? mode_v[mode_sel] == p->mode :
+				 mode_sel == nmode && p->mode == MODE_WRITE;
+
+			if (in_was >= 0 && in != in_was) {
+				wc_sel = in && p->write_cache >= 0 ?
+					 p->write_cache + 1 : 0;
+				fix_sel = in ? p->fix_config : 0;
+				bms_sel = in ? p->bms : 0;
+				bmsi = in && p->bms ? p->bms_interval : 0;
+				wc_init = wc_sel;
+				wc_named = 0;
+			}
+			in_was = in;
 		}
 		tui_size(&rows, &cols);
 		tui_clear();
@@ -9437,8 +9501,8 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 		       c_off(), g_profiles[prof_sel].what);
 		printf("  %d drive%s selected", nsel, nsel == 1 ? "" : "s");
 		if (mode_sel == nmode)
-			printf("   %soverwrites everything, then tries to heal "
-			       "what is weak%s", c_red(), c_off());
+			printf("   %soverwrites everything and heals%s",
+			       c_red(), c_off());
 		else if (mode_sel == nmode + 1)
 			printf("   %sthis ERASES the drive completely%s",
 			       c_red(), c_off());
@@ -9448,20 +9512,21 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 		else if (mode_sel >= 2)
 			printf("   %sthis mode writes to the drive%s",
 			       c_red(), c_off());
-		if (bms_sel)
-			printf("   %sbackground scan stays on afterwards%s",
-			       c_yel(), c_off());
-		if (persist_sel || fix_sel)
-			printf("   %ssettings are saved to the drive%s",
-			       c_yel(), c_off());
+		/*
+		 * One short phrase for everything that outlives the run, the
+		 * background scan included: predeploy turns on all of it by
+		 * default, and three warnings side by side ran past eighty
+		 * columns, where a wrapped row scrolls the top of the form away.
+		 */
+		if (bms_sel || persist_sel || fix_sel)
+			printf("   %ssaves drive settings%s", c_yel(), c_off());
 		if (arm)
-			printf("\n\n  %spress y to start a %s pass on %d "
-			       "drive%s%s, any other key to cancel%s\n",
+			printf("\n\n  %spress y to start a %s on %d drive%s%s, "
+			       "other keys cancel%s\n",
 			       c_red(), mode_c[mode_sel], nsel,
 			       nsel == 1 ? "" : "s",
-			       (persist_sel || fix_sel) ?
-			       " and save the settings to them" : "",
-			       c_off());
+			       (bms_sel || persist_sel || fix_sel) ?
+			       " and save settings" : "", c_off());
 		else
 			/*
 			 * Eighty columns, always.  A footer that wraps makes the
@@ -9542,7 +9607,7 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 			 * so make it two */
 			if (k == 's' && ((mode_sel >= 2 &&
 					  mode_sel != nmode + 2) ||
-					 persist_sel || fix_sel)) {
+					 persist_sel || fix_sel || bms_sel)) {
 				arm = 1;
 				continue;
 			}
@@ -9579,7 +9644,13 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 			o->order = (order_t)order_sel;
 			o->lookahead = la_sel == 0 ? 0 : -1;
 			o->bms = bms_sel;
+			o->bms_interval = bms_sel ? (int)bmsi : 0;
 			o->write_cache = wc_sel == 0 ? -1 : wc_sel - 1;
+			/* named means moved off what the profile put there;
+			 * --persist saves nothing else (invariant 7b) */
+			o->write_cache_set = wc_named || wc_sel != wc_init;
+			if (rc_sel != rc_init)
+				o->read_cache_set = 1;
 			o->persist = persist_sel;
 			o->fix_config = fix_sel;
 			o->awre = o->arre = awre_sel == 0 ? -1 : awre_sel - 1;
@@ -9782,6 +9853,30 @@ static void apply_settings(device_t *t, int n, const opts_t *o)
 
 	if (!settings_wanted(o) && o->read_cache < 0)
 		return;
+	/*
+	 * "Touch nothing" includes the drive's configuration.  This used to
+	 * run under --dry-run too, which mattered little while every saved
+	 * setting was one somebody typed, and matters a great deal now that
+	 * the default profile saves some.
+	 */
+	if (o->dry_run) {
+		if (!settings_wanted(o))
+			return;
+		out("\n  dry run, drive settings not applied:\n");
+		if (o->fix_config)
+			out("    would save the recommended configuration\n");
+		if (o->bms && o->bms_interval > 0)
+			out("    would enable the background scan, every %d "
+			    "hours, saved\n", o->bms_interval);
+		else if (o->bms)
+			out("    would enable the background scan, saved\n");
+		if (o->write_cache >= 0)
+			out("    would turn the write cache %s %s\n",
+			    o->write_cache ? "on" : "off",
+			    o->persist && o->write_cache_set ? "and save it" :
+			    "for the run");
+		return;
+	}
 	if (settings_wanted(o))
 		out("\n  Applying settings to %d drive%s, %s\n", n,
 		    n == 1 ? "" : "s",
@@ -9795,12 +9890,21 @@ static void apply_settings(device_t *t, int n, const opts_t *o)
 		 * It saves what it changes: a configuration fix that reverted
 		 * when the run ended would not be a fix.
 		 */
+		/*
+		 * A field also named on its own is left to that: it is the
+		 * more specific instruction, and now that predeploy turns
+		 * this on by default, '--awre off' would otherwise save AWRE
+		 * on and then switch it off only until the run ended.
+		 */
 		if (o->fix_config) {
-			sd_field_apply(d, "AWRE", 1, 1,
-				       "auto-reallocate on write");
-			sd_field_apply(d, "ARRE", 1, 1,
-				       "auto-reallocate on read");
-			sd_field_apply(d, "RCD", 0, 1, "read cache");
+			if (o->awre < 0)
+				sd_field_apply(d, "AWRE", 1, 1,
+					       "auto-reallocate on write");
+			if (o->arre < 0)
+				sd_field_apply(d, "ARRE", 1, 1,
+					       "auto-reallocate on read");
+			if (!o->read_cache_set)
+				sd_field_apply(d, "RCD", 0, 1, "read cache");
 		}
 		if (o->awre >= 0)
 			sd_field_apply(d, "AWRE", o->awre, o->persist,
@@ -9809,7 +9913,8 @@ static void apply_settings(device_t *t, int n, const opts_t *o)
 			sd_field_apply(d, "ARRE", o->arre, o->persist,
 				       "auto-reallocate on read");
 		if (o->read_cache >= 0)
-			sd_field_apply(d, "RCD", !o->read_cache, o->persist,
+			sd_field_apply(d, "RCD", !o->read_cache,
+				       o->persist && o->read_cache_set,
 				       "the read cache setting");
 		if (o->recovery_ms >= 0)
 			sd_field_apply(d, "RTL", o->recovery_ms, o->persist,
@@ -9820,10 +9925,14 @@ static void apply_settings(device_t *t, int n, const opts_t *o)
 		if (o->wr_retries >= 0)
 			sd_field_apply(d, "WRC", o->wr_retries, o->persist,
 				       "write retry count");
+		/* only a write cache setting somebody named is ever saved:
+		 * off is predeploy's measuring condition, not advice */
 		if (o->write_cache >= 0)
-			wc_set(d, o->write_cache, o->persist);
-		if (o->bms)
-			bms_enable(d);
+			wc_set(d, o->write_cache,
+			       o->persist && o->write_cache_set);
+		if (o->bms && bms_enable(d) > 0 && o->bms_interval > 0)
+			sd_field_apply(d, "BMS_I", o->bms_interval, 1,
+				       "background scan interval (hours)");
 	}
 	out("\n");
 }
@@ -11034,8 +11143,10 @@ int main(int argc, char **argv)
 			}
 		} else if (!strcmp(a, "--apply-settings")) {
 			o.apply_only = 1;
-		} else if (!strcmp(a, "--fix-config")) {
-			o.fix_config = 1;
+		} else if (!strcmp(a, "--fix-config") ||
+			   !strcmp(a, "--no-fix-config")) {
+			o.fix_config = !strcmp(a, "--fix-config");
+			o.fix_config_set = 1;
 		} else if (!strcmp(a, "--awre") || !strcmp(a, "--arre") ||
 			   !strcmp(a, "--read-cache")) {
 			const char *m = NEXT();
@@ -11085,6 +11196,7 @@ int main(int argc, char **argv)
 				o.write_cache = -1;
 			else
 				die("--write-cache takes 'on', 'off' or 'keep'");
+			o.write_cache_set = 1;
 		} else if (!strcmp(a, "--bms")) {
 			const char *m = NEXT();
 
@@ -11094,6 +11206,10 @@ int main(int argc, char **argv)
 				o.bms = 0;
 			else
 				die("--bms takes 'on' or 'keep'");
+			o.bms_set = 1;
+		} else if (!strcmp(a, "--bms-interval")) {
+			o.bms_interval = (int)numarg(a, NEXT(), 1, 65535);
+			o.bms_interval_set = 1;
 		} else if (!strcmp(a, "--drive-lookahead")) {
 			const char *m = NEXT();
 
@@ -11159,6 +11275,32 @@ int main(int argc, char **argv)
 			targets[ntargets++] = d;
 		}
 #undef NEXT
+	}
+
+	/*
+	 * The drive settings a profile carries are resolved after the flags,
+	 * not before like the rest of it, because they depend on whether the
+	 * profile's own mode survived.  They are what a drive being *prepared*
+	 * should be left as, and some of them are saved: '--mode read' on the
+	 * default profile is somebody reading a drive that may be in service,
+	 * and --apply-settings and --format say exactly what they want done.
+	 * Neither should find its configuration rewritten by a default.
+	 */
+	{
+		const profile_t *p = profile_by_name(o.profile);
+
+		if (p && o.mode == p->mode && !o.apply_only && !o.format) {
+			if (!o.write_cache_set)
+				o.write_cache = p->write_cache;
+			if (!o.fix_config_set)
+				o.fix_config = p->fix_config;
+			if (!o.bms_set)
+				o.bms = p->bms;
+			if (o.bms && !o.bms_interval_set)
+				o.bms_interval = p->bms_interval;
+		}
+		if (o.bms_interval_set && !o.bms)
+			die("--bms-interval needs --bms on");
 	}
 
 	/*

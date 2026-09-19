@@ -106,9 +106,19 @@ goes through `persist_ok()`.** Three things deliberately survive the scan:
 `--bms on`, because a background scan that stopped when the scan did would be
 pointless; `--fix-config`, because a configuration fix that reverted would not
 be a fix; and `--persist`, which saves the settings a run changed so a drive
-can be configured once and left. Both are opt-in, both announce what they did
-on stderr, and both print the exact command that undoes it. Do not "fix" them
-by adding a restore handler.
+can be configured once and left. All of them announce what they did on stderr
+and print the exact command that undoes it. Do not "fix" them by adding a
+restore handler.
+
+The first two are defaults of the **predeploy** and **repair** profiles (with
+`--bms-interval 168`), and that is the only place a saved setting is not typed
+by hand. A drive being prepared for service is the moment someone is
+deliberately configuring it, and a run there has already been confirmed as a
+destructive one. The boundaries are load-bearing: the profile's drive settings
+apply only while its own mode stands (`--mode read` under predeploy may be a
+drive in service, and saves nothing), never under `--apply-settings` or
+`--format`, never under `--dry-run`, and never through `--persist`, which saves
+only what was named. `--persist` stays opt-in and is never a profile default.
 
 All of it is applied by `apply_settings()` in the process that owns the run —
 the supervisor `run_begin()` forks — before the scan starts, and never inside

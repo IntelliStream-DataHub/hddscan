@@ -58,7 +58,7 @@ to derive it from.
 
 | profile | mode | for |
 |---|---|---|
-| **predeploy** *(default)* | write | No data on it yet. Writes every sector and verifies it reads back — the only way to learn whether a sector will *accept* a write. |
+| **predeploy** *(default)* | write | No data on it yet. Writes every sector and verifies it reads back — the only way to learn whether a sector will *accept* a write. Leaves the drive configured for service. |
 | **inservice** | read | It holds data you want to keep. Never writes anything. |
 | **survey** | read, sampled | Quick triage of a shelf. |
 | **decay** | check | Weeks after a predeploy run: has the pattern rotted? |
@@ -95,7 +95,7 @@ The settings are in two groups, because they answer different questions:
  -- How to test --
    Profile                < predeploy    >
    Mode                   < write        >
-   Chunk size             < 128K         >
+   Chunk size             < 1M           >
    ...
  -- Drive settings (sdparm/hdparm, restored on exit) --
    Drive look-ahead       < off          >
@@ -370,7 +370,16 @@ scans of the same drive incomparable. **Chunk size** is a field on the form so
 the trade is one keystroke away when you want it, and `--sector-slow-ms` buys
 back the sensitivity at the cost of more drill-downs.
 
-The write pattern does not depend on the chunk size. It used to be
+The exception is **predeploy** (and repair, which is predeploy and more), at
+1 MiB. It writes every sector, reads it back, and reads it again, so at
+14 MB/s a 12 TB drive would be weeks on the bench — long enough that the scan
+does not get run, which finds nothing at all. Its main question is also not
+latency: whether a sector accepts a write and returns the same bytes is
+answered exactly at any chunk size. What it gives up is the 128 KiB bar for
+slow sectors, and the scan says so as above. The other profiles, whose whole
+point is latency, keep 128 KiB.
+
+The write pattern does not depend on the chunk size either. It used to be
 seeded at each chunk's start, so a drive written in 1 MiB chunks and checked by
 `decay` at 128 KiB read back as wrong data at every 128 KiB boundary; it is now
 laid down in fixed 128 KiB units, which also keeps every pattern written at the
@@ -540,15 +549,18 @@ run-scoped unless you ask for `--persist`.
 writes, read cache on — changing only the parts actually wrong on each drive
 and printing each change. It saves what it sets, for the same reason `--bms on`
 does: a configuration fix that reverted when the scan ended would not be a fix.
+Predeploy and repair apply it by default; `--no-fix-config` opts out, and a
+field named on its own (`--awre off`) is left to that flag.
 
 `--write-cache on|off` flips WCE for the duration of a scan and puts it back
 afterwards, which is how you tell those apart without committing to anything:
 measure, flip, measure again. It matters for write modes on its own account
 too — with the cache on, a write returns as soon as the drive has the data in
 DRAM, so you are timing the cache rather than the platter. `off` makes a write
-mode honest and a great deal slower. Like the look-ahead and unlike `--bms`,
-it is restored on exit, on `SIGINT` and on error; nothing is saved to the
-drive.
+mode honest and a great deal slower. Predeploy and repair turn it off for
+exactly that reason. Like the look-ahead and unlike `--bms`, it is restored on
+exit, on `SIGINT` and on error, and `--persist` saves it only if it was named:
+off is how a write pass is measured, not how a drive should run.
 
 Fix the rest and re-measure. Note this takes **two** commands: sdparm honours
 only the last `--set` or `--clear` on a command line, and a comma separated
@@ -634,8 +646,13 @@ kernel timeout, the drive's look-ahead — is restored on exit, on `SIGINT` and
 on error, because a scan has no business leaving your system altered. This one
 writes a *saved* mode page and stays on, because a background scan that stopped
 when the scan did would be pointless: sweeping a 14 TB drive takes days of idle
-time. So it is opt-in, it says so on stderr when it happens, and it prints the
-command to reverse it (`sdparm --clear=EN_BMS --save /dev/sdX`).
+time. It says so on stderr when it happens and prints the command to reverse it
+(`sdparm --clear=EN_BMS --save /dev/sdX`). It is on by default under
+**predeploy** and **repair**, where the drive is being prepared for service and
+leaving it off means it mostly never gets turned on, with `--bms-interval 168`
+so the drive sweeps itself weekly; `--bms keep` opts out. Every other profile
+leaves it alone unless asked, and so does predeploy once its mode is overridden
+— `--mode read` may be a drive in service.
 
 **It is applied once, before the first read, never during.** A drive seeking on
 its own behalf in the middle of a latency measurement is exactly the queueing

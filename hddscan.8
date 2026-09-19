@@ -118,7 +118,15 @@ order the two appear in. The report names the profile that produced it.
 .RS
 .TP
 .B predeploy
-No data on it yet: write every sector and verify it reads back. The default,
+No data on it yet: write every sector and verify it reads back, in 1M chunks
+with the write cache off for the run. It also leaves the drive configured for
+service, which is the part that outlives the run:
+.B \-\-fix\-config
+and
+.B \-\-bms on
+with a weekly
+.BR \-\-bms\-interval ,
+all saved on a SAS drive. The default,
 so a bare invocation stops and asks for
 .B \-\-confirm
 rather than doing anything.
@@ -135,6 +143,14 @@ Weeks after a predeploy run: has the pattern rotted?
 .B repair
 predeploy, plus forcing a reallocation of anything unreadable.
 .RE
+.IP
+The drive settings a profile carries apply only in its own mode.
+.B \-\-mode read
+under predeploy may be a drive in service, and saves nothing; nor do
+.B \-\-apply\-settings
+or
+.BR \-\-format ,
+which say exactly what they want done.
 .TP
 .BR \-i ", " \-\-tui
 Interactive terminal UI. Implied when nothing to scan was named and both stdin
@@ -331,7 +347,7 @@ First byte to test. Default 0.
 Last byte to test. Default is the end of the device.
 .TP
 .BI \-\-chunk " SIZE"
-Bulk read size, default 128K. The single biggest lever on how long a scan
+Bulk read size, default 128K, or 1M under predeploy and repair. The single biggest lever on how long a scan
 takes, and on what it can see; see
 .B Thresholds
 above.
@@ -478,6 +494,15 @@ Apply the configuration hddscan recommends for a drive going into service:
 automatic reallocation on for both reads and writes, read cache on. Only the
 parts actually wrong are touched, each is printed, and they are saved to the
 drive \(em a fix that reverted when the scan ended would not be a fix.
+On by default under predeploy and repair. A field also named on its own with
+.BR \-\-awre ,
+.B \-\-arre
+or
+.B \-\-read\-cache
+is left to that flag.
+.TP
+.B \-\-no\-fix\-config
+Leave the configuration alone under the profiles that fix it by default.
 .TP
 .BI \-\-awre " on|off|keep"
 Let the drive retire a sector it struggles to write.
@@ -503,9 +528,13 @@ ex-array fault where a drive writes at full speed and reads like treacle.
 With the cache on, a write returns as soon as the drive has the data in DRAM,
 so a write mode times the cache rather than the platter.
 .I off
-makes it honest and much slower. Default
+makes it honest and much slower. Restored on exit, and saved by
+.B \-\-persist
+only when named here. Default
+.I off
+under predeploy and repair,
 .I keep
-touches nothing.
+otherwise.
 .TP
 .BI \-\-drive\-read\-retries " N"
 Bound how many times the drive re-reads a sector internally before reporting
@@ -537,15 +566,25 @@ here this one is
 .B saved on the drive
 and is not undone afterwards;
 .B sdparm \-\-clear=EN_BMS \-\-save /dev/sdX
-turns it back off.
+turns it back off. Default
+.I on
+under predeploy and repair,
+.I keep
+otherwise.
+.TP
+.BI \-\-bms\-interval " HOURS"
+How often that background scan sweeps the media (the SCSI BMS_I field), saved
+with it. Default 168, weekly, under predeploy and repair; otherwise the drive's
+own. Needs
+.BR "\-\-bms on" .
 .TP
 .B \-\-persist
 Save the settings this run changes to the drive so they survive a power cycle,
 instead of putting them back when the scan ends. Needs a SAS/SCSI drive and
 .BR sdparm (8);
 anything else is applied for the run only and says so. Only settings named
-explicitly are saved \(em the look-ahead default is not, or every scanned drive
-would be left permanently slower at sequential reads.
+explicitly are saved \(em the look-ahead, read cache and write cache defaults are
+not, or every scanned drive would be left permanently slower.
 .SS Output
 .TP
 .BI \-\-json " FILE"

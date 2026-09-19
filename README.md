@@ -42,11 +42,20 @@ depends entirely on what you are about to do with it:
 
 | profile | mode | for |
 |---|---|---|
-| **predeploy** *(default)* | write | No data on it yet. Writes every sector and verifies it reads back. |
+| **predeploy** *(default)* | write | No data on it yet. Writes every sector and verifies it reads back, then leaves the drive configured for service. |
 | **inservice** | read | It holds data you want to keep. Never writes anything. |
 | **survey** | read, sampled | Quick triage of a shelf. |
 | **decay** | check | Weeks after a predeploy run: has the pattern rotted? |
 | **repair** | write | predeploy, plus forcing a reallocation of anything unreadable. |
+
+A drive being prepared is the one moment someone is deliberately configuring
+it, so predeploy (and repair) also **save** the configuration it should run
+with on a SAS drive: auto-reallocation on, read cache on (`--fix-config`), and
+the drive's own background scan on, weekly (`--bms on --bms-interval 168`).
+Each change is printed with the command that undoes it; `--no-fix-config` and
+`--bms keep` opt out. The write cache is turned off only for the run, so the
+write pass times the platter rather than the drive's DRAM. None of it applies
+if you override the mode — `--mode read` under predeploy saves nothing.
 
 The default writes, because a surface test is normally run before a drive goes
 into service and a read-only pass cannot tell you whether a sector will *accept*

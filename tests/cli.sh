@@ -77,6 +77,32 @@ assert_has "order does not matter for that override" \
 	"$(runp --profile predeploy --mode read --confirm "$f" "$f")" \
 	"Mode             read-only"
 
+# predeploy leaves a drive configured for service.  An image has no mode
+# pages, so what is asserted is the plan --dry-run states, not sdparm's work.
+out=$(runp --dry-run --confirm "$f" "$f")
+assert_has "predeploy scans in 1M chunks" "$out" "1024 KiB"
+assert_has "predeploy saves the recommended configuration" "$out" \
+	"would save the recommended configuration"
+assert_has "predeploy enables the background scan" "$out" \
+	"would enable the background scan, every 168 hours"
+assert_has "predeploy turns the write cache off for the run" "$out" \
+	"would turn the write cache off for the run"
+assert_hasnt "--no-fix-config opts out of the saved configuration" \
+	"$(runp --dry-run --no-fix-config --confirm "$f" "$f")" \
+	"would save the recommended"
+assert_hasnt "--bms keep opts out of the background scan" \
+	"$(runp --dry-run --bms keep --confirm "$f" "$f")" \
+	"would enable the background scan"
+# A read pass under the default profile may be of a drive in service; a
+# default must never rewrite its configuration.
+assert_hasnt "predeploy's saved settings do not follow an overridden mode" \
+	"$(runp --dry-run --mode read "$f")" "would save"
+assert_hasnt "inservice carries no drive settings" \
+	"$(runp --dry-run --profile inservice "$f")" "drive settings not applied"
+assert_has "--bms-interval without --bms on is refused" \
+	"$(runp --profile inservice --bms-interval 24 "$f" 2>&1)" \
+	"--bms-interval needs --bms on"
+
 echo "== correctness of the scan itself =="
 
 f=$(image 16 clean.bin)
