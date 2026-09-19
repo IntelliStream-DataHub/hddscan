@@ -8464,7 +8464,9 @@ static int tui_ms(double ms, int striped, int draw)
  * The part of a drive's row that says how it is behaving: on a line of its
  * own under the drive at eighty columns, beside it on a terminal with room.
  * pw is the width of the slot the "sector" label goes in, and room is how
- * much of the line is left, which only a note is ever cut to fit.
+ * much of the line is left, which only a note is ever cut to fit.  ident
+ * says the row already carries the model and size in columns of their own,
+ * so a drive that is not running has only its note left to say.
  *
  * Writes are timed on their own, because a drive whose writes crawl reads
  * back at full speed.  A drive drilling for longer than the window finishes
@@ -8474,8 +8476,8 @@ static int tui_ms(double ms, int striped, int draw)
  * and how the one in the worst trouble on the screen once looked like one
  * that had not started.
  */
-static int tui_drive_tail(const jrec_t *x, int pw, int room, int striped,
-			  int draw)
+static int tui_drive_tail(const jrec_t *x, int pw, int ident, int room,
+			  int striped, int draw)
 {
 	char b[32];
 	int used;
@@ -8510,12 +8512,12 @@ static int tui_drive_tail(const jrec_t *x, int pw, int room, int striped,
 				LATWIN_SECS);
 	} else {
 		tui_put(draw, "%s", c_dim());
-		used += tui_put(draw, "%-20.20s  %9s",
-				x->model[0] ? x->model : "?",
-				human_size(x->size, b, sizeof(b)));
-		if (x->note[0] && room - used > 2)
-			used += tui_put(draw, "  %.*s", room - used - 2,
-					x->note);
+		if (!ident)
+			used += tui_put(draw, "%-20.20s  %9s  ",
+					x->model[0] ? x->model : "?",
+					human_size(x->size, b, sizeof(b)));
+		if (x->note[0] && room > used)
+			used += tui_put(draw, "%.*s", room - used, x->note);
 	}
 	tui_put(draw, "%s", striped ? c_plain() : c_off());
 	return used;
@@ -8532,22 +8534,36 @@ static int tui_drive_tail(const jrec_t *x, int pw, int room, int striped,
  * Then whether each drive fits on one row.  That is decided by width, never
  * by truncating: the table was one row once, ran to a hundred columns and
  * was cut off on anything narrower, which is why it is two rows at eighty.
+ *
+ * A terminal wider than one row needs is not left half empty.  What is left
+ * goes first to the drive's model and size, beside its name -- which drive
+ * this is, for every drive and not only the ones that have stopped -- and
+ * then to a bar of its own progress beside its percentage, as wide as the
+ * rest of the line allows.
  */
+#define DBAR_MIN 10
+
 typedef struct {
 	int rate, bad, weak, eta, state;
+	int size;               /* width of the size column, with ident */
 	int one;                /* each drive on a single row */
+	int ident;              /* model and size columns after the name */
+	int bar;                /* inside width of each drive's bar, or 0 */
 } dcols_t;
 
 static void tui_dcols(const jrec_t *j, int n, int cols, dcols_t *dc)
 {
 	char b1[32], b2[32];
-	int i, left, tail = 0;
+	int i, left, tail = 0, tail_id = 0, spare;
 
 	dc->rate = 11;
 	dc->bad = 7;
 	dc->weak = 8;
 	dc->eta = 10;
 	dc->state = 5;
+	dc->size = 4;
+	dc->ident = 0;
+	dc->bar = 0;
 	for (i = 0; i < n; i++) {
 		const jrec_t *x = &j[i];
 		int w;
@@ -8571,14 +8587,32 @@ static void tui_dcols(const jrec_t *j, int n, int cols, dcols_t *dc)
 		w = (int)strlen(jrec_word(x, 0));
 		if (w > dc->state)
 			dc->state = w;
-		w = tui_drive_tail(x, 6, 0, 0, 0);
+		w = (int)strlen(human_size(x->size, b2, sizeof(b2)));
+		if (w > dc->size)
+			dc->size = w;
+		w = tui_drive_tail(x, 6, 0, 0, 0, 0);
 		if (w > tail)
 			tail = w;
+		w = tui_drive_tail(x, 6, 1, 0, 0, 0);
+		if (w > tail_id)
+			tail_id = w;
 	}
 	/* "  name(8) pct(6) rate bad weak eta state" */
 	left = 2 + 8 + 1 + 6 + 1 + dc->rate + 1 + dc->bad + 1 + dc->weak +
 	       1 + dc->eta + 1 + dc->state;
 	dc->one = left + tail <= cols;
+	if (!dc->one)
+		return;
+	/* " model(20) size" */
+	if (left + 1 + 20 + 1 + dc->size + tail_id <= cols) {
+		dc->ident = 1;
+		left += 1 + 20 + 1 + dc->size;
+		tail = tail_id;
+	}
+	/* " [bar]" */
+	spare = cols - left - tail - 3;
+	if (spare >= DBAR_MIN)
+		dc->bar = spare;
 }
 
 static void tui_bar(int width, double frac)
@@ -8688,13 +8722,19 @@ static void tui_dashboard(const run_t *r, const jrec_t *j, int n, int nruns,
 		       "seconds; latency in ms");
 	tui_eol();
 	tui_at(row++, 1);
-	if (format)
+	if (format) {
 		printf("  %-8s %6s %-10s %-20s %-10s %s", "DRIVE", "PCT",
 		       "SIZE", "MODEL", "STATE", "LAST MESSAGE");
-	else
-		printf("  %-8s %6s %*s %*s %*s %*s %s", "DRIVE", "PCT",
-		       dc.rate, "RATE", dc.bad, "BAD", dc.weak, "WEAK",
-		       dc.eta, "ETA", "STATE");
+	} else {
+		printf("  %-8s", "DRIVE");
+		if (dc.ident)
+			printf(" %-20s %*s", "MODEL", dc.size, "SIZE");
+		printf(" %6s", "PCT");
+		if (dc.bar)
+			printf(" %*s", dc.bar + 2, "");
+		printf(" %*s %*s %*s %*s %s", dc.rate, "RATE", dc.bad, "BAD",
+		       dc.weak, "WEAK", dc.eta, "ETA", "STATE");
+	}
 	tui_eol();
 
 	avail = rows - row - g_msg_count - 2;
@@ -8812,9 +8852,20 @@ static void tui_dashboard(const run_t *r, const jrec_t *j, int n, int nruns,
 			tui_row_end(used, cols, striped);
 			continue;
 		}
-		used = printf("  %-8.8s %5.1f%% %*s/s ", jrec_name(x),
-			      x->state == JS_DONE ? 100.0 : x->pct, dc.rate - 2,
-			      human_size((uint64_t)x->rate, b1, sizeof(b1)));
+		used = printf("  %-8.8s", jrec_name(x));
+		if (dc.ident)
+			used += printf(" %-20.20s %*s",
+				       x->model[0] ? x->model : "?", dc.size,
+				       human_size(x->size, b1, sizeof(b1)));
+		used += printf(" %5.1f%%", x->state == JS_DONE ? 100.0 : x->pct);
+		if (dc.bar) {
+			used += printf(" ");
+			tui_bar(dc.bar, x->state == JS_DONE ? 1.0 :
+				x->pct / 100.0);
+			used += dc.bar + 2;
+		}
+		used += printf(" %*s/s ", dc.rate - 2,
+			       human_size((uint64_t)x->rate, b1, sizeof(b1)));
 		used += tui_count(x->bad, dc.bad, c_red(), striped);
 		used += printf(" ");
 		used += tui_count(x->weak, dc.weak, c_yel(), striped);
@@ -8829,8 +8880,8 @@ static void tui_dashboard(const run_t *r, const jrec_t *j, int n, int nruns,
 			printf("%s", bg);
 			used = 0;
 		}
-		used += tui_drive_tail(x, dc.one ? 6 : 10, cols - used,
-				       striped, 1);
+		used += tui_drive_tail(x, dc.one ? 6 : 10, dc.ident,
+				       cols - used, striped, 1);
 		tui_row_end(used, cols, striped);
 	}
 

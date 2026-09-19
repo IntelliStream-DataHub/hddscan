@@ -266,7 +266,9 @@ counts, ETA and state \(em and then how it is behaving, which for a running
 drive is its read latency over the last thirty seconds and for any other is
 what the drive is. On a terminal wide enough for both, that is one row per
 drive; otherwise it is two, with a rule between one drive and the next, and
-the whole table fits eighty columns. The rate, count and ETA columns widen
+the whole table fits eighty columns. A terminal wider than one row needs
+gives each drive its model and size beside its name, then a bar of its own
+progress as wide as the rest of the line. The rate, count and ETA columns widen
 to fit what is in them, so the header stays over its values.
 .PP
 More drives than the screen holds is the normal case on a shelf, so the table
