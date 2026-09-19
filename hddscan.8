@@ -15,6 +15,13 @@ hddscan \- per-sector latency and error scanner for rotating disks
 .br
 .B hddscan --status
 .RI [ run ]
+.br
+.B hddscan dm
+.I command
+.RI [ options ]
+.RB ( dm\-badblocks
+.I command
+when installed as that link)
 .SH DESCRIPTION
 .B hddscan
 finds sectors on a rotating disk that return data too slowly or not at all.
@@ -607,6 +614,18 @@ No drive is opened, so the block size and the partition offset can be chosen
 after the scan, once the partition they are for exists. Requires
 .BR \-\-badblocks\-list .
 .TP
+.B \-\-hide\-bad
+Write a map of the damage found by the newest finished scan of the whole drive
+onto the drive, and activate
+.IR /dev/mapper/bb\-<serial> :
+the same drive with the damage cut out, which any filesystem can use. A
+sampled or interrupted scan is not used; a list from one would hide only the
+damage that happened to be looked at. Whatever is on the drive becomes
+unreachable, so it needs
+.B \-\-confirm
+exactly as a write mode does. The drive is found in the run store by serial,
+since its name can change between boots.
+.TP
 .BI \-\-badblocks\-blocksize " N"
 Unit for that list. Default 1024. Use the block size the filesystem will be
 made with, usually 4096.
@@ -661,6 +680,83 @@ Print the option summary.
 .TP
 .B \-\-version
 Print the version and exit.
+.SH DEVICE-MAPPER MAPS
+.B hddscan dm
+keeps a map of a drive's bad extents on the drive itself and loads it as a
+.B dm\-linear
+table, so a filesystem sees a slightly smaller device with none of the known
+damage in it. No kernel module is involved. Installed as a link named
+.BR dm\-badblocks ,
+the same binary answers to that name.
+.PP
+The drive is divided into extents. The first and last hold two copies of the
+map, each with a generation number and a checksum; an update writes one, syncs
+it, then writes the other, and a read takes the newest that checks out. Every
+Kth extent is a spare. Damage known when the map is made is skipped, keeping
+the device in platter order; damage found later is remapped to the nearest
+spare, since skipping it then would move every byte after it.
+.TP
+.BI create " DEV " \-\-bad " FILE " \-\-confirm " DEV"
+Write a new map. Refuses a drive that already has one
+.RB ( \-\-force
+replaces it, losing everything on the mapped device) and a drive with damage
+where the map's two copies would live.
+.TP
+.BI activate " DEV" "\fR, \fPactivate\-all"
+Load the map as
+.IR /dev/mapper/NAME .
+.B activate\-all
+finds every drive carrying a map, by the map rather than by name, and is what
+.I contrib/dm\-badblocks.service
+runs at boot, before local filesystems and ZFS imports.
+.TP
+.BI remap " DEV " \-\-bad " FILE"
+Move damage found later to spares. On a live device it suspends it, copies
+what can still be read, checks the copy past the page cache, writes the map,
+reloads the table and resumes; if the reload fails the previous map is written
+back so the drive never disagrees with the kernel. Sectors that could not be
+read are zeroed and their range on the mapped device is printed.
+.TP
+.BI status " DEV" "\fR, \fPtable" " DEV" "\fR, \fPmap" " DEV OFFSET" "\fR, \fPdeactivate" " NAME"
+Show the map, print the dm table, translate an offset, remove the device.
+.TP
+.BI \-\-bad " FILE"
+Bad blocks in
+.BR badblocks (8)
+format, relative to the whole device;
+.B \-
+is standard input.
+.TP
+.BI \-\-block\-size " N"
+Unit of the numbers in that file. Default 1024; 512 for sector numbers from the
+kernel log.
+.TP
+.BI \-\-extent " SIZE"
+Granularity of the map, a power of two from 64K to 64M. Default 1M.
+.TP
+.BI \-\-reserve " PCT"
+Share of the drive held as spares. Default 0.1, one extent in a thousand.
+.TP
+.BI \-\-name " NAME"
+Device-mapper name. Default
+.BI bb\- device\fR;
+.B \-\-hide\-bad
+uses the drive's serial.
+.TP
+.B \-\-logical
+For
+.BR remap :
+the file numbers blocks of the mapped device rather than of the drive.
+.TP
+.B \-\-offline
+For
+.BR remap :
+the device is not active. Refused if it is.
+.TP
+.B \-\-physical
+For
+.BR map :
+the offset is on the drive, not on the mapped device.
 .SH EXIT STATUS
 .TP
 .B 0
@@ -779,6 +875,14 @@ nothing is ever allocated inside it. XFS and btrfs have no equivalent, and
 and ZFS fault a drive out on a read error rather than stepping around it, so
 a drive kept this way belongs somewhere a second copy exists \(em a backup
 target or a scratch disk \(em and not in an array or a pool.
+.PP
+For any other filesystem,
+.B \-\-hide\-bad
+cuts the damage out below it instead, with device-mapper, and the filesystem
+goes on
+.IR /dev/mapper/bb\-<serial> .
+That is also what makes ZFS reasonable on such a drive: the pool never sees the
+damage the scan found, and its checksums catch whatever appears later.
 .SH FILES
 .TP
 .IR ./hddscan- <device>.txt

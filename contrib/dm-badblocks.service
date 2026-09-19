@@ -1,0 +1,17 @@
+# Activate every drive that carries a dm-badblocks map, before anything that
+# mounts or imports what lives on /dev/mapper/bb-*.
+[Unit]
+Description=Activate dm-badblocks devices
+DefaultDependencies=no
+After=systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+Before=local-fs-pre.target zfs-import-cache.service zfs-import-scan.service
+Wants=local-fs-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/hddscan dm activate-all
+
+[Install]
+WantedBy=sysinit.target

@@ -1941,7 +1941,8 @@ static void smart_modes(const device_t *d, smart_t *s);
  */
 static int tool_present(const char *tool)
 {
-	static const char *dirs[] = { "/usr/bin", "/usr/sbin", "/bin", "/sbin" };
+	static const char *dirs[] = { "/usr/bin", "/usr/sbin", "/bin", "/sbin",
+				      "/usr/local/bin", "/usr/local/sbin" };
 	char path[128];
 	size_t i;
 
@@ -5889,6 +5890,18 @@ static void fs_plan(const ctx_t *c)
 	out("\n   3. e2fsck -l /root/%s.bb %s\n", slug, target);
 	out("      the same list, added to a filesystem that already exists, for\n"
 	    "      when a later scan finds more.\n");
+	/*
+	 * The other way, for every filesystem that has no bad-block list --
+	 * and the one that makes ZFS reasonable on such a drive, since the
+	 * pool never sees the damage and its checksums catch what comes later.
+	 */
+	out("\n   Or, for any filesystem (ZFS, btrfs, XFS): cut the damage out below\n"
+	    "   it with device-mapper, and build on /dev/mapper/bb-* instead:\n"
+	    "        %s --hide-bad --confirm %s %s\n"
+	    "      needs dm-badblocks, and the scan to have covered the whole drive.\n",
+	    PROG, c->dev->name, c->dev->path);
+	out("\n   Re-scan every few months and add what it finds: the list only\n"
+	    "   covers damage that had already appeared by the time it was made.\n");
 }
 
 static void report(ctx_t *c)
@@ -6853,6 +6866,7 @@ typedef struct {
 	int persist;            /* save changed settings to the drive */
 	int fix_config;         /* apply the configuration the report advises */
 	int fix_config_set;     /* named on the command line, either way */
+	int hide_bad;           /* hand the last scan's damage to dm-badblocks */
 	int apply_only;         /* apply the settings and stop, do not scan */
 	int format;             /* low level format instead of a scan */
 	int fmt_bs;             /* 0 keep, else the logical block size to set */
@@ -7259,6 +7273,12 @@ static void usage(void)
 "                         one a parallel run keeps per drive) or its --csv.\n"
 "                         Touches no drive, so the block size and offset can\n"
 "                         be chosen once the partition exists\n"
+"  --hide-bad             write a map of the damage the last finished\n"
+"                         whole-drive scan found onto the drive, and activate\n"
+"                         /dev/mapper/bb-<serial>: the same drive with the\n"
+"                         damage cut out, for any filesystem (see 'dm' below).\n"
+"                         Whatever is on the drive becomes unreachable, so it\n"
+"                         needs --confirm like a write\n"
 "  --prometheus FILE      write metrics for node_exporter's textfile collector\n"
 "  --journal FILE         crash journal for --mode verify: the original bytes\n"
 "                         are fsynced here before the pattern is written, so a\n"
@@ -7276,8 +7296,23 @@ static void usage(void)
 "  --no-color             plain text\n"
 "  -h, --help             this text\n"
 "\n"
+"Device-mapper maps: %s dm COMMAND (also installed as dm-badblocks)\n"
+"  create DEV --bad FILE --confirm DEV    map DEV's damage onto DEV itself\n"
+"  activate DEV | activate-all            load it as /dev/mapper/NAME\n"
+"  remap DEV --bad FILE                   move damage found later to spares\n"
+"  status DEV | table DEV | map DEV OFF | deactivate NAME\n"
+"  --bad FILE             bad blocks, badblocks(8) format, whole-device\n"
+"  --block-size N         unit of those numbers, default 1024\n"
+"  --extent SIZE          granularity of the map, default 1M\n"
+"  --reserve PCT          share of the drive held as spares, default 0.1\n"
+"  --name NAME            device-mapper name, default bb-<device>\n"
+"  --logical              remap: FILE numbers blocks of the mapped device\n"
+"  --offline              remap: the device is not active\n"
+"  --physical             map: OFF is on the drive, not the mapped device\n"
+"  'hddscan dm --help' has the rest\n"
+"\n"
 "Exit status: 0 healthy, 1 suspect, 2 failing or usage error, 130 interrupted.\n",
-	PROG, VERSION, PROG, PROG, PROG);
+	PROG, VERSION, PROG, PROG, PROG, PROG);
 }
 
 /* ------------------------------------------------------------------ *
@@ -9170,7 +9205,8 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 	static const scan_mode_t mode_v[] = { MODE_READ, MODE_CHECK,
 					      MODE_VERIFY, MODE_WRITE };
 	static const char *mode_c[] = { "read", "check", "verify", "write",
-					"repair", "format", "settings" };
+					"repair", "format", "settings",
+					"hide bad" };
 	int mode_sel = 0, order_sel = (int)o->order;
 	int la_sel = o->lookahead == 0 ? 0 : 1, bms_sel = o->bms ? 1 : 0;
 	int wc_sel = o->write_cache < 0 ? 0 : o->write_cache + 1;
@@ -9221,8 +9257,8 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 	  0, 5, { "predeploy", "inservice", "survey", "decay", "repair" },
 	  NULL, 0, 0, 0, &prof_sel },
 	{ NULL, 0, "Mode", "read is safe; write and repair destroy data; format erases it",
-	  0, 7, { "read", "check", "verify", "write", "repair", "format",
-		  "settings" },
+	  0, 8, { "read", "check", "verify", "write", "repair", "format",
+		  "settings", "hide bad" },
 	  NULL, 0, 0, 0, &mode_sel },
 	{ NULL, 0, "Chunk size", "bigger is much faster but raises the bar a sector must clear",
 	  0, 5, { "128K", "256K", "512K", "1M", "4M" },
@@ -9296,6 +9332,8 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 		mode_sel = nmode + 1;
 	if (o->apply_only)
 		mode_sel = nmode + 2;
+	if (o->hide_bad)
+		mode_sel = nmode + 3;
 
 	/*
 	 * Drives and settings are one cursor space: index < ndev is a drive,
@@ -9509,6 +9547,9 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 		else if (mode_sel == nmode + 2)
 			printf("   %sapplies the settings and stops, no scan%s",
 			       c_yel(), c_off());
+		else if (mode_sel == nmode + 3)
+			printf("   %shides the last scan's damage; data lost%s",
+			       c_red(), c_off());
 		else if (mode_sel >= 2)
 			printf("   %sthis mode writes to the drive%s",
 			       c_red(), c_off());
@@ -9620,12 +9661,15 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 			o->repair = 0;
 			o->format = 0;
 			o->apply_only = 0;
+			o->hide_bad = 0;
 			if (mode_sel == nmode)
 				o->repair = 1;
 			else if (mode_sel == nmode + 1)
 				o->format = 1;
 			else if (mode_sel == nmode + 2)
 				o->apply_only = 1;
+			else if (mode_sel == nmode + 3)
+				o->hide_bad = 1;
 			else
 				o->mode = mode_v[mode_sel];
 			o->chunk = chunk_v[chunk_sel];
@@ -9828,6 +9872,1775 @@ static void job_reap(job_t *j, int status)
 	x.state = (x.verdict == 130 || x.verdict == 128 + SIGINT ||
 		   x.verdict == 128 + SIGTERM) ? JS_STOPPED : JS_DONE;
 	jrec_put(&x);
+}
+
+/* ------------------------------------------------------------------ *
+ * hiding the damage: device-mapper maps (hddscan dm ..., or dm-badblocks)
+ *
+ * A drive with a few hundred damaged sectors is not scrap: it is a backup
+ * target whose damage has to be stepped around.  This keeps a map of the
+ * drive's bad extents on the drive itself and turns it into a dm-linear
+ * table, so what the filesystem sees is a slightly smaller device with no
+ * bad blocks in it -- any filesystem, ZFS included.  No kernel module:
+ * device-mapper already does the remapping, this only decides what the table
+ * says.  It used to be a program of its own; it is part of this one so that a
+ * rescue system needs one static binary, and so --hide-bad runs the same code
+ * the command line does.  Installed as 'dm-badblocks' (a link to hddscan) it
+ * answers to that name too.
+ *
+ * Layout, in extents of --extent bytes (1 MiB by default):
+ *
+ *   extent 0          metadata, copy A
+ *   extent N-1        metadata, copy B
+ *   every Kth extent  a spare, held back for damage found later
+ *   bad at creation   skipped: the virtual device simply steps over them
+ *   everything else   the virtual device, in order
+ *
+ * Damage known when the map is created is *skipped*, which keeps the virtual
+ * device laid out in platter order.  Damage found afterwards cannot be skipped
+ * -- that would shift every byte after it -- so it is *remapped* instead: the
+ * extent's readable contents are copied to the nearest free spare and the
+ * table points there.  Spares are spread through the drive rather than kept
+ * at the end so a remapped extent costs a short seek, not a full stroke.
+ * ------------------------------------------------------------------ */
+
+#define DMBB_PROG "dm-badblocks"
+
+/* how to name this in advice: the link if run as one, else the subcommand */
+static const char *g_dmbb_cmd = PROG " dm";
+
+#define DMBB_MAGIC "DMBADBLK"
+#define DMBB_META_VERSION 1
+#define DMBB_HDR_BYTES 4096u
+#define DMBB_DEF_EXTENT (1024u * 1024u)
+#define DMBB_MIN_EXTENT (64u * 1024u)
+#define DMBB_MAX_EXTENT (64u * 1024u * 1024u)
+#define DMBB_DEF_RESERVE 0.1         /* percent of the drive held as spares */
+#define DMBB_IO_UNIT 4096u           /* copy granularity: one 4Kn sector */
+
+/* header field offsets, little-endian on disk */
+#define DMBB_H_MAGIC     0
+#define DMBB_H_VERSION   8
+#define DMBB_H_HDRBYTES  12
+#define DMBB_H_GEN       16
+#define DMBB_H_EXTENT    24
+#define DMBB_H_DEVBYTES  32
+#define DMBB_H_NEXT      40
+#define DMBB_H_INTERVAL  48
+#define DMBB_H_NLOGICAL  56
+#define DMBB_H_NSKIP     64
+#define DMBB_H_NREMAP    68
+#define DMBB_H_NDEAD     72
+#define DMBB_H_UUID      80
+#define DMBB_H_NAME      96          /* 64 bytes, NUL padded */
+#define DMBB_H_CREATED   160
+#define DMBB_H_SUM       168
+#define DMBB_NAME_MAX_LEN 63
+
+typedef struct {
+	uint64_t l;             /* logical extent */
+	uint64_t p;             /* the spare it now lives on */
+} dmbb_remap_t;
+
+typedef struct {
+	uint64_t l, p, n;       /* n extents: logical l.. at physical p.. */
+} dmbb_run_t;
+
+typedef struct {
+	uint64_t gen;
+	uint64_t ext;           /* extent size in bytes */
+	uint64_t dev_bytes;     /* device size when the map was created */
+	uint64_t n_ext;         /* physical extents */
+	uint64_t interval;      /* a spare every this many extents, 0 none */
+	uint64_t n_logical;     /* extents in the virtual device */
+	uint8_t uuid[16];
+	char name[DMBB_NAME_MAX_LEN + 1];
+	uint64_t created;
+
+	uint64_t *skip;         /* bad at creation, sorted; fixed forever */
+	uint32_t n_skip;
+	dmbb_remap_t *remap;         /* found later, sorted by l */
+	uint32_t n_remap, cap_remap;
+	uint64_t *dead;         /* retired spares, sorted */
+	uint32_t n_dead, cap_dead;
+
+	dmbb_run_t *runs;            /* base layout, derived, never stored */
+	uint64_t n_runs;
+} dmbb_map_t;
+
+static int g_dmbb_verbose;
+
+static void dmbb_die(const char *fmt, ...)
+{
+	va_list ap;
+
+	fprintf(stderr, DMBB_PROG ": ");
+	va_start(ap, fmt);
+	vfprintf(stderr, fmt, ap);
+	va_end(ap);
+	fputc('\n', stderr);
+	exit(2);
+}
+
+static void dmbb_msg(const char *fmt, ...)
+{
+	va_list ap;
+
+	va_start(ap, fmt);
+	vfprintf(stderr, fmt, ap);
+	va_end(ap);
+}
+
+static void *dmbb_xcalloc(size_t n, size_t sz)
+{
+	void *p = calloc(n ? n : 1, sz);
+
+	if (!p)
+		dmbb_die("out of memory");
+	return p;
+}
+
+static void dmbb_put32(uint8_t *b, uint32_t v)
+{
+	int i;
+
+	for (i = 0; i < 4; i++)
+		b[i] = (uint8_t)(v >> (8 * i));
+}
+
+static void dmbb_put64(uint8_t *b, uint64_t v)
+{
+	int i;
+
+	for (i = 0; i < 8; i++)
+		b[i] = (uint8_t)(v >> (8 * i));
+}
+
+static uint32_t dmbb_get32(const uint8_t *b)
+{
+	uint32_t v = 0;
+	int i;
+
+	for (i = 3; i >= 0; i--)
+		v = (v << 8) | b[i];
+	return v;
+}
+
+static uint64_t dmbb_get64(const uint8_t *b)
+{
+	uint64_t v = 0;
+	int i;
+
+	for (i = 7; i >= 0; i--)
+		v = (v << 8) | b[i];
+	return v;
+}
+
+static uint64_t dmbb_fnv64(const uint8_t *b, size_t n)
+{
+	uint64_t h = 0xcbf29ce484222325ull;
+	size_t i;
+
+	for (i = 0; i < n; i++) {
+		h ^= b[i];
+		h *= 0x100000001b3ull;
+	}
+	return h;
+}
+
+static int dmbb_parse_size(const char *s, uint64_t *out)
+{
+	char *end;
+	unsigned long long v;
+
+	errno = 0;
+	v = strtoull(s, &end, 10);
+	if (errno || end == s)
+		return -1;
+	switch (*end) {
+	case 'k': case 'K': v <<= 10; end++; break;
+	case 'm': case 'M': v <<= 20; end++; break;
+	case 'g': case 'G': v <<= 30; end++; break;
+	case 't': case 'T': v <<= 40; end++; break;
+	default: break;
+	}
+	if (*end == 'i' || *end == 'B')
+		end++;
+	if (*end == 'B')
+		end++;
+	if (*end)
+		return -1;
+	*out = v;
+	return 0;
+}
+
+static const char *dmbb_human(uint64_t b, char *buf, size_t len)
+{
+	static const char *u[] = { "B", "KiB", "MiB", "GiB", "TiB", "PiB" };
+	double v = (double)b;
+	int i = 0;
+
+	while (v >= 1024.0 && i < 5) {
+		v /= 1024.0;
+		i++;
+	}
+	snprintf(buf, len, i ? "%.2f %s" : "%.0f %s", v, u[i]);
+	return buf;
+}
+
+/* dmsetup is run through the shell, so a name is checked before it gets there */
+static int dmbb_name_ok(const char *n)
+{
+	size_t i;
+
+	if (!n || !*n || strlen(n) > DMBB_NAME_MAX_LEN)
+		return 0;
+	for (i = 0; n[i]; i++)
+		if (!((n[i] >= 'a' && n[i] <= 'z') || (n[i] >= 'A' && n[i] <= 'Z') ||
+		      (n[i] >= '0' && n[i] <= '9') || n[i] == '-' ||
+		      n[i] == '_' || n[i] == '.'))
+			return 0;
+	return 1;
+}
+
+static uint64_t dmbb_dev_size(int fd)
+{
+	struct stat st;
+	uint64_t sz = 0;
+
+	if (fstat(fd, &st) < 0)
+		dmbb_die("fstat: %s", strerror(errno));
+	if (S_ISBLK(st.st_mode)) {
+		if (ioctl(fd, BLKGETSIZE64, &sz) < 0)
+			dmbb_die("BLKGETSIZE64: %s", strerror(errno));
+		return sz;
+	}
+	return (uint64_t)st.st_size;
+}
+
+static int dmbb_is_blockdev(const char *path)
+{
+	struct stat st;
+
+	return stat(path, &st) == 0 && S_ISBLK(st.st_mode);
+}
+
+static int dmbb_pread_full(int fd, void *buf, size_t len, uint64_t off)
+{
+	size_t done = 0;
+
+	while (done < len) {
+		ssize_t r = pread(fd, (char *)buf + done, len - done,
+				  (off_t)(off + done));
+
+		if (r < 0 && errno == EINTR)
+			continue;
+		if (r <= 0)
+			return -1;
+		done += (size_t)r;
+	}
+	return 0;
+}
+
+static int dmbb_pwrite_full(int fd, const void *buf, size_t len, uint64_t off)
+{
+	size_t done = 0;
+
+	while (done < len) {
+		ssize_t r = pwrite(fd, (const char *)buf + done, len - done,
+				   (off_t)(off + done));
+
+		if (r < 0 && errno == EINTR)
+			continue;
+		if (r <= 0)
+			return -1;
+		done += (size_t)r;
+	}
+	return 0;
+}
+
+/* ------------------------------------------------------------------ *
+ * the map in memory
+ * ------------------------------------------------------------------ */
+
+static int dmbb_cmp_u64(const void *a, const void *b)
+{
+	uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+
+	return x < y ? -1 : x > y;
+}
+
+static int dmbb_cmp_remap(const void *a, const void *b)
+{
+	const dmbb_remap_t *x = a, *y = b;
+
+	return x->l < y->l ? -1 : x->l > y->l;
+}
+
+static int dmbb_in_sorted(const uint64_t *v, uint32_t n, uint64_t x)
+{
+	return n && bsearch(&x, v, n, sizeof(*v), dmbb_cmp_u64) != NULL;
+}
+
+static int dmbb_is_meta(const dmbb_map_t *m, uint64_t p)
+{
+	return p == 0 || p == m->n_ext - 1;
+}
+
+static int dmbb_is_spare_slot(const dmbb_map_t *m, uint64_t p)
+{
+	return m->interval && p && p < m->n_ext - 1 && p % m->interval == 0;
+}
+
+static int dmbb_is_skip(const dmbb_map_t *m, uint64_t p)
+{
+	return dmbb_in_sorted(m->skip, m->n_skip, p);
+}
+
+static int dmbb_is_dead(const dmbb_map_t *m, uint64_t p)
+{
+	return dmbb_in_sorted(m->dead, m->n_dead, p);
+}
+
+static dmbb_remap_t *dmbb_remap_of(const dmbb_map_t *m, uint64_t l)
+{
+	dmbb_remap_t key;
+
+	if (!m->n_remap)
+		return NULL;
+	key.l = l;
+	key.p = 0;
+	return bsearch(&key, m->remap, m->n_remap, sizeof(key), dmbb_cmp_remap);
+}
+
+static dmbb_remap_t *dmbb_spare_user(const dmbb_map_t *m, uint64_t p)
+{
+	uint32_t i;
+
+	for (i = 0; i < m->n_remap; i++)
+		if (m->remap[i].p == p)
+			return &m->remap[i];
+	return NULL;
+}
+
+static void dmbb_add_dead(dmbb_map_t *m, uint64_t p)
+{
+	if (dmbb_is_dead(m, p))
+		return;
+	if (m->n_dead == m->cap_dead) {
+		m->cap_dead = m->cap_dead ? m->cap_dead * 2 : 64;
+		m->dead = realloc(m->dead, m->cap_dead * sizeof(*m->dead));
+		if (!m->dead)
+			dmbb_die("out of memory");
+	}
+	m->dead[m->n_dead++] = p;
+	qsort(m->dead, m->n_dead, sizeof(*m->dead), dmbb_cmp_u64);
+}
+
+static void dmbb_add_remap(dmbb_map_t *m, uint64_t l, uint64_t p)
+{
+	if (m->n_remap == m->cap_remap) {
+		m->cap_remap = m->cap_remap ? m->cap_remap * 2 : 64;
+		m->remap = realloc(m->remap, m->cap_remap * sizeof(*m->remap));
+		if (!m->remap)
+			dmbb_die("out of memory");
+	}
+	m->remap[m->n_remap].l = l;
+	m->remap[m->n_remap].p = p;
+	m->n_remap++;
+	qsort(m->remap, m->n_remap, sizeof(*m->remap), dmbb_cmp_remap);
+}
+
+static uint64_t dmbb_spare_total(const dmbb_map_t *m)
+{
+	if (!m->interval || m->n_ext < 3)
+		return 0;
+	return (m->n_ext - 2) / m->interval;
+}
+
+/*
+ * The base layout: every physical extent that is not metadata, a spare slot
+ * or skipped, in platter order, grouped into contiguous runs.  It is derived
+ * from the header and the skip list every time and never stored, so it cannot
+ * disagree with them.
+ */
+static void dmbb_build_runs(dmbb_map_t *m)
+{
+	uint64_t p, l = 0, cap = 1024;
+
+	free(m->runs);
+	m->runs = dmbb_xcalloc(cap, sizeof(*m->runs));
+	m->n_runs = 0;
+	for (p = 1; p + 1 < m->n_ext; p++) {
+		dmbb_run_t *r;
+
+		if (dmbb_is_spare_slot(m, p) || dmbb_is_skip(m, p))
+			continue;
+		r = m->n_runs ? &m->runs[m->n_runs - 1] : NULL;
+		if (r && r->p + r->n == p) {
+			r->n++;
+		} else {
+			if (m->n_runs == cap) {
+				cap *= 2;
+				m->runs = realloc(m->runs, cap * sizeof(*m->runs));
+				if (!m->runs)
+					dmbb_die("out of memory");
+			}
+			r = &m->runs[m->n_runs++];
+			r->l = l;
+			r->p = p;
+			r->n = 1;
+		}
+		l++;
+	}
+	m->n_logical = l;
+}
+
+/* base logical -> physical; runs are ascending in both */
+static uint64_t dmbb_base_l2p(const dmbb_map_t *m, uint64_t l)
+{
+	uint64_t lo = 0, hi = m->n_runs;
+
+	while (lo < hi) {
+		uint64_t mid = (lo + hi) / 2;
+		const dmbb_run_t *r = &m->runs[mid];
+
+		if (l < r->l)
+			hi = mid;
+		else if (l >= r->l + r->n)
+			lo = mid + 1;
+		else
+			return r->p + (l - r->l);
+	}
+	return UINT64_MAX;
+}
+
+static uint64_t dmbb_base_p2l(const dmbb_map_t *m, uint64_t p)
+{
+	uint64_t lo = 0, hi = m->n_runs;
+
+	while (lo < hi) {
+		uint64_t mid = (lo + hi) / 2;
+		const dmbb_run_t *r = &m->runs[mid];
+
+		if (p < r->p)
+			hi = mid;
+		else if (p >= r->p + r->n)
+			lo = mid + 1;
+		else
+			return r->l + (p - r->p);
+	}
+	return UINT64_MAX;
+}
+
+static uint64_t dmbb_l2p(const dmbb_map_t *m, uint64_t l)
+{
+	dmbb_remap_t *r = dmbb_remap_of(m, l);
+
+	return r ? r->p : dmbb_base_l2p(m, l);
+}
+
+/* ------------------------------------------------------------------ *
+ * the map on disk
+ *
+ * Two copies, one in the first extent and one in the last, each carrying a
+ * generation number and a checksum over itself.  The virtual device is
+ * unreadable without the map -- lose it and every byte on the drive is in
+ * the wrong place -- so a write goes to one copy, is synced, and only then
+ * to the other.  Whatever moment it is interrupted at, one copy is whole,
+ * and reading takes the newest one that checks out.
+ * ------------------------------------------------------------------ */
+
+static size_t dmbb_meta_len(const dmbb_map_t *m)
+{
+	size_t n = DMBB_HDR_BYTES + (size_t)m->n_skip * 8 +
+		   (size_t)m->n_remap * 16 + (size_t)m->n_dead * 8;
+
+	return (n + DMBB_IO_UNIT - 1) / DMBB_IO_UNIT * DMBB_IO_UNIT;
+}
+
+static uint8_t *dmbb_meta_encode(const dmbb_map_t *m, size_t *len)
+{
+	size_t n = dmbb_meta_len(m), off = DMBB_HDR_BYTES;
+	uint8_t *b = dmbb_xcalloc(1, n);
+	uint32_t i;
+
+	memcpy(b + DMBB_H_MAGIC, DMBB_MAGIC, 8);
+	dmbb_put32(b + DMBB_H_VERSION, DMBB_META_VERSION);
+	dmbb_put32(b + DMBB_H_HDRBYTES, DMBB_HDR_BYTES);
+	dmbb_put64(b + DMBB_H_GEN, m->gen);
+	dmbb_put64(b + DMBB_H_EXTENT, m->ext);
+	dmbb_put64(b + DMBB_H_DEVBYTES, m->dev_bytes);
+	dmbb_put64(b + DMBB_H_NEXT, m->n_ext);
+	dmbb_put64(b + DMBB_H_INTERVAL, m->interval);
+	dmbb_put64(b + DMBB_H_NLOGICAL, m->n_logical);
+	dmbb_put32(b + DMBB_H_NSKIP, m->n_skip);
+	dmbb_put32(b + DMBB_H_NREMAP, m->n_remap);
+	dmbb_put32(b + DMBB_H_NDEAD, m->n_dead);
+	memcpy(b + DMBB_H_UUID, m->uuid, 16);
+	memcpy(b + DMBB_H_NAME, m->name, strlen(m->name));
+	dmbb_put64(b + DMBB_H_CREATED, m->created);
+	for (i = 0; i < m->n_skip; i++, off += 8)
+		dmbb_put64(b + off, m->skip[i]);
+	for (i = 0; i < m->n_remap; i++, off += 16) {
+		dmbb_put64(b + off, m->remap[i].l);
+		dmbb_put64(b + off + 8, m->remap[i].p);
+	}
+	for (i = 0; i < m->n_dead; i++, off += 8)
+		dmbb_put64(b + off, m->dead[i]);
+	dmbb_put64(b + DMBB_H_SUM, dmbb_fnv64(b, n));
+	*len = n;
+	return b;
+}
+
+/* 0 and a filled map if the copy at off is whole; -1 otherwise */
+static int dmbb_meta_read_at(int fd, uint64_t off, uint64_t dev, dmbb_map_t *m)
+{
+	uint8_t hdr[DMBB_HDR_BYTES], *b;
+	uint64_t ext, sum;
+	uint32_t ns, nr, nd, i;
+	size_t n, o = DMBB_HDR_BYTES;
+
+	if (off + DMBB_HDR_BYTES > dev || dmbb_pread_full(fd, hdr, DMBB_HDR_BYTES, off) < 0)
+		return -1;
+	if (memcmp(hdr + DMBB_H_MAGIC, DMBB_MAGIC, 8) ||
+	    dmbb_get32(hdr + DMBB_H_VERSION) != DMBB_META_VERSION ||
+	    dmbb_get32(hdr + DMBB_H_HDRBYTES) != DMBB_HDR_BYTES)
+		return -1;
+	ext = dmbb_get64(hdr + DMBB_H_EXTENT);
+	ns = dmbb_get32(hdr + DMBB_H_NSKIP);
+	nr = dmbb_get32(hdr + DMBB_H_NREMAP);
+	nd = dmbb_get32(hdr + DMBB_H_NDEAD);
+	if (ext < DMBB_MIN_EXTENT || ext > DMBB_MAX_EXTENT || (ext & (ext - 1)))
+		return -1;
+	n = DMBB_HDR_BYTES + (size_t)ns * 8 + (size_t)nr * 16 + (size_t)nd * 8;
+	n = (n + DMBB_IO_UNIT - 1) / DMBB_IO_UNIT * DMBB_IO_UNIT;
+	if (n > ext)
+		return -1;
+	b = dmbb_xcalloc(1, n);
+	if (dmbb_pread_full(fd, b, n, off) < 0) {
+		free(b);
+		return -1;
+	}
+	sum = dmbb_get64(b + DMBB_H_SUM);
+	dmbb_put64(b + DMBB_H_SUM, 0);
+	if (dmbb_fnv64(b, n) != sum) {
+		free(b);
+		return -1;
+	}
+	memset(m, 0, sizeof(*m));
+	m->gen = dmbb_get64(b + DMBB_H_GEN);
+	m->ext = ext;
+	m->dev_bytes = dmbb_get64(b + DMBB_H_DEVBYTES);
+	m->n_ext = dmbb_get64(b + DMBB_H_NEXT);
+	m->interval = dmbb_get64(b + DMBB_H_INTERVAL);
+	m->n_logical = dmbb_get64(b + DMBB_H_NLOGICAL);
+	memcpy(m->uuid, b + DMBB_H_UUID, 16);
+	memcpy(m->name, b + DMBB_H_NAME, DMBB_NAME_MAX_LEN);
+	m->name[DMBB_NAME_MAX_LEN] = 0;
+	m->created = dmbb_get64(b + DMBB_H_CREATED);
+	m->n_skip = ns;
+	m->skip = dmbb_xcalloc(ns, sizeof(*m->skip));
+	for (i = 0; i < ns; i++, o += 8)
+		m->skip[i] = dmbb_get64(b + o);
+	m->n_remap = m->cap_remap = nr;
+	m->remap = dmbb_xcalloc(nr, sizeof(*m->remap));
+	for (i = 0; i < nr; i++, o += 16) {
+		m->remap[i].l = dmbb_get64(b + o);
+		m->remap[i].p = dmbb_get64(b + o + 8);
+	}
+	m->n_dead = m->cap_dead = nd;
+	m->dead = dmbb_xcalloc(nd, sizeof(*m->dead));
+	for (i = 0; i < nd; i++, o += 8)
+		m->dead[i] = dmbb_get64(b + o);
+	free(b);
+	if (m->n_ext != m->dev_bytes / m->ext || m->n_ext < 3)
+		return -1;
+	return 0;
+}
+
+static void dmbb_map_free(dmbb_map_t *m)
+{
+	free(m->skip);
+	free(m->remap);
+	free(m->dead);
+	free(m->runs);
+	memset(m, 0, sizeof(*m));
+}
+
+/*
+ * Returns 0 with the newest whole copy loaded, -1 if there is none.  *copies
+ * says which were whole (bit 0 A, bit 1 B), so a caller can say that one of
+ * them needs rewriting.  Copy B's place depends on the extent size, which is
+ * in the header -- so if A is gone, every extent size is tried.
+ */
+static int dmbb_meta_load(int fd, dmbb_map_t *m, int *copies)
+{
+	uint64_t dev = dmbb_dev_size(fd), ext;
+	dmbb_map_t a, b;
+	int ha, hb = -1;
+
+	*copies = 0;
+	ha = dmbb_meta_read_at(fd, 0, dev, &a);
+	if (!ha) {
+		*copies |= 1;
+		hb = dmbb_meta_read_at(fd, (a.n_ext - 1) * a.ext, dev, &b);
+	} else {
+		for (ext = DMBB_MIN_EXTENT; ext <= DMBB_MAX_EXTENT && hb; ext <<= 1)
+			if (dev / ext >= 3)
+				hb = dmbb_meta_read_at(fd, (dev / ext - 1) * ext,
+						  dev, &b);
+	}
+	if (!hb)
+		*copies |= 2;
+	if (ha && hb)
+		return -1;
+	if (!ha && !hb) {
+		if (b.gen > a.gen) {
+			dmbb_map_free(&a);
+			*m = b;
+		} else {
+			dmbb_map_free(&b);
+			*m = a;
+		}
+	} else {
+		*m = ha ? b : a;
+	}
+	if (m->dev_bytes > dev) {
+		dmbb_msg(DMBB_PROG ": the map was made for %" PRIu64 " bytes and the "
+		    "device now has %" PRIu64 "; refusing to use it\n",
+		    m->dev_bytes, dev);
+		dmbb_map_free(m);
+		return -1;
+	}
+	dmbb_build_runs(m);
+	return 0;
+}
+
+static int dmbb_meta_store(int fd, dmbb_map_t *m)
+{
+	uint8_t *b;
+	size_t len;
+	int rc = -1;
+
+	m->gen++;
+	b = dmbb_meta_encode(m, &len);
+	if (len > m->ext) {
+		dmbb_msg(DMBB_PROG ": the map no longer fits in one %" PRIu64 "-byte "
+		    "extent; nothing written\n", m->ext);
+		m->gen--;
+		free(b);
+		return -1;
+	}
+	if (dmbb_pwrite_full(fd, b, len, 0) < 0 || fdatasync(fd) < 0) {
+		dmbb_msg(DMBB_PROG ": writing map copy A: %s\n", strerror(errno));
+		goto out;
+	}
+	if (dmbb_pwrite_full(fd, b, len, (m->n_ext - 1) * m->ext) < 0 ||
+	    fdatasync(fd) < 0) {
+		dmbb_msg(DMBB_PROG ": writing map copy B: %s\n", strerror(errno));
+		goto out;
+	}
+	rc = 0;
+out:
+	free(b);
+	return rc;
+}
+
+/* ------------------------------------------------------------------ *
+ * the dm table
+ * ------------------------------------------------------------------ */
+
+static void dmbb_table_line(FILE *f, uint64_t l, uint64_t p, uint64_t n,
+		       uint64_t ext, const char *dev)
+{
+	uint64_t s = ext / 512;
+
+	fprintf(f, "%" PRIu64 " %" PRIu64 " linear %s %" PRIu64 "\n",
+		l * s, n * s, dev, p * s);
+}
+
+/*
+ * The base runs in logical order, with each remapped extent cut out of its
+ * run and pointed at its spare.  Remaps are sorted by logical extent, so one
+ * pass over both does it.
+ */
+static void dmbb_emit_table(FILE *f, const dmbb_map_t *m, const char *dev)
+{
+	uint64_t i;
+	uint32_t k = 0;
+
+	for (i = 0; i < m->n_runs; i++) {
+		const dmbb_run_t *r = &m->runs[i];
+		uint64_t l = r->l, end = r->l + r->n;
+
+		while (k < m->n_remap && m->remap[k].l < r->l)
+			k++;
+		while (l < end) {
+			if (k < m->n_remap && m->remap[k].l < end) {
+				uint64_t rl = m->remap[k].l;
+
+				if (rl > l)
+					dmbb_table_line(f, l, r->p + (l - r->l),
+						   rl - l, m->ext, dev);
+				dmbb_table_line(f, rl, m->remap[k].p, 1, m->ext,
+					   dev);
+				l = rl + 1;
+				k++;
+			} else {
+				dmbb_table_line(f, l, r->p + (l - r->l), end - l,
+					   m->ext, dev);
+				l = end;
+			}
+		}
+	}
+}
+
+/* ------------------------------------------------------------------ *
+ * dmsetup
+ * ------------------------------------------------------------------ */
+
+static int dmbb_run_cmd(const char *cmd)
+{
+	int st = system(cmd);
+
+	if (g_dmbb_verbose)
+		dmbb_msg("  $ %s -> %d\n", cmd, st);
+	return st != -1 && WIFEXITED(st) && WEXITSTATUS(st) == 0 ? 0 : -1;
+}
+
+static int dmbb_read_line(const char *path, char *out, size_t len)
+{
+	FILE *f = fopen(path, "re");
+	size_t n;
+
+	if (!f)
+		return -1;
+	if (!fgets(out, (int)len, f)) {
+		fclose(f);
+		return -1;
+	}
+	fclose(f);
+	n = strlen(out);
+	while (n && (out[n - 1] == '\n' || out[n - 1] == ' '))
+		out[--n] = 0;
+	return 0;
+}
+
+/*
+ * Is a device-mapper device sitting on top of this drive right now?  Asked of
+ * sysfs, not of dmsetup: dmsetup needs root to answer at all, and a check that
+ * silently said "no" to anyone else would let a remap copy extents out from
+ * under a live filesystem without suspending it.  Returns 1 and the holder's
+ * dm name and uuid, 0 if there is none, -1 if it cannot tell.
+ */
+static int dmbb_holder(const char *dev, char *name, size_t nlen, char *uuid,
+		     size_t ulen)
+{
+	struct stat st;
+	char path[512], p2[768];
+	DIR *d;
+	struct dirent *e;
+	int found = 0;
+
+	if (stat(dev, &st) < 0)
+		return -1;
+	if (!S_ISBLK(st.st_mode))
+		return 0;       /* an image: nothing can hold it */
+	snprintf(path, sizeof(path), "/sys/dev/block/%u:%u/holders",
+		 major(st.st_rdev), minor(st.st_rdev));
+	d = opendir(path);
+	if (!d)
+		return -1;
+	while ((e = readdir(d))) {
+		if (strncmp(e->d_name, "dm-", 3))
+			continue;
+		snprintf(p2, sizeof(p2), "/sys/block/%s/dm/name", e->d_name);
+		if (dmbb_read_line(p2, name, nlen) < 0)
+			continue;
+		snprintf(p2, sizeof(p2), "/sys/block/%s/dm/uuid", e->d_name);
+		if (dmbb_read_line(p2, uuid, ulen) < 0)
+			uuid[0] = 0;
+		found = 1;
+		break;
+	}
+	closedir(d);
+	return found;
+}
+
+static int dmbb_active(const char *name)
+{
+	char path[160];
+
+	snprintf(path, sizeof(path), "/dev/mapper/%s", name);
+	return access(path, F_OK) == 0;
+}
+
+/* "create NAME" or "reload NAME", with the table on stdin */
+static int dmbb_load(const char *verb, const dmbb_map_t *m, const char *dev)
+{
+	char cmd[256], uuid[64] = "";
+	FILE *f;
+	int st, i;
+
+	if (!strcmp(verb, "create")) {
+		char *u = uuid;
+
+		u += sprintf(u, "--uuid DMBB-");
+		for (i = 0; i < 16; i++)
+			u += sprintf(u, "%02x", m->uuid[i]);
+	}
+	snprintf(cmd, sizeof(cmd), "dmsetup %s %s %s", verb, uuid, m->name);
+	f = popen(cmd, "w");
+	if (!f)
+		return -1;
+	dmbb_emit_table(f, m, dev);
+	st = pclose(f);
+	return st != -1 && WIFEXITED(st) && WEXITSTATUS(st) == 0 ? 0 : -1;
+}
+
+/* ------------------------------------------------------------------ *
+ * bad block lists
+ * ------------------------------------------------------------------ */
+
+/*
+ * badblocks(8) format, which is what hddscan --badblocks-list writes: one
+ * block number per line in units of bs.  It must be relative to the whole
+ * device, not a partition.  Returns the sorted, unique extents touched.
+ */
+static uint64_t *dmbb_read_badlist(const char *path, uint64_t bs, uint64_t ext,
+			      uint32_t *count)
+{
+	FILE *f = strcmp(path, "-") ? fopen(path, "re") : stdin;
+	char line[256];
+	uint64_t *v = NULL;
+	uint32_t n = 0, cap = 0, i, u;
+
+	if (!f)
+		dmbb_die("cannot read %s: %s", path, strerror(errno));
+	while (fgets(line, sizeof(line), f)) {
+		char *s = line, *end;
+		unsigned long long blk;
+		uint64_t off, e, last;
+
+		while (*s == ' ' || *s == '\t')
+			s++;
+		if (*s == '#' || *s == '\n' || !*s)
+			continue;
+		errno = 0;
+		blk = strtoull(s, &end, 10);
+		if (errno || end == s)
+			dmbb_die("%s: not a block number: %s", path, line);
+		off = (uint64_t)blk * bs;
+		last = (off + bs - 1) / ext;
+		for (e = off / ext; e <= last; e++) {
+			if (n == cap) {
+				cap = cap ? cap * 2 : 256;
+				v = realloc(v, cap * sizeof(*v));
+				if (!v)
+					dmbb_die("out of memory");
+			}
+			v[n++] = e;
+		}
+	}
+	if (f != stdin)
+		fclose(f);
+	if (n)
+		qsort(v, n, sizeof(*v), dmbb_cmp_u64);
+	for (i = 0, u = 0; i < n; i++)
+		if (!u || v[u - 1] != v[i])
+			v[u++] = v[i];
+	*count = u;
+	return v;
+}
+
+/* ------------------------------------------------------------------ *
+ * commands
+ * ------------------------------------------------------------------ */
+
+typedef struct {
+	const char *dev;
+	const char *bad;
+	const char *confirm;
+	const char *name;
+	uint64_t bs;
+	uint64_t ext;
+	double reserve;
+	int force;
+	int logical;
+	int offline;
+	int physical;
+} dmbb_opts_t;
+
+static int dmbb_open_dev(const char *path, int wr, int excl)
+{
+	int fd = open(path, (wr ? O_RDWR : O_RDONLY) | O_CLOEXEC |
+		      (excl && dmbb_is_blockdev(path) ? O_EXCL : 0));
+
+	if (fd < 0)
+		dmbb_die("cannot open %s: %s%s", path, strerror(errno),
+		    errno == EBUSY ? " (mounted, or in use by another "
+		    "device-mapper table?)" : "");
+	return fd;
+}
+
+static void dmbb_load_or_die(int fd, const char *dev, dmbb_map_t *m)
+{
+	int copies;
+
+	if (dmbb_meta_load(fd, m, &copies) < 0)
+		dmbb_die("%s: no dm-badblocks map found", dev);
+	if (copies != 3)
+		dmbb_msg(DMBB_PROG ": %s: map copy %s is damaged; the next change "
+		    "rewrites it\n", dev, copies == 1 ? "B" : "A");
+}
+
+static void dmbb_default_name(const char *dev, char *out, size_t len)
+{
+	const char *b = strrchr(dev, '/');
+	size_t i;
+
+	snprintf(out, len, "bb-%s", b ? b + 1 : dev);
+	for (i = 0; out[i]; i++)
+		if (!dmbb_name_ok((char[]){ out[i], 0 }))
+			out[i] = '_';
+}
+
+static int dmbb_cmd_create(const dmbb_opts_t *o)
+{
+	dmbb_map_t m, old;
+	uint64_t dev, *bad = NULL;
+	uint32_t nbad = 0, k, ns = 0, nmeta = 0, nspare = 0;
+	int fd, copies, rfd;
+	char b1[32], b2[32];
+
+	if (!o->confirm || strcmp(o->confirm, o->dev))
+		dmbb_die("creating a map overwrites the first and last %s of %s, "
+		    "and a filesystem made on the device afterwards overwrites "
+		    "the rest.  Pass --confirm %s", dmbb_human(o->ext, b1,
+		    sizeof(b1)), o->dev, o->dev);
+	if (o->ext < DMBB_MIN_EXTENT || o->ext > DMBB_MAX_EXTENT ||
+	    (o->ext & (o->ext - 1)))
+		dmbb_die("--extent must be a power of two from 64K to 64M");
+	if (o->reserve < 0 || o->reserve > 50)
+		dmbb_die("--reserve is a percentage from 0 to 50");
+	fd = dmbb_open_dev(o->dev, 1, 1);
+	dev = dmbb_dev_size(fd);
+	if (!dmbb_meta_load(fd, &old, &copies)) {
+		dmbb_map_free(&old);
+		if (!o->force)
+			dmbb_die("%s already carries a dm-badblocks map.  Adding "
+			    "damage found since is 'remap'; replacing the map "
+			    "loses everything on the virtual device and needs "
+			    "--force", o->dev);
+	}
+
+	memset(&m, 0, sizeof(m));
+	m.ext = o->ext;
+	m.dev_bytes = dev;
+	m.n_ext = dev / o->ext;
+	if (m.n_ext < 3)
+		dmbb_die("%s is too small for %s extents", o->dev,
+		    dmbb_human(o->ext, b1, sizeof(b1)));
+	m.interval = o->reserve > 0 ?
+		     (uint64_t)(100.0 / o->reserve + 0.5) : 0;
+	if (m.interval == 1)
+		m.interval = 2;
+	if (o->name)
+		snprintf(m.name, sizeof(m.name), "%s", o->name);
+	else
+		dmbb_default_name(o->dev, m.name, sizeof(m.name));
+	if (!dmbb_name_ok(m.name))
+		dmbb_die("--name may only use letters, digits, '-', '_' and '.'");
+	m.created = (uint64_t)time(NULL);
+	rfd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+	if (rfd < 0 || read(rfd, m.uuid, 16) != 16)
+		dmbb_die("cannot read /dev/urandom");
+	close(rfd);
+
+	if (o->bad)
+		bad = dmbb_read_badlist(o->bad, o->bs, o->ext, &nbad);
+	m.skip = dmbb_xcalloc(nbad, sizeof(*m.skip));
+	for (k = 0; k < nbad; k++) {
+		uint64_t p = bad[k];
+
+		if (p >= m.n_ext) {
+			dmbb_msg(DMBB_PROG ": bad block beyond the last whole extent "
+			    "(extent %" PRIu64 "); already unused\n", p);
+			continue;
+		}
+		/*
+		 * Two copies are the whole of the map's protection, and a
+		 * copy on damaged media is not one.  Moving them would mean
+		 * searching for them on every read; refuse and say so.
+		 */
+		if (dmbb_is_meta(&m, p)) {
+			nmeta++;
+			continue;
+		}
+		if (dmbb_is_spare_slot(&m, p)) {
+			dmbb_add_dead(&m, p);
+			nspare++;
+			continue;
+		}
+		m.skip[ns++] = p;
+	}
+	if (nmeta)
+		dmbb_die("%s has damage in its first or last %s, where the map's "
+		    "two copies live.  Not creating a map whose only "
+		    "protection is already compromised", o->dev,
+		    dmbb_human(o->ext, b1, sizeof(b1)));
+	m.n_skip = ns;
+	dmbb_build_runs(&m);
+	if (dmbb_meta_len(&m) > m.ext)
+		dmbb_die("%u bad extents do not fit in one %s map extent; use a "
+		    "larger --extent", ns, dmbb_human(o->ext, b1, sizeof(b1)));
+	if (dmbb_meta_store(fd, &m) < 0)
+		dmbb_die("could not write the map");
+	close(fd);
+
+	printf("  created map '%s' on %s\n", m.name, o->dev);
+	printf("  virtual device  %s  (%" PRIu64 " extents of %s)\n",
+	       dmbb_human(m.n_logical * m.ext, b1, sizeof(b1)), m.n_logical,
+	       dmbb_human(m.ext, b2, sizeof(b2)));
+	printf("  skipped         %u bad extent%s (%s)\n", ns,
+	       ns == 1 ? "" : "s", dmbb_human((uint64_t)ns * m.ext, b1, sizeof(b1)));
+	printf("  spares          %" PRIu64 ", one every %" PRIu64
+	       " extents%s\n", dmbb_spare_total(&m) - nspare, m.interval,
+	       nspare ? " (some were bad already and are retired)" : "");
+	printf("  next            %s activate %s\n", g_dmbb_cmd, o->dev);
+	free(bad);
+	dmbb_map_free(&m);
+	return 0;
+}
+
+static int dmbb_cmd_status(const dmbb_opts_t *o)
+{
+	dmbb_map_t m;
+	int fd = dmbb_open_dev(o->dev, 0, 0);
+	uint64_t used = 0, dead_free = 0, i;
+	char b1[32], b2[32], when[64];
+	time_t t;
+	struct tm tm;
+
+	dmbb_load_or_die(fd, o->dev, &m);
+	close(fd);
+	for (i = 0; i < m.n_dead; i++)
+		if (!dmbb_spare_user(&m, m.dead[i]))
+			dead_free++;
+	used = m.n_remap;
+	t = (time_t)m.created;
+	localtime_r(&t, &tm);
+	strftime(when, sizeof(when), "%Y-%m-%d %H:%M", &tm);
+	printf("  device          %s  %s\n", o->dev,
+	       dmbb_human(m.dev_bytes, b1, sizeof(b1)));
+	if (dmbb_active(m.name))
+		printf("  name            %s  (active: /dev/mapper/%s)\n",
+		       m.name, m.name);
+	else
+		printf("  name            %s\n", m.name);
+	printf("  created         %s, map generation %" PRIu64 "\n", when,
+	       m.gen);
+	printf("  extent          %s, %" PRIu64 " on the drive\n",
+	       dmbb_human(m.ext, b1, sizeof(b1)), m.n_ext);
+	printf("  virtual device  %s  (%" PRIu64 " extents)\n",
+	       dmbb_human(m.n_logical * m.ext, b1, sizeof(b1)), m.n_logical);
+	printf("  skipped         %u extent%s bad when the map was made (%s)\n",
+	       m.n_skip, m.n_skip == 1 ? "" : "s",
+	       dmbb_human((uint64_t)m.n_skip * m.ext, b2, sizeof(b2)));
+	printf("  spares          %" PRIu64 " total: %" PRIu64 " in use, %"
+	       PRIu64 " retired, %" PRIu64 " free\n", dmbb_spare_total(&m), used,
+	       dead_free, dmbb_spare_total(&m) - used - dead_free);
+	if (m.n_remap && m.n_remap <= 32) {
+		uint32_t k;
+
+		printf("  remapped        logical extent -> spare\n");
+		for (k = 0; k < m.n_remap; k++)
+			printf("                  %" PRIu64 " -> %" PRIu64 "\n",
+			       m.remap[k].l, m.remap[k].p);
+	}
+	dmbb_map_free(&m);
+	return 0;
+}
+
+static int dmbb_cmd_table(const dmbb_opts_t *o)
+{
+	dmbb_map_t m;
+	int fd = dmbb_open_dev(o->dev, 0, 0);
+
+	dmbb_load_or_die(fd, o->dev, &m);
+	close(fd);
+	dmbb_emit_table(stdout, &m, o->dev);
+	dmbb_map_free(&m);
+	return 0;
+}
+
+static int dmbb_cmd_map(const dmbb_opts_t *o, const char *arg)
+{
+	dmbb_map_t m;
+	int fd = dmbb_open_dev(o->dev, 0, 0);
+	uint64_t off, e, r;
+
+	if (!arg || dmbb_parse_size(arg, &off))
+		dmbb_die("map needs a byte offset");
+	dmbb_load_or_die(fd, o->dev, &m);
+	close(fd);
+	e = off / m.ext;
+	if (o->physical) {
+		dmbb_remap_t *u = dmbb_spare_user(&m, e);
+
+		r = u ? u->l : dmbb_base_p2l(&m, e);
+		if (u == NULL && r != UINT64_MAX && dmbb_remap_of(&m, r))
+			r = UINT64_MAX;   /* abandoned: its data moved */
+		if (r == UINT64_MAX) {
+			printf("physical %" PRIu64 " is not part of the "
+			       "virtual device\n", off);
+			dmbb_map_free(&m);
+			return 1;
+		}
+		printf("physical %" PRIu64 " -> logical %" PRIu64 "\n", off,
+		       r * m.ext + off % m.ext);
+	} else {
+		if (e >= m.n_logical) {
+			printf("logical %" PRIu64 " is past the end\n", off);
+			dmbb_map_free(&m);
+			return 1;
+		}
+		r = dmbb_l2p(&m, e);
+		printf("logical %" PRIu64 " -> physical %" PRIu64 "\n", off,
+		       r * m.ext + off % m.ext);
+	}
+	dmbb_map_free(&m);
+	return 0;
+}
+
+static uint64_t dmbb_alloc_spare(const dmbb_map_t *m, uint64_t near)
+{
+	uint64_t k0, d, maxk, best = UINT64_MAX, bestd = UINT64_MAX;
+
+	if (!m->interval)
+		return UINT64_MAX;
+	maxk = (m->n_ext - 2) / m->interval;
+	k0 = near / m->interval;
+	for (d = 0; d <= maxk + 1; d++) {
+		uint64_t c[2], j;
+
+		c[0] = k0 >= d ? k0 - d : 0;
+		c[1] = k0 + 1 + d;
+		for (j = 0; j < 2; j++) {
+			uint64_t p = c[j] * m->interval, dist;
+
+			if (!c[j] || !dmbb_is_spare_slot(m, p) || dmbb_is_dead(m, p) ||
+			    dmbb_spare_user(m, p) || dmbb_is_skip(m, p))
+				continue;
+			dist = p > near ? p - near : near - p;
+			if (dist < bestd) {
+				bestd = dist;
+				best = p;
+			}
+		}
+		if (best != UINT64_MAX)
+			return best;
+	}
+	return UINT64_MAX;
+}
+
+/*
+ * Copy what can still be read of extent src to dst and read the copy back.
+ * An unreadable unit is written as zeros and counted: the data there is gone
+ * either way, and the caller says where so it can be found in the filesystem.
+ * The read-back compares against what was *written*, through a descriptor
+ * that bypasses the page cache when the device allows it -- otherwise it
+ * would only be checking memory.  Returns -1 if the destination misbehaves,
+ * which retires that spare and tries another.
+ */
+static int dmbb_copy_extent(int fd, const dmbb_map_t *m, uint64_t src, uint64_t dst,
+		       uint64_t *lost)
+{
+	uint8_t *buf, *chk;
+	uint64_t u;
+	int rc = 0;
+
+	if (posix_memalign((void **)&buf, DMBB_IO_UNIT, m->ext) ||
+	    posix_memalign((void **)&chk, DMBB_IO_UNIT, DMBB_IO_UNIT))
+		dmbb_die("out of memory");
+	*lost = 0;
+	for (u = 0; u < m->ext; u += DMBB_IO_UNIT)
+		if (dmbb_pread_full(fd, buf + u, DMBB_IO_UNIT, src * m->ext + u) < 0) {
+			memset(buf + u, 0, DMBB_IO_UNIT);
+			(*lost)++;
+		}
+	if (dmbb_pwrite_full(fd, buf, m->ext, dst * m->ext) < 0 ||
+	    fdatasync(fd) < 0)
+		rc = -1;
+	for (u = 0; !rc && u < m->ext; u += DMBB_IO_UNIT)
+		if (dmbb_pread_full(fd, chk, DMBB_IO_UNIT, dst * m->ext + u) < 0 ||
+		    memcmp(buf + u, chk, DMBB_IO_UNIT))
+			rc = -1;
+	free(buf);
+	free(chk);
+	return rc;
+}
+
+/* move logical extent l, currently on physical cur, to a fresh spare */
+static int dmbb_move_extent(int fd, dmbb_map_t *m, uint64_t l, uint64_t cur)
+{
+	char b1[32];
+
+	for (;;) {
+		uint64_t s = dmbb_alloc_spare(m, cur), lost;
+		dmbb_remap_t *r;
+
+		if (s == UINT64_MAX) {
+			dmbb_msg(DMBB_PROG ": no free spare left for logical extent %"
+			    PRIu64 "; it stays on damaged media\n", l);
+			return -1;
+		}
+		if (dmbb_copy_extent(fd, m, cur, s, &lost) < 0) {
+			dmbb_msg(DMBB_PROG ": spare %" PRIu64 " failed while copying "
+			    "to it; retiring it and trying another\n", s);
+			dmbb_add_dead(m, s);
+			continue;
+		}
+		r = dmbb_remap_of(m, l);
+		if (r)
+			r->p = s;
+		else
+			dmbb_add_remap(m, l, s);
+		printf("  remapped logical extent %" PRIu64 " (%s into the "
+		       "virtual device) from %" PRIu64 " to spare %" PRIu64
+		       "\n", l, dmbb_human(l * m->ext, b1, sizeof(b1)), cur, s);
+		if (lost)
+			printf("    %" PRIu64 " x %u bytes could not be read "
+			       "and were zeroed: virtual bytes %" PRIu64
+			       "..%" PRIu64 " need checking\n", lost, DMBB_IO_UNIT,
+			       l * m->ext, (l + 1) * m->ext - 1);
+		return 0;
+	}
+}
+
+static void dmbb_map_clone(const dmbb_map_t *src, dmbb_map_t *dst)
+{
+	*dst = *src;
+	dst->skip = dmbb_xcalloc(src->n_skip, sizeof(*dst->skip));
+	memcpy(dst->skip, src->skip, src->n_skip * sizeof(*dst->skip));
+	dst->remap = dmbb_xcalloc(src->n_remap, sizeof(*dst->remap));
+	memcpy(dst->remap, src->remap, src->n_remap * sizeof(*dst->remap));
+	dst->cap_remap = src->n_remap;
+	dst->dead = dmbb_xcalloc(src->n_dead, sizeof(*dst->dead));
+	memcpy(dst->dead, src->dead, src->n_dead * sizeof(*dst->dead));
+	dst->cap_dead = src->n_dead;
+	dst->runs = NULL;
+	dst->n_runs = 0;
+}
+
+static int dmbb_cmd_remap(const dmbb_opts_t *o)
+{
+	dmbb_map_t m, before;
+	uint64_t *bad;
+	uint32_t nbad, k;
+	int fd, dfd, active = 0, fails = 0, changed = 0, h;
+	char hname[128] = "", huuid[128] = "";
+
+	if (!o->bad)
+		dmbb_die("remap needs --bad FILE (badblocks format, - for stdin)");
+	fd = dmbb_open_dev(o->dev, 1, 0);
+	dmbb_load_or_die(fd, o->dev, &m);
+	if (o->name)
+		snprintf(m.name, sizeof(m.name), "%s", o->name);
+
+	/*
+	 * Suspending the device flushes what is in flight and holds new I/O,
+	 * so nothing is written to an extent between copying it and pointing
+	 * the table at the copy.  Without that the copy could be stale the
+	 * moment it was made.  Whatever sits on the drive is found through
+	 * sysfs, under whatever name it was activated as.
+	 */
+	h = dmbb_holder(o->dev, hname, sizeof(hname), huuid, sizeof(huuid));
+	if (h < 0 && !o->offline)
+		dmbb_die("cannot tell whether %s is in use (no sysfs?); if it is "
+		    "not, say so with --offline", o->dev);
+	if (h > 0) {
+		if (strncmp(huuid, "DMBB-", 5))
+			dmbb_die("%s is held by device-mapper device '%s', which "
+			    "is not one of ours; refusing", o->dev, hname);
+		if (o->offline)
+			dmbb_die("%s is active as /dev/mapper/%s; --offline would "
+			    "copy extents from under it", o->dev, hname);
+		if (!dmbb_name_ok(hname))
+			dmbb_die("unexpected device-mapper name '%s'", hname);
+		snprintf(m.name, sizeof(m.name), "%s", hname);
+		active = 1;
+	}
+	dfd = open(o->dev, O_RDWR | O_DIRECT | O_CLOEXEC);
+	if (dfd < 0)
+		dfd = fd;       /* tmpfs and friends: no O_DIRECT */
+	bad = dmbb_read_badlist(o->bad, o->bs, m.ext, &nbad);
+	dmbb_map_clone(&m, &before);
+
+	if (active) {
+		char cmd[160];
+
+		snprintf(cmd, sizeof(cmd), "dmsetup suspend %s", m.name);
+		if (dmbb_run_cmd(cmd) < 0)
+			dmbb_die("could not suspend %s (need root?)", m.name);
+	}
+
+	for (k = 0; k < nbad; k++) {
+		uint64_t p = bad[k], l;
+		dmbb_remap_t *u;
+
+		if (o->logical) {
+			if (p >= m.n_logical) {
+				dmbb_msg(DMBB_PROG ": logical extent %" PRIu64 " is past "
+				    "the end\n", p);
+				continue;
+			}
+			p = dmbb_l2p(&m, p);
+		}
+		if (p >= m.n_ext) {
+			dmbb_msg(DMBB_PROG ": extent %" PRIu64 " is past the end of "
+			    "the map\n", p);
+			continue;
+		}
+		if (dmbb_is_meta(&m, p)) {
+			dmbb_msg(DMBB_PROG ": extent %" PRIu64 " holds a copy of the map "
+			    "itself; the other copy still protects it, but "
+			    "this drive is getting worse\n", p);
+			continue;
+		}
+		if (dmbb_is_skip(&m, p) || dmbb_is_dead(&m, p))
+			continue;       /* already out of use */
+		if (dmbb_is_spare_slot(&m, p)) {
+			u = dmbb_spare_user(&m, p);
+			if (u && dmbb_move_extent(dfd, &m, u->l, p) < 0) {
+				fails++;
+				continue;
+			}
+			dmbb_add_dead(&m, p);
+			changed = 1;
+			if (!u)
+				printf("  retired free spare %" PRIu64 "\n", p);
+			continue;
+		}
+		l = dmbb_base_p2l(&m, p);
+		if (l == UINT64_MAX || dmbb_remap_of(&m, l))
+			continue;       /* its data already moved */
+		if (dmbb_move_extent(dfd, &m, l, p) < 0) {
+			fails++;
+			continue;
+		}
+		changed = 1;
+	}
+
+	if (changed && dmbb_meta_store(fd, &m) < 0) {
+		fails++;
+		changed = 0;
+		dmbb_msg(DMBB_PROG ": the map was NOT updated; the copies made are "
+		    "unused and the device is as it was\n");
+	}
+	if (active) {
+		char cmd[160];
+
+		if (changed && dmbb_load("reload", &m, o->dev) < 0) {
+			/*
+			 * The kernel still has the old table.  Left alone,
+			 * the map on disk would send the next activation to
+			 * the copies made just now, while everything written
+			 * from here on goes to the old extents.  So the map
+			 * goes back to what the kernel is using, as a newer
+			 * generation so it wins.
+			 */
+			dmbb_msg(DMBB_PROG ": dmsetup reload failed; putting the "
+			    "previous map back\n");
+			before.gen = m.gen;
+			if (dmbb_meta_store(fd, &before) < 0)
+				dmbb_msg(DMBB_PROG ": %sand that failed too: do not "
+				    "reactivate %s until this is sorted out\n",
+				    "", o->dev);
+			fails++;
+		}
+		snprintf(cmd, sizeof(cmd), "dmsetup resume %s", m.name);
+		if (dmbb_run_cmd(cmd) < 0)
+			dmbb_msg(DMBB_PROG ": could not resume %s; run '%s' by hand\n",
+			    m.name, cmd);
+	}
+	if (dfd != fd)
+		close(dfd);
+	close(fd);
+	if (!changed && !fails)
+		printf("  nothing to do: every extent listed is already out "
+		       "of use\n");
+	free(bad);
+	dmbb_map_free(&before);
+	dmbb_map_free(&m);
+	return fails ? 1 : 0;
+}
+
+static int dmbb_cmd_activate(const dmbb_opts_t *o)
+{
+	dmbb_map_t m;
+	int fd;
+
+	if (!dmbb_is_blockdev(o->dev))
+		dmbb_die("%s is not a block device; device-mapper needs one "
+		    "(for an image, 'losetup -f --show %s' first)", o->dev,
+		    o->dev);
+	fd = dmbb_open_dev(o->dev, 0, 0);
+	dmbb_load_or_die(fd, o->dev, &m);
+	close(fd);
+	if (o->name)
+		snprintf(m.name, sizeof(m.name), "%s", o->name);
+	if (dmbb_active(m.name))
+		dmbb_die("/dev/mapper/%s is already active", m.name);
+	if (dmbb_load("create", &m, o->dev) < 0)
+		dmbb_die("dmsetup create failed (need root?)");
+	printf("/dev/mapper/%s\n", m.name);
+	dmbb_map_free(&m);
+	return 0;
+}
+
+/*
+ * Every drive carrying a map, activated.  This is what runs at boot: a
+ * filesystem on /dev/mapper/bb-* is only there once its table has been
+ * loaded, and a ZFS pool on one will not import before that.  Drives are
+ * found by the map on them, never by name, since sdb may be sdc next boot.
+ */
+static int dmbb_cmd_activate_all(void)
+{
+	DIR *d = opendir("/sys/block");
+	struct dirent *e;
+	int fails = 0, found = 0, denied = 0;
+
+	if (!d)
+		dmbb_die("cannot read /sys/block: %s", strerror(errno));
+	while ((e = readdir(d))) {
+		char dev[300], hn[128], hu[128];
+		dmbb_map_t m;
+		int fd, copies;
+
+		if (e->d_name[0] == '.' || !strncmp(e->d_name, "dm-", 3) ||
+		    !strncmp(e->d_name, "loop", 4) || !strncmp(e->d_name, "ram", 3) ||
+		    !strncmp(e->d_name, "zram", 4))
+			continue;
+		snprintf(dev, sizeof(dev), "/dev/%s", e->d_name);
+		fd = open(dev, O_RDONLY | O_CLOEXEC);
+		if (fd < 0) {
+			if (errno == EACCES || errno == EPERM)
+				denied++;
+			continue;
+		}
+		if (dmbb_meta_load(fd, &m, &copies) < 0) {
+			close(fd);
+			continue;
+		}
+		close(fd);
+		found++;
+		if (dmbb_holder(dev, hn, sizeof(hn), hu, sizeof(hu)) > 0) {
+			printf("%s: already active as /dev/mapper/%s\n", dev, hn);
+		} else if (dmbb_active(m.name)) {
+			dmbb_msg(DMBB_PROG ": %s: /dev/mapper/%s exists but is not on "
+			    "this drive; two drives with one name?\n", dev,
+			    m.name);
+			fails++;
+		} else if (dmbb_load("create", &m, dev) < 0) {
+			dmbb_msg(DMBB_PROG ": %s: dmsetup create failed\n", dev);
+			fails++;
+		} else {
+			printf("%s: /dev/mapper/%s\n", dev, m.name);
+		}
+		dmbb_map_free(&m);
+	}
+	closedir(d);
+	/* "none" is only an answer if every drive could be asked */
+	if (denied) {
+		dmbb_msg(DMBB_PROG ": %d drive%s could not be read (need root?), so "
+		    "maps on %s were not looked for\n", denied,
+		    denied == 1 ? "" : "s", denied == 1 ? "it" : "them");
+		return 1;
+	}
+	if (!found)
+		printf("no drive carries a dm-badblocks map\n");
+	return fails ? 1 : 0;
+}
+
+static int dmbb_cmd_deactivate(const char *name)
+{
+	char cmd[160];
+
+	if (!dmbb_name_ok(name))
+		dmbb_die("bad device name '%s'", name ? name : "");
+	snprintf(cmd, sizeof(cmd), "dmsetup remove %s", name);
+	return dmbb_run_cmd(cmd) < 0 ? 1 : 0;
+}
+
+static void dmbb_usage(void)
+{
+	printf(
+"%s %s - hide a drive's bad extents behind a device-mapper device\n"
+"\n"
+"Usage:\n"
+"  %s create DEV --bad FILE --confirm DEV [options]\n"
+"  %s status DEV\n"
+"  %s activate DEV [--name NAME]\n"
+"  %s activate-all\n"
+"  %s deactivate NAME\n"
+"  %s remap DEV --bad FILE [--logical]\n"
+"  %s table DEV\n"
+"  %s map DEV OFFSET [--physical]\n"
+"\n"
+"create writes a map of DEV's bad extents to its first and last extent.\n"
+"activate turns it into /dev/mapper/NAME, a device with the damage cut out.\n"
+"remap adds damage found later, moving the affected extents to spares.\n"
+"\n"
+"Options\n"
+"  --bad FILE        bad blocks in badblocks(8) format, relative to the whole\n"
+"                    device (hddscan --badblocks-list writes this); - is stdin\n"
+"  --block-size N    unit of the numbers in FILE, default 1024\n"
+"  --extent SIZE     granularity of the map, default 1M; power of two\n"
+"  --reserve PCT     share of the drive held as spares, default 0.1\n"
+"  --name NAME       device-mapper name, default bb-<device>\n"
+"  --confirm DEV     create overwrites DEV; name it again to agree\n"
+"  --force           create over an existing map (loses the virtual device)\n"
+"  --logical         remap: FILE numbers blocks of the virtual device\n"
+"  --offline         remap: do not suspend an active device (it must not be)\n"
+"  --physical        map: OFFSET is on the drive, not the virtual device\n"
+"  -v                show the dmsetup commands run\n",
+	g_dmbb_cmd, VERSION, g_dmbb_cmd, g_dmbb_cmd, g_dmbb_cmd, g_dmbb_cmd, g_dmbb_cmd, g_dmbb_cmd, g_dmbb_cmd, g_dmbb_cmd);
+}
+
+static int dmbb_main(int argc, char **argv)
+{
+	dmbb_opts_t o;
+	const char *cmd, *pos[2] = { NULL, NULL };
+	int i, npos = 0;
+
+	memset(&o, 0, sizeof(o));
+	o.bs = 1024;
+	o.ext = DMBB_DEF_EXTENT;
+	o.reserve = DMBB_DEF_RESERVE;
+	if (argc < 2 || !strcmp(argv[1], "-h") || !strcmp(argv[1], "--help")) {
+		dmbb_usage();
+		return argc < 2 ? 2 : 0;
+	}
+	if (!strcmp(argv[1], "--version")) {
+		printf(DMBB_PROG " " VERSION "\n");
+		return 0;
+	}
+	cmd = argv[1];
+	for (i = 2; i < argc; i++) {
+		const char *a = argv[i];
+#define DMBB_NEXT() (i + 1 < argc ? argv[++i] : (dmbb_die("%s needs an argument", a), ""))
+		if (!strcmp(a, "--bad"))
+			o.bad = DMBB_NEXT();
+		else if (!strcmp(a, "--confirm"))
+			o.confirm = DMBB_NEXT();
+		else if (!strcmp(a, "--name"))
+			o.name = DMBB_NEXT();
+		else if (!strcmp(a, "--block-size")) {
+			if (dmbb_parse_size(DMBB_NEXT(), &o.bs) || !o.bs)
+				dmbb_die("bad --block-size");
+		} else if (!strcmp(a, "--extent")) {
+			if (dmbb_parse_size(DMBB_NEXT(), &o.ext))
+				dmbb_die("bad --extent");
+		} else if (!strcmp(a, "--reserve")) {
+			char *end;
+			const char *s = DMBB_NEXT();
+
+			o.reserve = strtod(s, &end);
+			if (end == s || (*end && strcmp(end, "%")))
+				dmbb_die("bad --reserve");
+		} else if (!strcmp(a, "--force"))
+			o.force = 1;
+		else if (!strcmp(a, "--logical"))
+			o.logical = 1;
+		else if (!strcmp(a, "--offline"))
+			o.offline = 1;
+		else if (!strcmp(a, "--physical"))
+			o.physical = 1;
+		else if (!strcmp(a, "-v"))
+			g_dmbb_verbose = 1;
+		else if (a[0] == '-' && a[1])
+			dmbb_die("unknown option %s", a);
+		else if (npos < 2)
+			pos[npos++] = a;
+		else
+			dmbb_die("unexpected argument %s", a);
+#undef DMBB_NEXT
+	}
+	if (o.name && !dmbb_name_ok(o.name))
+		dmbb_die("--name may only use letters, digits, '-', '_' and '.'");
+	if (!strcmp(cmd, "deactivate"))
+		return dmbb_cmd_deactivate(pos[0]);
+	if (!strcmp(cmd, "activate-all"))
+		return dmbb_cmd_activate_all();
+	o.dev = pos[0];
+	if (!o.dev)
+		dmbb_die("%s needs a device", cmd);
+	if (!strcmp(cmd, "create"))
+		return dmbb_cmd_create(&o);
+	if (!strcmp(cmd, "status"))
+		return dmbb_cmd_status(&o);
+	if (!strcmp(cmd, "table"))
+		return dmbb_cmd_table(&o);
+	if (!strcmp(cmd, "map"))
+		return dmbb_cmd_map(&o, pos[1]);
+	if (!strcmp(cmd, "remap"))
+		return dmbb_cmd_remap(&o);
+	if (!strcmp(cmd, "activate"))
+		return dmbb_cmd_activate(&o);
+	dmbb_die("unknown command '%s' (see --help)", cmd);
+	return 2;
+}
+
+/* ------------------------------------------------------------------ *
+ * --hide-bad: a scan's damage, handed to the map above
+ *
+ * What the map is fed has to be the whole truth, so it only ever comes from a
+ * scan that covered the whole drive and finished.  A list from a sampled or
+ * interrupted scan hides the damage that happened to be looked at and leaves
+ * the rest in the middle of the new device, which is worse than no list:
+ * it looks like a fix.  The drive is matched by serial where it has one,
+ * because sdb today may be sdc after a reboot.
+ * ------------------------------------------------------------------ */
+
+/* did this checkpoint's scan cover every byte of a drive of this size? */
+static int ckpt_whole(const char *path, uint64_t size)
+{
+	FILE *f = fopen(path, "re");
+	char line[256];
+	uint64_t sz = 0, start = 1, end = 0, bytes = 0, v;
+
+	if (!f)
+		return 0;
+	while (fgets(line, sizeof(line), f)) {
+		if (sscanf(line, "size %" SCNu64, &v) == 1)
+			sz = v;
+		else if (sscanf(line, "start %" SCNu64, &v) == 1)
+			start = v;
+		else if (sscanf(line, "end %" SCNu64, &v) == 1)
+			end = v;
+		else if (sscanf(line, "bytes %" SCNu64, &v) == 1)
+			bytes = v;
+		else if (!strncmp(line, "finding ", 8))
+			break;
+	}
+	fclose(f);
+	return sz == size && start == 0 && end == size && bytes >= size;
+}
+
+/* the checkpoint of the newest finished whole-drive scan of d, if any */
+static int last_whole_scan(const device_t *d, char *ckpt, size_t len,
+			   char *runid, size_t rlen)
+{
+	run_t *v;
+	int n = store_list(&v), i, k, found = 0;
+
+	for (i = 0; i < n && !found; i++) {
+		jrec_t *j;
+		int nj;
+
+		if (v[i].live)
+			continue;
+		nj = store_jobs(&v[i], &j);
+		for (k = 0; k < nj && !found; k++) {
+			int same = d->serial[0] ?
+				   !strcmp(j[k].serial, d->serial) :
+				   !strcmp(j[k].path, d->path);
+
+			if (!same || j[k].state != JS_DONE)
+				continue;
+			if (snprintf(ckpt, len, "%s/%s.ckpt", v[i].dir,
+				     j[k].slug) >= (int)len)
+				continue;
+			if (!ckpt_whole(ckpt, d->size))
+				continue;
+			snprintf(runid, rlen, "%s", v[i].id);
+			found = 1;
+		}
+		free(j);
+	}
+	free(v);
+	return found;
+}
+
+static int hide_bad(device_t *t, int n, const opts_t *o)
+{
+	int i, worst = 0;
+
+	for (i = 0; i < n; i++) {
+		device_t *d = &t[i];
+		char ckpt[STORE_MAX + 128], list[STORE_MAX + 128];
+		char runid[48], slug[56], name[DMBB_NAME_MAX_LEN + 1];
+		dmbb_opts_t dop;
+		int ok = o->tui || (o->confirm &&
+			 (!strcmp(o->confirm, d->name) ||
+			  (d->serial[0] && !strcmp(o->confirm, d->serial))));
+
+		safety_check(d);
+		if (d->unsafe && !o->force)
+			die("%s: %s\n       refusing to put a device over a "
+			    "drive that is in use", d->name, d->unsafe_why);
+		if (!ok)
+			die("%s: hiding its bad blocks overwrites the start "
+			    "and end of the drive and makes whatever is on it "
+			    "unreachable; needs --confirm %s (or --confirm "
+			    "<serial>)", d->path, d->name);
+		if (!last_whole_scan(d, ckpt, sizeof(ckpt), runid,
+				     sizeof(runid))) {
+			msg(PROG ": %s: no finished scan of the whole drive on "
+			    "record, so there is no list of its damage to "
+			    "trust.  Scan it first (a sampled or interrupted "
+			    "scan does not count)\n", d->name);
+			worst = 2;
+			continue;
+		}
+		snprintf(list, sizeof(list), "%.*s.dmbb",
+			 (int)(strlen(ckpt) - 5), ckpt);
+		if (badblocks_replay(ckpt, list, 4096, 0))
+			return 2;
+		report_slug(d->serial[0] ? d->serial : d->name, slug,
+			    sizeof(slug));
+		snprintf(name, sizeof(name), "bb-%s", slug);
+		if (!dmbb_name_ok(name))
+			snprintf(name, sizeof(name), "bb-%s", d->name);
+
+		memset(&dop, 0, sizeof(dop));
+		dop.dev = d->path;
+		dop.bad = list;
+		dop.bs = 4096;
+		dop.ext = DMBB_DEF_EXTENT;
+		dop.reserve = DMBB_DEF_RESERVE;
+		dop.name = name;
+		dop.confirm = d->path;
+
+		out("\n  %s: hiding the damage found by run %s\n", d->name,
+		    runid);
+		if (o->dry_run) {
+			out("  dry run: would write a map of it to %s and "
+			    "activate /dev/mapper/%s\n", d->path, name);
+			continue;
+		}
+		/* create refuses a drive that already carries a map */
+		if (dmbb_cmd_create(&dop) != 0) {
+			worst = 2;
+			continue;
+		}
+		if (d->is_file) {
+			out("  %s is an image: the map is written, and "
+			    "activating it needs a loop device\n", d->path);
+			continue;
+		}
+		if (dmbb_cmd_activate(&dop) != 0) {
+			worst = 2;
+			continue;
+		}
+		out("\n  /dev/mapper/%s is %s with its damage cut out.  Put the "
+		    "filesystem on that,\n  never on %s itself.  Damage found "
+		    "later: '%s dm remap %s --bad LIST'\n", name, d->path,
+		    d->path, PROG, d->path);
+	}
+	return worst;
 }
 
 /*
@@ -10919,6 +12732,23 @@ int main(int argc, char **argv)
 	const char *logpath = NULL;
 	struct sigaction sa;
 
+	/*
+	 * The device-mapper maps have a command line of their own, reached as
+	 * 'hddscan dm ...' or through a link named dm-badblocks, which is what
+	 * the boot unit and anyone used to the old separate tool call.
+	 */
+	{
+		const char *b0 = strrchr(argv[0], '/');
+
+		b0 = b0 ? b0 + 1 : argv[0];
+		if (!strcmp(b0, "dm-badblocks")) {
+			g_dmbb_cmd = "dm-badblocks";
+			return dmbb_main(argc, argv);
+		}
+		if (argc > 1 && !strcmp(argv[1], "dm"))
+			return dmbb_main(argc - 1, argv + 1);
+	}
+
 	memset(&o, 0, sizeof(o));
 	o.mode = MODE_READ;
 	o.chunk = DEF_CHUNK;
@@ -11143,6 +12973,8 @@ int main(int argc, char **argv)
 			}
 		} else if (!strcmp(a, "--apply-settings")) {
 			o.apply_only = 1;
+		} else if (!strcmp(a, "--hide-bad")) {
+			o.hide_bad = 1;
 		} else if (!strcmp(a, "--fix-config") ||
 			   !strcmp(a, "--no-fix-config")) {
 			o.fix_config = !strcmp(a, "--fix-config");
@@ -11562,7 +13394,7 @@ tui_again:
 		 * done with it.
 		 */
 		tui_clear();
-		if (o.apply_only)
+		if (o.apply_only || o.hide_bad)
 			tui_cooked();
 		else if (!o.format)
 			g_quiet = 1;
@@ -11629,6 +13461,8 @@ tui_again:
 	 * exits (invariant 7b).  --apply-settings has no run at all, so it
 	 * does the work here and now.
 	 */
+	if (o.hide_bad)
+		return hide_bad(targets, ntargets, &o);
 	if (o.apply_only) {
 		if (!settings_wanted(&o))
 			die("--apply-settings without any setting to apply. "
@@ -11828,8 +13662,26 @@ tui_again:
 		apply_settings(targets, ntargets, &o);
 		for (i = 0; i < ntargets && !g_stop; i++) {
 			char jb[PATH_MAX], cb[PATH_MAX], bb[PATH_MAX], pb[PATH_MAX];
+			char ck[STORE_MAX + 128];
+			opts_t wo = o;
 			int st;
 
+			/*
+			 * A checkpoint in the run, as a parallel run keeps
+			 * for every drive.  Without one a single-drive scan
+			 * left no list of what it found once the terminal was
+			 * gone, so neither --badblocks-from nor --hide-bad
+			 * had anything to work from after the commonest kind
+			 * of scan there is.
+			 */
+			if (have_run && !o.state) {
+				char slug[96];
+
+				report_slug(targets[i].name, slug, sizeof(slug));
+				if (snprintf(ck, sizeof(ck), "%s/%s.ckpt", r.dir,
+					     slug) < (int)sizeof(ck))
+					wo.state = ck;
+			}
 			if (have_run) {
 				if (jrec_get(jobs[i].file, &g_job) < 0)
 					memset(&g_job, 0, sizeof(g_job));
@@ -11848,7 +13700,7 @@ tui_again:
 				g_job_own = 1;
 				job_flush(JS_RUNNING);
 			}
-			st = scan_device(&targets[i], &o,
+			st = scan_device(&targets[i], &wo,
 					     derive_path(o.json, targets[i].name,
 							 ntargets > 1, jb, sizeof(jb)),
 					     derive_path(o.csv, targets[i].name,

@@ -62,6 +62,25 @@ into service and a read-only pass cannot tell you whether a sector will *accept*
 a write. So a bare `hddscan /dev/sdb` stops and asks for `--confirm` rather than
 doing anything — an error, never data loss.
 
+## Using a damaged drive anyway
+
+A drive with a few hundred bad sectors can still be a good backup target, as
+long as nothing is stored on them. ext4 can take a list of them at `mkfs` time,
+and the report prints the commands. For any other filesystem (ZFS, btrfs,
+XFS), hddscan can cut the damage out one layer down instead:
+
+```sh
+sudo hddscan --profile inservice /dev/sdc            # a whole-drive scan
+sudo hddscan --hide-bad --confirm sdc /dev/sdc       # -> /dev/mapper/bb-<serial>
+sudo zpool create -o ashift=12 -O compression=zstd backup /dev/mapper/bb-<serial>
+```
+
+`--hide-bad` writes a map of the damage the last complete scan found onto the
+drive itself, and loads it with device-mapper: no kernel module. Damage found
+later is moved to spares held back for it (`hddscan dm remap`), and
+`contrib/dm-badblocks.service` sets the devices up again at boot. The form
+offers it as **Mode → hide bad**. See `DESIGN.md` for how the map works.
+
 ## Runs keep going without you
 
 A scan or a format is a **run**, and it belongs to a supervisor process of its

@@ -513,7 +513,8 @@ def main():
         for mode, presses, word, warn in (
                 ("write", 3, "write", "writes to the drive"),
                 ("repair", 4, "repair", "overwrites everything"),
-                ("format", 5, "format", "ERASES the drive completely")):
+                ("format", 5, "format", "ERASES the drive completely"),
+                ("hide bad", 7, "hide bad", "hides the last scan's damage")):
             s = Session(["-i", "--no-color", "--dry-run", "--outdir", tmp, a])
             s.set_choice("Mode", word)
             shown = s.value_of("Mode")

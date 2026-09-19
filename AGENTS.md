@@ -173,12 +173,17 @@ comparable with another report, which is why every report names its profile.
 
 ## The test suite
 
-`make test` runs both halves. Everything runs against regular files used as
+`make test` runs all three. Everything runs against regular files used as
 images: no root, no spinning disk, and nothing in it can reach `/dev/sd*`.
 
 - `tests/cli.sh` — scan correctness, coverage honesty, exit codes, argument
   validation, output formats, checkpoint/resume, the run store, and the
   printed advice.
+- `tests/dm.sh` — the device-mapper maps (`hddscan dm`): the table's own
+  invariants, the map surviving damage to one copy, and data written through
+  one table reading back through the next after remaps. The kernel's half is
+  stood in for by `dd` applying each table line, the same arithmetic dm-linear
+  does.
 - `tests/tui.py` — the form, the dashboard and the list of runs, driven
   through a pty.
 
@@ -352,7 +357,7 @@ only — say so rather than implying otherwise.
 - Test artifacts (`*.bin`, `hddscan-*.txt`, `*.md5`, state files) must be
   cleaned up; the repo tracks only `hddscan.c`, `Makefile`, `hddscan.8`,
   `LICENSE`, `README.md`, `DESIGN.md`, `tests/`, `docs/` (the README's
-  screenshots) and this file.
+  screenshots), `contrib/` (the boot unit for the maps) and this file.
 - `hddscan.8` and `usage()` document the same options and must not drift.
   `make mancheck` diffs the two option lists and prints nothing when they
   agree; run it after adding or renaming any flag.
@@ -405,6 +410,39 @@ Two more things that follow from the store, both easy to get wrong:
   buffer, and `-Wformat-truncation` (part of `-Wformat=2`, which must stay
   silent) will say so. Refuse a path that does not fit rather than truncating
   one into a path that points somewhere else.
+
+**15. A device-mapper map puts data in the wrong place if it is wrong, so it
+is never guessed at.** `hddscan dm` (also installed as the `dm-badblocks`
+link, and what `--hide-bad` calls in-process) keeps a map of a drive's bad
+extents on the drive and loads it as a dm-linear table. It was a separate
+project once; it lives here so a rescue system needs one binary and so the map
+has one implementation. Its code is prefixed `dmbb_` and keeps its own `die()`
+and `msg()`. Five rules:
+
+- **The skip list never changes after `create`.** It defines the layout:
+  logical extent L is the Lth physical extent that is not metadata, a spare
+  slot or skipped. Adding to it later would move every byte after the new
+  entry. Damage found later is a remap, always.
+- **The map is written A, sync, B, sync, and read as the newest copy that
+  checks out.** Neither copy is written while the other is the only good one.
+  Both bad means "no map", never a best guess. Damage in either copy's extent
+  refuses `create`.
+- **A live remap is suspend, copy, verify, write map, reload, resume.** If the
+  reload fails the previous map is written back as a newer generation, or the
+  next activation would read copies that stopped receiving writes the moment
+  the old table resumed.
+- **Whether a device is live is asked of sysfs, not `dmsetup`,** which needs
+  root to answer at all. A wrong "not live" would copy extents out from under
+  a mounted filesystem. `activate-all` likewise says it could not read a drive
+  rather than reporting that no drive has a map.
+- **`--hide-bad` only takes its list from a finished whole-drive scan,**
+  judged by the checkpoint's own start, end and byte count. A sampled or
+  interrupted scan's list hides only what it looked at, and still looks like
+  a fix. Every scan, single-drive ones included, keeps a checkpoint in its run
+  directory for this reason.
+
+The kernel side (`activate`, a live `remap`, the boot unit) needs root and
+has not been run. Say so rather than implying otherwise.
 
 **11. `--format` is not a scan mode and must not become one.** FORMAT UNIT
 erases the drive, runs for hours and cannot be undone, so it dispatches before

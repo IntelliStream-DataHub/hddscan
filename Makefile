@@ -26,6 +26,7 @@ static: $(SRC)
 install: $(BIN)
 	install -d $(DESTDIR)$(PREFIX)/sbin
 	install -m 0755 $(BIN) $(DESTDIR)$(PREFIX)/sbin/$(BIN)
+	ln -sf $(BIN) $(DESTDIR)$(PREFIX)/sbin/dm-badblocks
 	install -d $(DESTDIR)$(MANDIR)
 	install -m 0644 $(MAN) $(DESTDIR)$(MANDIR)/$(MAN)
 
@@ -42,6 +43,7 @@ mancheck: $(BIN)
 # nothing it does can reach /dev/sd*.
 test: $(BIN)
 	@tests/cli.sh
+	@bash tests/dm.sh
 	@python3 tests/tui.py
 
 clean:

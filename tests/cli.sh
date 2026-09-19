@@ -170,6 +170,50 @@ assert_has "the report gives a mkfs line for it" "$out" "mkfs.ext4 -b 4096"
 assert_has "the report warns the drive off arrays and pools" "$out" \
 	"mdraid array or a"
 
+echo "== hiding the damage behind device-mapper =="
+
+# The map is written for real -- it is this binary's own code -- and read back
+# with 'hddscan dm'.  Only activation needs device-mapper, and an image stops
+# short of it and says so.
+hide() { $HDDSCAN --no-color --outdir "$TMP" "$@" 2>&1; }
+
+f=$(patterned 16 hide.bin)
+printf 'BADBADBAD' | dd of="$f" bs=1 seek=8388608 conv=notrunc status=none
+assert_has "--hide-bad needs --confirm like a write" \
+	"$(hide --hide-bad "$f")" "needs --confirm"
+out=$(hide --hide-bad --dry-run --confirm "$f" "$f")
+assert_has "--dry-run says what it would do" "$out" "would write a map"
+assert_has "and writes nothing" "$($HDDSCAN dm status "$f" 2>&1)" \
+	"no dm-badblocks map"
+# the write pass that patterned it saw a clean drive, and that is the
+# newest whole scan until the check below
+run --mode check "$f" >/dev/null
+out=$(hide --hide-bad --confirm "$f" "$f"); rc=$?
+assert_eq  "--hide-bad writes the map and exits 0" "$rc" "0"
+st=$($HDDSCAN dm status "$f" 2>&1)
+assert_has "the map skips exactly the extent the scan found bad" "$st" \
+	"1 extent bad when the map was made"
+assert_has "and is named for the drive" "$st" "bb-hide.bin"
+assert_has "the extent it skips is the damaged one" \
+	"$($HDDSCAN dm map "$f" 8388608 --physical)" "not part of the virtual device"
+assert_has "an image stops short of activating, and says why" "$out" \
+	"needs a loop device"
+assert_has "running it twice will not replace the map" \
+	"$(hide --hide-bad --confirm "$f" "$f")" "already carries"
+
+f=$(image 16 hide2.bin)
+run --sample 64 "$f" >/dev/null
+out=$(hide --hide-bad --confirm "$f" "$f"); rc=$?
+assert_has "a drive whose only scan was sampled is refused" "$out" \
+	"no finished scan of the whole drive"
+assert_has "and no map is written" "$($HDDSCAN dm status "$f" 2>&1)" \
+	"no dm-badblocks map"
+assert_eq  "and it exits 2" "$rc" "2"
+f=$(patterned 16 hide4.bin)
+printf 'BAD' | dd of="$f" bs=1 seek=4096 conv=notrunc status=none
+assert_has "the report offers it for filesystems without a bad-block list" \
+	"$(run --mode check "$f")" "--hide-bad --confirm"
+
 # REGRESSION: the pattern was seeded at each chunk's start, so what was on
 # the platter depended on the chunk size it was written with.  Predeploy
 # moving to 1M chunks while decay stayed at 128K would have made every decay

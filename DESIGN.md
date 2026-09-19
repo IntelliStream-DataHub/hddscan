@@ -747,6 +747,55 @@ on it. Reformatting without protection (`sg_format --fmtpinfo=0`) does the same
 job and the same damage. Neither belongs anywhere near a drive whose contents
 you still want.
 
+### Hiding the damage from the filesystem
+
+ext2/3/4 can keep a filesystem off listed blocks (`mkfs -l`), and nothing else
+can. `hddscan dm` does it one layer down instead, for every filesystem. It
+keeps a map of the drive's bad extents on the drive itself and loads it as a
+device-mapper `dm-linear` table, so the filesystem sees a slightly smaller
+device with none of the known damage in it. There is no kernel module:
+device-mapper already does the remapping, and this only decides what the table
+says. `--hide-bad` is the one-step version. It takes the damage from the
+newest finished whole-drive scan of that drive, matched by serial because
+`sdc` may be `sdd` after a reboot, then writes the map and activates
+`/dev/mapper/bb-<serial>`.
+
+The drive is divided into extents, 1 MiB by default:
+
+| extent | holds |
+|---|---|
+| 0 | the map, copy A |
+| N-1 | the map, copy B |
+| every Kth | a spare, held back for damage found later (`--reserve 0.1` = one per 1000) |
+| bad when the map was made | skipped: the device steps over them |
+| everything else | the device, in platter order |
+
+Damage known at `create` is **skipped**, which keeps the device in platter
+order. Damage found later can't be skipped, because that would move every byte
+after it. It is **remapped** instead: what can still be read is copied to the
+nearest free spare, and the table points there. Spares are spread through the
+drive rather than kept at the end, so a remapped extent costs a short seek,
+not a full stroke. On a live device `remap` suspends it first, so nothing is
+written to an extent between copying it and switching the table.
+
+Each copy of the map has a generation number and a checksum. An update writes
+one copy, syncs it, then writes the other, and a read takes the newest copy
+that checks out, so an interrupted update always leaves one whole. Losing both
+would lose everything on the device, since without the map every byte is in
+the wrong place. That is why damage in either copy's extent refuses `create`.
+
+**ZFS on top.** On such a drive ZFS belongs on the mapped device, never on the
+raw drive, which it would fault out on the first read error. On the mapped
+device the pool never sees the known damage, and its checksums catch what
+appears later, which ext4 cannot do. On a single disk it can only *repair* a
+block that has a second copy, so give `copies=2` to the datasets that matter.
+On distributions where ZFS is an out-of-tree module, btrfs gives you
+compression and checksums from the stock kernel.
+
+`contrib/dm-badblocks.service` runs `hddscan dm activate-all` at boot, before
+local filesystems and ZFS imports. It finds the drives by the map on them,
+not by name.
+
 ### Useful flags
 
 ```sh
@@ -1105,6 +1154,12 @@ sudo dmsetup remove badsect && sudo losetup -d "$LOOP"
 ## Licence
 
 MIT. See [LICENSE](LICENSE). Copyright (c) 2026 Olav Gjerde.
+
+**The device-mapper side of `hddscan dm` has not been run.** Activating a map,
+remapping on a live device (suspend, reload, resume, and putting the old map
+back when a reload fails), and the boot unit all need root. The suite proves
+the table arithmetic and that data survives a remap by applying each table
+with `dd`, not the kernel.
 
 ## What was verified during development
 
