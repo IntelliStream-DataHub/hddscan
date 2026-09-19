@@ -71,7 +71,7 @@ what *every* block never written since a PI format looks like. They are
 counted separately as `align_errors` and `prot_errors` and must never
 contribute to `blocks_bad` or the verdict. Misreporting either condemns
 healthy hardware, which is exactly what happened both times before it was
-fixed — `EILSEQ` was found doing it to `sdb`, a drive whose platters are
+fixed — `EILSEQ` was found doing it to a PI-formatted drive whose platters are
 fine.
 
 The corollary is invariant 9's: blocks skipped this way were **not tested**,
@@ -315,34 +315,48 @@ The `EIO` path cannot be tested this way. It needs root and a `dm-error`
 target; the recipe is in `DESIGN.md`. That path remains verified by inspection
 only — say so rather than implying otherwise.
 
+## CI and releases
+
+`.github/workflows/ci.yml` runs on every push and pull request, on x86_64 and
+aarch64: the build with `-Werror`, `make test`, `mancheck`, `sitecheck`, then
+the static build and the CLI and dm suites again against it. A warning another
+compiler version finds is a failure, the same as on a developer's machine.
+
+`.github/workflows/release.yml` runs on a tag `v<VERSION>` and refuses a tag
+that does not match `VERSION` in `hddscan.c`. Each architecture builds on its
+own runner with `make dist`, unpacks the tarball and runs all three suites
+against the binary inside, the one that ships rather than a sibling, then
+the tarballs go to a **draft** release. Publishing is a person's decision.
+`make dist` is the whole recipe, so a release can be reproduced by hand.
+Releases are static glibc, which is proven by those suites. musl would be
+tidier and has never been tried; do not switch to it without the suites
+behind it.
+
 ## Environment notes
 
-- This machine now has two real SAS HDDs, both unmounted and free to test on:
-  `sdb` (Seagate ST14000NM0168, 12.5 TB, 512e) and `sdc` (HGST
-  HUH721010AL4200, 9.1 TB, **4Kn** — logical block size 4096, which is where
-  the alignment arithmetic behind invariant 3 actually gets exercised).
-  `sda` is the SAS SSD the system runs from: it holds `/`, `/boot` and
-  `/boot/efi`, so it is never a test target.
-- Both HDDs being SAS means the SAS-specific paths are reachable for the first
-  time — the error counter log, the mode pages, `sg_reassign`, and the
-  `sdparm` look-ahead backend. `sdparm` and `sg3_utils` are now installed.
-- **`sdb` is formatted with T10 type 2 protection information** and almost
-  nothing has been written to it since (`Power on minutes since format = 3375`
-  in its SMART data). Every block past roughly 300 MiB refuses to be read at
-  all: `Sense Key: Aborted Command / Logical block guard check failed`, which
-  reaches us as `EILSEQ`. This is not a fault, it is what a freshly
-  PI-formatted drive does, and it makes `sdb` the one place the `prot_errors`
-  path of invariant 3 can be exercised for real. Do not read a FAILING verdict
-  from it as a dying drive without checking `prot_errors` first.
-  `sdc` has `protection_type` 0 and is the clean control.
+- Some paths only real hardware reaches, and each needs a particular kind of
+  drive. A **SAS** drive reaches the error counter log, the mode pages,
+  `sg_reassign` and the `sdparm` look-ahead backend (`sdparm` and `sg3_utils`
+  installed). A **4Kn** drive, with a logical block size of 4096, is where the
+  alignment arithmetic behind invariant 3 is actually exercised. A drive
+  **formatted with T10 protection information and barely written since** is
+  the one place the `prot_errors` path of invariant 3 runs for real: every
+  block not written since the format refuses to be read, with `Sense Key:
+  Aborted Command / Logical block guard check failed`, which reaches us as
+  `EILSEQ`. That is not a fault, it is what a freshly PI-formatted drive does,
+  so never read a FAILING verdict from such a drive as a dying one without
+  checking `prot_errors` first. A drive with `protection_type` 0 is the clean
+  control beside it.
+- Never test on the drive the system runs from. The safety checks refuse a
+  mounted drive, but check which disk holds `/` before handing out a command.
 - Protection type is readable without root or sg3_utils, from
   `/sys/block/<dev>/device/scsi_disk/*/protection_type`. The `integrity/`
-  directory under `/sys/block/<dev>/` is **not** the same thing — it describes
-  host-side DIX, and reads `format: none` on `sdb` despite its type 2 format.
-- There is no passwordless sudo, so **nothing that needs root can be run from
-  an agent session**: reading `/dev/sdb` or `/dev/sdc` at all needs it, since
-  the user is not in the `disk` group. Hardware runs have to be handed to the
-  user to execute. Image files remain the way to test everything else.
+  directory under `/sys/block/<dev>/` is **not** the same thing: it describes
+  host-side DIX, and reads `format: none` on a type 2 drive.
+- Reading a block device needs root or the `disk` group, which an agent
+  session normally has neither of. Hardware runs are handed to the person at
+  the machine to execute, with the exact command; image files remain the way
+  to test everything else.
 - Untested for lack of hardware, and honestly labelled as such in `DESIGN.md`:
   the `EIO` path, the drive look-ahead success path, SMR gating, every
   SAS-specific code path (error counter log, mode pages, `sg_reassign`), and
