@@ -74,6 +74,10 @@
 #define RATE_WINDOW_S 600   /* the trailing window a slow stretch is judged over */
 #define RATE_STEP_S 10      /* how often that window moves */
 #define RATE_STEPS (RATE_WINDOW_S / RATE_STEP_S + 1)
+#define DRATE_WINDOW_S 30   /* the trailing window RATE and ETA are shown over */
+#define DRATE_STEP_S 2      /* how often that window moves */
+#define DRATE_STEPS (DRATE_WINDOW_S / DRATE_STEP_S + 1)
+#define STATE_VERSION 2     /* --state file layout; see state_load() */
 #define MAX_RETRIES 1000
 #define N_BANDS 512
 #define MAX_FINDINGS 200000
@@ -167,6 +171,28 @@ static const char *c_grn(void)   { return g_color ? "\033[32m" : ""; }
 static const char *c_yel(void)   { return g_color ? "\033[33m" : ""; }
 static const char *c_bold(void)  { return g_color ? "\033[1m"  : ""; }
 static const char *c_off(void)   { return g_color ? "\033[0m"  : ""; }
+static const char *c_dim(void)   { return g_color ? "\033[2m"  : ""; }
+/*
+ * Back to plain text without clearing the background: inside a striped row
+ * a full reset would take the stripe with it, so intensity and foreground
+ * are put back by themselves.
+ */
+static const char *c_plain(void) { return g_color ? "\033[22;39m" : ""; }
+
+/*
+ * Alternate rows sit on a background a shade off the terminal's own, which
+ * is what tells one drive from the next without spending a line on a rule.
+ * A shade that reads as grey on black is a smear on white, so which way to
+ * go is asked of the terminal once -- see probe_background().
+ */
+static int g_term_light;
+
+static const char *c_stripe(int on)
+{
+	if (!g_color || !on)
+		return "";
+	return g_term_light ? "\033[48;5;254m" : "\033[48;5;236m";
+}
 
 static uint64_t now_us(void)
 {
@@ -400,7 +426,7 @@ typedef struct {
 	unsigned long long pidstart;
 	long long started, updated, ended;
 	double pct, rate, eta;
-	uint64_t bad, weak, slow, bytes;
+	uint64_t bad, weak, bytes;
 	int too_slow;           /* under the throughput floor, see rate_judge() */
 	double lat_med, lat_avg, lat_min, lat_max;
 	double wlat_med;        /* 0 when nothing has been written */
@@ -601,8 +627,8 @@ static void jrec_put(const jrec_t *j)
 	fprintf(f, "started %lld\nupdated %lld\nended %lld\n",
 		j->started, j->updated, j->ended);
 	fprintf(f, "pct %.3f\nrate %.0f\neta %.1f\n", j->pct, j->rate, j->eta);
-	fprintf(f, "bad %" PRIu64 "\nweak %" PRIu64 "\nslow %" PRIu64
-		"\nbytes %" PRIu64 "\n", j->bad, j->weak, j->slow, j->bytes);
+	fprintf(f, "bad %" PRIu64 "\nweak %" PRIu64 "\nbytes %" PRIu64 "\n",
+		j->bad, j->weak, j->bytes);
 	fprintf(f, "lat %.2f %.2f %.2f %.2f\n", j->lat_med, j->lat_avg,
 		j->lat_min, j->lat_max);
 	if (j->too_slow)
@@ -687,8 +713,6 @@ static int jrec_get(const char *path, jrec_t *j)
 			j->bad = strtoull(v, NULL, 10);
 		else if (!strcmp(k, "weak"))
 			j->weak = strtoull(v, NULL, 10);
-		else if (!strcmp(k, "slow"))
-			j->slow = strtoull(v, NULL, 10);
 		else if (!strcmp(k, "bytes"))
 			j->bytes = strtoull(v, NULL, 10);
 		else if (!strcmp(k, "lat"))
@@ -2477,9 +2501,16 @@ static int mode_writes(scan_mode_t m)
 
 typedef enum {
 	ST_OK = 0,
-	ST_RECOVERED,    /* slow once, clean on every retry */
-	ST_SLOW,         /* consistently over budget */
-	ST_UNSTABLE,     /* intermittent slow or intermittent error */
+	/*
+	 * One bucket for every sector the drive did not simply hand over:
+	 * over its latency budget, or readable only after a retry.  These
+	 * were once three states -- recovered, slow, unstable -- but the
+	 * distinction was reported as two columns nobody could act on
+	 * differently, and the verdict never split on it either.  What
+	 * separates them is still on each finding: 'errs' is how many
+	 * attempts failed outright, 'tries' how many it took.
+	 */
+	ST_WEAK,
 	ST_BAD,          /* unreadable on every attempt */
 	ST_CORRUPT       /* data came back but did not match what we wrote */
 } status_t;
@@ -2488,13 +2519,25 @@ static const char *status_name(status_t s)
 {
 	switch (s) {
 	case ST_OK: return "ok";
-	case ST_RECOVERED: return "recovered";
-	case ST_SLOW: return "slow";
-	case ST_UNSTABLE: return "unstable";
+	case ST_WEAK: return "weak";
 	case ST_BAD: return "bad";
 	case ST_CORRUPT: return "corrupt";
 	}
 	return "?";
+}
+
+static status_t status_of_name(const char *s)
+{
+	/* recovered, slow and unstable are what weak used to be called, and
+	 * a --csv written back then still says so */
+	if (!strcmp(s, "weak") || !strcmp(s, "recovered") ||
+	    !strcmp(s, "slow") || !strcmp(s, "unstable"))
+		return ST_WEAK;
+	if (!strcmp(s, "bad"))
+		return ST_BAD;
+	if (!strcmp(s, "corrupt"))
+		return ST_CORRUPT;
+	return ST_OK;
 }
 
 typedef struct {
@@ -2606,6 +2649,9 @@ typedef struct {
 	int no_direct;
 	int map_width;
 	const char *state_path;
+	/* where this run's badblocks list went, if it was asked for one */
+	const char *bb_path;
+	uint64_t bb_bs, bb_off;
 	int resume;
 
 	/* running state */
@@ -2633,10 +2679,8 @@ typedef struct {
 	uint64_t prot_fixed;    /* chunks a write pass gave a valid guard tag */
 	uint64_t prot_fixed_bytes;
 	uint64_t prot_run;      /* consecutive refusals, to spot a whole-device one */
-	uint64_t blocks_slow;
+	uint64_t blocks_weak;
 	uint64_t blocks_bad;
-	uint64_t blocks_recovered;
-	uint64_t blocks_unstable;
 	uint64_t blocks_corrupt;
 	uint64_t blocks_fixed;          /* read fast again after we rewrote them */
 	/*
@@ -2706,6 +2750,12 @@ typedef struct {
 	uint64_t slow_secs;     /* scan time the trailing window spent under it */
 	double slow_worst;      /* bytes/s at its worst */
 	uint64_t slow_worst_pos;
+
+	/* a much shorter one: what RATE and ETA are shown over, see drate() */
+	struct {
+		uint64_t t_us, bytes;
+	} dr[DRATE_STEPS];
+	int dr_head, dr_n;
 
 	/*
 	 * A rolling window of recent chunk latencies.  The cumulative figures
@@ -3679,19 +3729,18 @@ static void analyze_block(ctx_t *c, uint64_t off, size_t len, void *buf,
 		sorted_med = lat[n_lat / 2];
 	}
 
+	/*
+	 * Getting here at all means the block missed its budget or failed to
+	 * read -- drill_chunk() skips the ones that came back in time.  So the
+	 * only question left is whether anything came back at all.
+	 */
 	if (errors == attempts) {
 		st = ST_BAD;
 		if (c->drill_written)
 			c->blocks_unrepaired++;
+	} else {
+		st = ST_WEAK;
 	}
-	else if (errors > 0)
-		st = ST_UNSTABLE;
-	else if (n_lat && lat[0] > block_thr_at(c, off))
-		st = ST_SLOW;
-	else if (n_lat && lat[n_lat - 1] > block_thr_at(c, off))
-		st = ST_UNSTABLE;
-	else
-		st = ST_RECOVERED;
 
 	f = find_add(c);
 	if (f) {
@@ -3719,7 +3768,7 @@ static void analyze_block(ctx_t *c, uint64_t off, size_t len, void *buf,
 		const void *src = NULL;
 
 		if (readable_copy && c->rewrite_weak &&
-		    (st == ST_SLOW || st == ST_UNSTABLE || st == ST_RECOVERED)) {
+		    st == ST_WEAK) {
 			do_rewrite = 1;
 			src = keep;
 		} else if (!readable_copy && c->force_remap && st == ST_BAD) {
@@ -3785,12 +3834,15 @@ static void analyze_block(ctx_t *c, uint64_t off, size_t len, void *buf,
 
 	switch (st) {
 	case ST_BAD: c->blocks_bad++; break;
-	case ST_UNSTABLE: c->blocks_unstable++; break;
-	case ST_SLOW: c->blocks_slow++; break;
-	case ST_RECOVERED: c->blocks_recovered++; break;
+	case ST_WEAK: c->blocks_weak++; break;
 	default: break;
 	}
-	if (st == ST_BAD || st == ST_UNSTABLE)
+	/*
+	 * The map still splits on whether the drive ever refused the block,
+	 * which is what 'X' means on it -- a sector that only ever read slowly
+	 * is a different mark from one that would not read at all.
+	 */
+	if (errors > 0)
 		c->bands[band_of(c, off)].bad_blocks++;
 	else
 		c->bands[band_of(c, off)].slow_blocks++;
@@ -4135,11 +4187,70 @@ static void rate_window(ctx_t *c)
 	}
 }
 
+/*
+ * RATE is what the drive is doing now, not what it averaged since Tuesday.
+ * On a scan measured in days a lifetime average cannot move: a drive that
+ * crawled through its first twelve hours and recovered still reads as a
+ * disaster, and one that has just walked into a bad patch still reads as
+ * fine.  Neither is what someone watching the screen is asking.  So the
+ * column, and the ETA beside it, come off the same trailing window as the
+ * latency columns.
+ *
+ * The throughput floor deliberately does not: see rate_judge(), which holds
+ * the whole session against it, and rate_window(), which holds a ten-minute
+ * window against it to catch a stretch the session average would bury.  A
+ * verdict wants the long view; a display wants the short one.
+ */
+static void drate_sample(ctx_t *c, uint64_t now)
+{
+	int last = (c->dr_head + DRATE_STEPS - 1) % DRATE_STEPS;
+
+	if (c->dr_n && now - c->dr[last].t_us <
+		       (uint64_t)DRATE_STEP_S * 1000000ull)
+		return;
+	c->dr[c->dr_head].t_us = now;
+	c->dr[c->dr_head].bytes = c->bytes_done;
+	c->dr_head = (c->dr_head + 1) % DRATE_STEPS;
+	if (c->dr_n < DRATE_STEPS)
+		c->dr_n++;
+}
+
+/*
+ * Measured from the oldest sample still inside the window -- or, when the
+ * scan has been stuck on one sector for longer than the window, from the
+ * newest one there is, which is how a drive delivering nothing comes out at
+ * 0 B/s instead of at whatever it managed before it stalled.  Negative until
+ * there is enough of a span to divide by; the caller falls back to the
+ * session average for the first seconds of a scan.
+ */
+static double drate(const ctx_t *c, uint64_t now)
+{
+	uint64_t win = (uint64_t)DRATE_WINDOW_S * 1000000ull;
+	uint64_t cut = now > win ? now - win : 0;
+	int first = (c->dr_head + DRATE_STEPS - c->dr_n) % DRATE_STEPS;
+	int i, pick = -1;
+
+	for (i = 0; i < c->dr_n; i++) {
+		int k = (first + i) % DRATE_STEPS;
+
+		if (c->dr[k].t_us >= cut) {
+			pick = k;
+			break;
+		}
+	}
+	if (pick < 0 && c->dr_n)
+		pick = (c->dr_head + DRATE_STEPS - 1) % DRATE_STEPS;
+	if (pick < 0 || now - c->dr[pick].t_us < 1000000ull)
+		return -1;
+	return (double)(c->bytes_done - c->dr[pick].bytes) /
+	       ((double)(now - c->dr[pick].t_us) / 1e6);
+}
+
 static void progress(ctx_t *c, int final)
 {
 	static uint64_t last;
 	uint64_t now = now_us();
-	double el, rate, eta, pct;
+	double el, rate, avg_rate, eta, eta_avg, pct;
 	char b1[32], b2[32], b3[32], lw[96] = "";
 	int tty = isatty(STDERR_FILENO);
 
@@ -4153,8 +4264,14 @@ static void progress(ctx_t *c, int final)
 					      tty ? 500000 : 30000000))
 		return;
 	last = now;
+	drate_sample(c, now);
 	el = (double)(now - c->t_start_us) / 1e6;
-	rate = el > 0 ? (double)(c->bytes_done - c->bytes_at_start) / el : 0;
+	avg_rate = el > 0 ? (double)(c->bytes_done - c->bytes_at_start) / el : 0;
+	/* the last call, the one a finished scan leaves on the screen and in
+	 * the record, is the whole run rather than its last thirty seconds */
+	rate = final ? avg_rate : drate(c, now);
+	if (rate < 0)
+		rate = avg_rate;
 	rate_judge(c, now);
 	{
 		uint64_t left = c->nchunks > c->step ? c->nchunks - c->step : 0;
@@ -4162,6 +4279,8 @@ static void progress(ctx_t *c, int final)
 		if (c->sample > 1)
 			left /= c->sample;
 		eta = rate > 0 ? (double)left * (double)c->chunk / rate : -1;
+		eta_avg = avg_rate > 0 ?
+			  (double)left * (double)c->chunk / avg_rate : -1;
 	}
 	pct = c->nchunks ? 100.0 * (double)c->step / (double)c->nchunks : 100.0;
 
@@ -4175,7 +4294,7 @@ static void progress(ctx_t *c, int final)
 	 * only symptom is a percentage that does not move, and by the time
 	 * anyone works out why, days are gone.
 	 */
-	if (!c->stall_warned && el > 900 && eta > 30.0 * 24 * 3600 &&
+	if (!c->stall_warned && el > 900 && eta_avg > 30.0 * 24 * 3600 &&
 	    c->retry_ios > c->chunks_read) {
 		c->stall_warned = 1;
 		msg(PROG ": %s: %sat this rate this scan needs %s%s, and %"
@@ -4190,7 +4309,7 @@ static void progress(ctx_t *c, int final)
 		    "300 ms will then be\n"
 		    "         reported as unreadable, which is the honest "
 		    "answer for them.\n",
-		    c->dev->name, c_yel(), human_time(eta, b3, sizeof(b3)),
+		    c->dev->name, c_yel(), human_time(eta_avg, b3, sizeof(b3)),
 		    c_off(), c->retry_ios, c->chunks_read);
 	}
 
@@ -4211,8 +4330,7 @@ static void progress(ctx_t *c, int final)
 		g_job.rate = rate;
 		g_job.eta = eta;
 		g_job.bad = c->blocks_bad + c->blocks_corrupt;
-		g_job.weak = c->blocks_recovered;
-		g_job.slow = c->blocks_slow + c->blocks_unstable;
+		g_job.weak = c->blocks_weak;
 		g_job.too_slow = c->too_slow;
 		g_job.bytes = c->bytes_done;
 		g_job.lat_med = med;
@@ -4237,13 +4355,12 @@ static void progress(ctx_t *c, int final)
 			snprintf(lw + strlen(lw) - 3, sizeof(lw) - (strlen(lw) - 3),
 				 ", write med %.1f ms", wmed);
 	}
-	fprintf(stderr, "\r%s  %5.1f%%  %s/s%s  bad:%" PRIu64 " slow:%" PRIu64
-		" weak:%" PRIu64 "%s  elapsed %s  eta %s   ",
+	fprintf(stderr, "\r%s  %5.1f%%  %s/s%s  bad:%" PRIu64 " weak:%" PRIu64
+		"%s  elapsed %s  eta %s   ",
 		c->dev->name, pct,
 		human_size((uint64_t)rate, b1, sizeof(b1)),
 		c->too_slow ? " TOO SLOW" : "",
-		c->blocks_bad, c->blocks_slow + c->blocks_unstable,
-		c->blocks_recovered, lw,
+		c->blocks_bad, c->blocks_weak, lw,
 		human_time(el, b2, sizeof(b2)),
 		human_time(eta, b3, sizeof(b3)));
 	if (final)
@@ -4267,7 +4384,7 @@ static void state_save(ctx_t *c)
 	f = fopen(tmp, "we");
 	if (!f)
 		return;
-	fprintf(f, "hddscan-state 1\n");
+	fprintf(f, "hddscan-state %d\n", STATE_VERSION);
 	fprintf(f, "device %s\n", c->dev->name);
 	fprintf(f, "size %" PRIu64 "\n", c->dev->size);
 	fprintf(f, "mode %d\n", (int)c->mode);
@@ -4277,11 +4394,10 @@ static void state_save(ctx_t *c)
 	fprintf(f, "start %" PRIu64 "\nend %" PRIu64 "\n", c->start, c->end);
 	fprintf(f, "bytes %" PRIu64 "\n", c->bytes_done);
 	fprintf(f, "counters %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64
-		" %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64
-		" %" PRIu64 " %" PRIu64 "\n",
+		" %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 "\n",
 		c->chunks_read, c->chunks_slow, c->chunks_err, c->blocks_drilled,
-		c->blocks_slow, c->blocks_bad, c->blocks_recovered,
-		c->blocks_unstable, c->blocks_fixed, c->hard_errors, c->retry_ios);
+		c->blocks_weak, c->blocks_bad, c->blocks_fixed, c->hard_errors,
+		c->retry_ios);
 	fprintf(f, "writes %" PRIu64 " %" PRIu64 "\n", c->writes_done,
 		c->writes_slow);
 	fprintf(f, "unrepaired %" PRIu64 "\n", c->blocks_unrepaired);
@@ -4323,19 +4439,58 @@ static void state_save(ctx_t *c)
 	rename(tmp, c->state_path);
 }
 
+/*
+ * Whether this file may be loaded at all, read before anything out of it is.
+ * Deciding afterwards is not the same thing: the counters, the position and
+ * the surface map are already in the context by then, and "ignoring" it does
+ * not put them back.
+ */
+static int state_usable(FILE *f, const ctx_t *c)
+{
+	char line[1024];
+	char name[64] = "";
+	int ver = 0;
+
+	while (fgets(line, sizeof(line), f)) {
+		if (!strncmp(line, "hddscan-state ", 14))
+			ver = atoi(line + 14);
+		else if (!strncmp(line, "device ", 7))
+			sscanf(line + 7, "%63s", name);
+	}
+	rewind(f);
+	/*
+	 * Version 1 wrote a counters line of eleven fields and finding states
+	 * numbered against the old six-state enum, both of which would land
+	 * in the wrong places here.  A scan that old restarts rather than
+	 * resumes into nonsense.
+	 */
+	if (ver != STATE_VERSION) {
+		msg(PROG ": state file is format %d, this build writes %d "
+		    "- ignoring\n", ver, STATE_VERSION);
+		return 0;
+	}
+	if (name[0] && strcmp(name, c->dev->name)) {
+		msg(PROG ": state file belongs to %s, not %s - ignoring\n",
+		    name, c->dev->name);
+		return 0;
+	}
+	return 1;
+}
+
 static int state_load(ctx_t *c)
 {
 	FILE *f = fopen(c->state_path, "re");
 	char line[1024];
-	char name[64] = "";
 	int i;
 
 	if (!f)
 		return -1;
+	if (!state_usable(f, c)) {
+		fclose(f);
+		return -1;
+	}
 	while (fgets(line, sizeof(line), f)) {
-		if (!strncmp(line, "device ", 7)) {
-			sscanf(line + 7, "%63s", name);
-		} else if (!strncmp(line, "pos ", 4)) {
+		if (!strncmp(line, "pos ", 4)) {
 			c->pos = strtoull(line + 4, NULL, 10);
 		} else if (!strncmp(line, "step ", 5)) {
 			c->step = strtoull(line + 5, NULL, 10);
@@ -4344,10 +4499,9 @@ static int state_load(ctx_t *c)
 		} else if (!strncmp(line, "counters ", 9)) {
 			sscanf(line + 9, "%" SCNu64 " %" SCNu64 " %" SCNu64
 			       " %" SCNu64 " %" SCNu64 " %" SCNu64 " %" SCNu64
-			       " %" SCNu64 " %" SCNu64 " %" SCNu64 " %" SCNu64,
+			       " %" SCNu64 " %" SCNu64,
 			       &c->chunks_read, &c->chunks_slow, &c->chunks_err,
-			       &c->blocks_drilled, &c->blocks_slow, &c->blocks_bad,
-			       &c->blocks_recovered, &c->blocks_unstable,
+			       &c->blocks_drilled, &c->blocks_weak, &c->blocks_bad,
 			       &c->blocks_fixed, &c->hard_errors, &c->retry_ios);
 		} else if (!strncmp(line, "band ", 5)) {
 			band_t b;
@@ -4400,11 +4554,6 @@ static int state_load(ctx_t *c)
 		}
 	}
 	fclose(f);
-	if (name[0] && strcmp(name, c->dev->name)) {
-		msg(PROG ": state file belongs to %s, not %s - ignoring\n",
-		    name, c->dev->name);
-		return -1;
-	}
 	return 0;
 }
 
@@ -5155,7 +5304,7 @@ static int find_cmp_sev(const void *a, const void *b)
 {
 	const finding_t *x = a, *y = b;
 	int sx, sy;
-	static const int rank[] = { 0, 1, 2, 3, 5, 4 };
+	static const int rank[] = { 0, 1, 3, 2 };   /* OK, WEAK, BAD, CORRUPT */
 
 	sx = rank[x->status];
 	sy = rank[y->status];
@@ -5512,12 +5661,9 @@ static int verdict_of(ctx_t *c, const char **why)
 		*why = buf;
 		return 1;
 	}
-	if (c->blocks_unstable || c->blocks_slow || d_realloc > 0 || d_pending > 0) {
-		*why = "sectors needed retries or the drive reallocated during the scan";
-		return 1;
-	}
-	if (c->blocks_recovered) {
-		*why = "some reads exceeded the latency budget but recovered on retry";
+	if (c->blocks_weak || d_realloc > 0 || d_pending > 0) {
+		*why = "sectors were over the latency budget or needed retries, "
+		       "or the drive reallocated during the scan";
 		return 1;
 	}
 	if (d_timeouts > 0) {
@@ -5643,6 +5789,81 @@ static void print_smart_line(const char *label, long long before, long long afte
 		    label, before, after, c_red(), c_off());
 	else
 		out("    %-28s %8lld\n", label, before);
+}
+
+/*
+ * A drive with a handful of unusable sectors is not scrap.  ext2/3/4 has
+ * kept a bad-block inode since ext2: every block listed in it is allocated
+ * to that inode and to nothing else, so the filesystem never puts data
+ * there.  Nothing else in common use does this -- XFS and btrfs have no
+ * equivalent, and mdraid and ZFS deliberately fault a drive out on a read
+ * error rather than route around it, which is right for redundancy and
+ * wrong for a drive you have already decided to nurse.  So the drive is
+ * finished for an array and perfectly good as a backup target, where a
+ * second copy exists and losing it costs time rather than data.
+ *
+ * The list has to be built in the block size and partition offset of the
+ * filesystem that will use it, and nobody knows those during a scan that
+ * takes days.  So this prints how to build it afterwards, out of what the
+ * scan already wrote down, while that is still on disk.
+ */
+static void fs_plan(const ctx_t *c)
+{
+	uint64_t lost = 0;
+	char b1[32], b2[32], slug[96], target[160];
+	int i;
+
+	if (!c->nfind)
+		return;
+	/*
+	 * mke2fs runs on a partition, which is where a filesystem goes on a
+	 * real drive; an image file is its own target and has none.
+	 */
+	report_slug(c->dev->name, slug, sizeof(slug));
+	if (c->dev->is_file)
+		snprintf(target, sizeof(target), "%s", c->dev->path);
+	else
+		snprintf(target, sizeof(target), "%s1", c->dev->path);
+
+	for (i = 0; i < c->nfind; i++)
+		lost += c->find[i].len ? c->find[i].len : (uint32_t)c->block;
+
+	out("\n Using this drive anyway\n");
+	out("   %d sector%s the scan would not trust, %s of %s. A filesystem can\n"
+	    "   be told to keep what it stores off them:\n",
+	    c->nfind, c->nfind == 1 ? "" : "s",
+	    human_size(lost, b1, sizeof(b1)),
+	    human_size(c->dev->size, b2, sizeof(b2)));
+	if (c->bb_path)
+		out("\n   1. the list is already written, from this scan:\n"
+		    "        %s  (blocks of %" PRIu64 " bytes%s)\n",
+		    c->bb_path, c->bb_bs ? c->bb_bs : 1024,
+		    c->bb_off ? ", partition offset subtracted" :
+				", device-relative");
+	else if (c->state_path)
+		out("\n   1. write the list, in the block size the filesystem will use\n"
+		    "      and relative to the partition it will live on:\n"
+		    "        %s --badblocks-from %s \\\n"
+		    "            --badblocks-list /root/%s.bb \\\n"
+		    "            --badblocks-blocksize 4096 --badblocks-offset 1048576\n"
+		    "      (the offset is where the partition starts: 1 MiB is where\n"
+		    "      the first one usually does. Leave it out for a whole disk.)\n",
+		    PROG, c->state_path, slug);
+	else
+		out("\n   1. this scan kept no checkpoint and no --csv, so the sector\n"
+		    "      list above is all there is. Re-run with --badblocks-list,\n"
+		    "      or --csv, to get one a filesystem can read.\n");
+	out("\n   2. mkfs.ext4 -b 4096 -l /root/%s.bb %s\n", slug, target);
+	out("      ext2/3/4 only: mke2fs puts every listed block in the bad-block\n"
+	    "      inode, where nothing else can be allocated. XFS and btrfs have\n"
+	    "      no equivalent. Do not put this drive in an mdraid array or a\n"
+	    "      ZFS pool: both fault a drive out on a read error instead of\n"
+	    "      stepping around it.\n");
+	out("\n   3. e2fsck -l /root/%s.bb %s\n", slug, target);
+	out("      the same list, added to a filesystem that already exists, for\n"
+	    "      when a later scan finds more.\n");
+	out("\n   Re-scan every few months and add what it finds: the list only\n"
+	    "   covers damage that had already appeared by the time it was made.\n");
 }
 
 static void report(ctx_t *c)
@@ -5871,13 +6092,10 @@ static void report(ctx_t *c)
 		    "cache is on.%s\n"
 		    "    Re-reading a sector the drive has just fetched is "
 		    "answered from its\n"
-		    "    DRAM, so a sector that recovers slowly once and returns "
-		    "instantly for\n"
-		    "    every retry is indistinguishable from one that is "
-		    "genuinely fine. That\n"
-		    "    is why such sectors land in 'intermittently bad' rather "
-		    "than\n    'persistently slow'. Re-run with --read-cache off "
-		    "to make the retries\n    mean something.\n",
+		    "    DRAM, so the retry times below say more about the cache "
+		    "than about\n"
+		    "    the platter. Re-run with --read-cache off to make them "
+		    "mean something.\n",
 		    c_yel(), c_off());
 	if (c->prot_errors)
 		out("    %sblocked by protection   %12" PRIu64 "%s  (guard tag check "
@@ -5888,15 +6106,10 @@ static void report(ctx_t *c)
 		    "refused to be read until this pass wrote them)\n",
 		    c_grn(), c->prot_fixed, c_off());
 	out("\n");
-	out("    %ssectors recovered on retry%s%12" PRIu64 "  (slow once, fine afterwards)\n",
-	    c->blocks_recovered ? c_yel() : "", c->blocks_recovered ? c_off() : "",
-	    c->blocks_recovered);
-	out("    %ssectors intermittently bad%s%12" PRIu64 "  (sometimes slow or failing)\n",
-	    c->blocks_unstable ? c_yel() : "", c->blocks_unstable ? c_off() : "",
-	    c->blocks_unstable);
-	out("    %ssectors persistently slow %s%12" PRIu64 "  (always over budget)\n",
-	    c->blocks_slow ? c_yel() : "", c->blocks_slow ? c_off() : "",
-	    c->blocks_slow);
+	out("    %ssectors weak              %s%12" PRIu64 "  (over budget, or "
+	    "read only on a retry)\n",
+	    c->blocks_weak ? c_yel() : "", c->blocks_weak ? c_off() : "",
+	    c->blocks_weak);
 	out("    %ssectors unreadable        %s%12" PRIu64 "  (every attempt failed)\n",
 	    c->blocks_bad ? c_red() : "", c->blocks_bad ? c_off() : "",
 	    c->blocks_bad);
@@ -6176,6 +6389,7 @@ no_modes:	;
 		out(" The drive works but showed weak spots. Re-run the scan in a few days;\n"
 		    " if the same offsets are slow again, or SMART counters keep growing,\n"
 		    " treat it as failing. --rewrite-weak can refresh marginal sectors.\n");
+	fs_plan(c);
 	out("========================================================================\n\n");
 }
 
@@ -6263,9 +6477,7 @@ static void write_json(ctx_t *c, const char *path)
 		fprintf(f, "    \"slow_bands\": %d,\n", sb.n);
 	}
 	fprintf(f, "    \"sectors_drilled\": %" PRIu64 ",\n", c->blocks_drilled);
-	fprintf(f, "    \"sectors_recovered\": %" PRIu64 ",\n", c->blocks_recovered);
-	fprintf(f, "    \"sectors_unstable\": %" PRIu64 ",\n", c->blocks_unstable);
-	fprintf(f, "    \"sectors_slow\": %" PRIu64 ",\n", c->blocks_slow);
+	fprintf(f, "    \"sectors_weak\": %" PRIu64 ",\n", c->blocks_weak);
 	fprintf(f, "    \"sectors_bad\": %" PRIu64 ",\n", c->blocks_bad);
 	fprintf(f, "    \"sectors_unrepaired\": %" PRIu64 ",\n", c->blocks_unrepaired);
 	fprintf(f, "    \"sectors_corrupt\": %" PRIu64 ",\n", c->blocks_corrupt);
@@ -6358,8 +6570,7 @@ static void write_badblocks(ctx_t *c, const char *path, uint64_t bs,
 		uint64_t o, end;
 
 		/* anything we would not trust a filesystem to live on */
-		if (x->status != ST_BAD && x->status != ST_CORRUPT &&
-		    x->status != ST_UNSTABLE)
+		if (x->status == ST_OK)
 			continue;
 		if (x->offset < part_off)
 			continue;
@@ -6372,6 +6583,77 @@ static void write_badblocks(ctx_t *c, const char *path, uint64_t bs,
 	fclose(f);
 	msg(PROG ": wrote %s (%" PRIu64 " blocks of %" PRIu64 " bytes)\n",
 	    path, n, bs);
+}
+
+/*
+ * The list above is only useful at the block size and partition offset of
+ * the filesystem that will use it, and nobody knows those during a scan that
+ * takes three days.  So it can be built again afterwards from what the scan
+ * already wrote down -- its checkpoint, or its --csv -- without going near
+ * the drive.  A parallel run always checkpoints each drive, so this works
+ * for a scan that was never asked to produce a list at all.
+ */
+static int badblocks_replay(const char *src, const char *out, uint64_t bs,
+			    uint64_t part_off)
+{
+	FILE *f = fopen(src, "re");
+	char line[1024];
+	ctx_t c;
+	int csv = 0, first = 1;
+
+	if (!f) {
+		msg(PROG ": cannot read %s: %s\n", src, strerror(errno));
+		return 2;
+	}
+	memset(&c, 0, sizeof(c));
+	c.block = DEF_BLOCK;
+	while (fgets(line, sizeof(line), f)) {
+		if (first) {
+			first = 0;
+			csv = !strncmp(line, "device,offset_bytes", 19);
+			if (csv)
+				continue;
+			if (strncmp(line, "hddscan-state ", 14)) {
+				msg(PROG ": %s is neither a checkpoint nor a "
+				    "--csv finding list\n", src);
+				fclose(f);
+				return 2;
+			}
+		}
+		if (csv) {
+			finding_t *x;
+			char st[32] = "";
+			uint64_t off = 0, lba;
+			unsigned len = 0;
+
+			if (sscanf(line, "%*[^,],%" SCNu64 ",%" SCNu64 ",%u,%31[^,],",
+				   &off, &lba, &len, st) != 4)
+				continue;
+			x = find_add(&c);
+			if (!x)
+				break;
+			x->offset = off;
+			x->len = len;
+			x->status = status_of_name(st);
+		} else if (!strncmp(line, "block ", 6)) {
+			c.block = (size_t)strtoull(line + 6, NULL, 10);
+		} else if (!strncmp(line, "finding ", 8)) {
+			finding_t *x = find_add(&c);
+			int st = 0;
+
+			if (!x)
+				break;
+			sscanf(line + 8, "%" SCNu64 " %u %d", &x->offset,
+			       &x->len, &st);
+			x->status = (status_t)st;
+		}
+	}
+	fclose(f);
+	if (!c.block)
+		c.block = DEF_BLOCK;
+	write_badblocks(&c, out, bs, part_off);
+	free(c.find);
+	return 0;
 }
 
 /* ------------------------------------------------------------------ *
@@ -6410,14 +6692,10 @@ static void write_prometheus(ctx_t *c, const char *path)
 	{ "hddscan_duration_seconds", "Wall clock duration of the scan", "gauge", secs },
 	{ "hddscan_sectors_bad", "Sectors unreadable on every attempt", "gauge",
 	  (double)c->blocks_bad },
-	{ "hddscan_sectors_unstable", "Sectors intermittently slow or failing",
-	  "gauge", (double)c->blocks_unstable },
-	{ "hddscan_sectors_slow", "Sectors consistently over the latency budget",
-	  "gauge", (double)c->blocks_slow },
+	{ "hddscan_sectors_weak", "Sectors over the latency budget or readable "
+	  "only after a retry", "gauge", (double)c->blocks_weak },
 	{ "hddscan_writes_slow", "Chunk writes over the latency budget",
 	  "gauge", (double)c->writes_slow },
-	{ "hddscan_sectors_recovered", "Sectors slow once but clean on retry",
-	  "gauge", (double)c->blocks_recovered },
 	{ "hddscan_sectors_corrupt", "Sectors returning data that did not match",
 	  "gauge", (double)c->blocks_corrupt },
 	{ "hddscan_sectors_healed", "Weak sectors that read clean after a rewrite",
@@ -6593,6 +6871,7 @@ typedef struct {
 	const char *badblocks;
 	uint64_t bb_blocksize;
 	uint64_t bb_offset;
+	const char *bb_from;    /* build that list from a finished scan */
 	const char *prometheus;
 	const char *journal;
 	const char *state;
@@ -6908,10 +7187,17 @@ static void usage(void)
 "  --json FILE            write a machine readable report\n"
 "  --badblocks-list FILE  write bad sectors in badblocks(8) format, ready for\n"
 "                         'mke2fs -l FILE' so a new filesystem steps around\n"
-"                         them.  Includes bad, corrupt and unstable sectors\n"
-"  --badblocks-blocksize N   unit for that list (default 1024)\n"
+"                         them.  Includes every sector the scan would not\n"
+"                         trust: bad, corrupt and weak alike\n"
+"  --badblocks-blocksize N   unit for that list (default 1024). Use the\n"
+"                         filesystem's own block size, usually 4096\n"
 "  --badblocks-offset N   subtract a partition's start offset from the block\n"
 "                         numbers, since mke2fs runs on the partition\n"
+"  --badblocks-from FILE  build that list from a scan that has already\n"
+"                         finished, reading its checkpoint (--state, or the\n"
+"                         one a parallel run keeps per drive) or its --csv.\n"
+"                         Touches no drive, so the block size and offset can\n"
+"                         be chosen once the partition exists\n"
 "  --prometheus FILE      write metrics for node_exporter's textfile collector\n"
 "  --journal FILE         crash journal for --mode verify: the original bytes\n"
 "                         are fsynced here before the pattern is written, so a\n"
@@ -7064,6 +7350,9 @@ static int scan_device(device_t *d, const opts_t *o, const char *json_path,
 	c.no_direct = o->no_direct;
 	c.map_width = o->map_width;
 	c.state_path = o->state;
+	c.bb_path = bb_path;
+	c.bb_bs = o->bb_blocksize;
+	c.bb_off = o->bb_offset;
 	c.resume = o->resume;
 	c.temp_min = -1;
 	c.temp_max = -1;
@@ -7520,8 +7809,8 @@ static int jrec_cmp_risk(const void *a, const void *b)
 
 	if ((x->bad != 0) != (y->bad != 0))
 		return x->bad ? -1 : 1;
-	if ((x->slow != 0) != (y->slow != 0))
-		return x->slow ? -1 : 1;
+	if ((x->weak != 0) != (y->weak != 0))
+		return x->weak ? -1 : 1;
 	if (x->pct != y->pct)
 		return x->pct < y->pct ? -1 : 1;
 	return 0;
@@ -7574,7 +7863,7 @@ typedef struct {
 	int running, done, queued, orphaned;
 	int healthy, suspect, failing, stopped;
 	double pct, agg_rate, max_eta;
-	uint64_t bytes, bad, weak, slow;
+	uint64_t bytes, bad, weak;
 } tally_t;
 
 static void tally(const jrec_t *j, int n, tally_t *t)
@@ -7613,7 +7902,6 @@ static void tally(const jrec_t *j, int n, tally_t *t)
 		t->bytes += x->bytes;
 		t->bad += x->bad;
 		t->weak += x->weak;
-		t->slow += x->slow;
 	}
 	t->pct /= (double)(n > 0 ? n : 1);
 }
@@ -7670,7 +7958,7 @@ static int render_parallel(const run_t *r, const jrec_t *j, int n,
 		for (k = 0; k < w; k++)
 			fputc(k < filled ? '=' : '-', stderr);
 		fprintf(stderr, "]  bad sectors %" PRIu64 ", weak %" PRIu64
-			", slow %" PRIu64 "   \n", t.bad, t.weak, t.slow);
+			"   \n", t.bad, t.weak);
 		lines++;
 	}
 	LINE("  run %s   hddscan --status %s   %s\n", r->id, r->id,
@@ -7689,12 +7977,11 @@ static int render_parallel(const run_t *r, const jrec_t *j, int n,
 				jrec_t *x = &sorted[i];
 
 				LINE("    %-8s %5.1f%% %9s/s  bad %-5" PRIu64
-				     " weak %-5" PRIu64 " slow %-7" PRIu64
-				     " %s%-10s%s        \n",
+				     " weak %-7" PRIu64 " %s%-10s%s        \n",
 				     jrec_name(x),
 				     x->state == JS_DONE ? 100.0 : x->pct,
 				     human_size((uint64_t)x->rate, b1, sizeof(b1)),
-				     x->bad, x->weak, x->slow,
+				     x->bad, x->weak,
 				     jrec_color(x), jrec_word(x, format), c_off());
 			}
 			free(sorted);
@@ -7703,11 +7990,11 @@ static int render_parallel(const run_t *r, const jrec_t *j, int n,
 		for (i = 0; i < n; i++) {
 			const jrec_t *x = &j[i];
 
-			LINE("    %-8s %5.1f%% %9s/s  bad %-5" PRIu64 " weak %-5"
-			     PRIu64 " slow %-7" PRIu64 " eta %-10s %s%s%s   \n",
+			LINE("    %-8s %5.1f%% %9s/s  bad %-5" PRIu64
+			     " weak %-7" PRIu64 " eta %-10s %s%s%s   \n",
 			     jrec_name(x), x->state == JS_DONE ? 100.0 : x->pct,
 			     human_size((uint64_t)x->rate, b1, sizeof(b1)),
-			     x->bad, x->weak, x->slow,
+			     x->bad, x->weak,
 			     x->state == JS_RUNNING ?
 			     human_time(x->eta, b2, sizeof(b2)) : "-",
 			     jrec_color(x), jrec_word(x, format), c_off());
@@ -7743,6 +8030,61 @@ static void tui_cooked(void)
 	g_tty_raw = 0;
 }
 
+/*
+ * Light terminal or dark one?  OSC 11 asks, and a terminal that knows the
+ * answer replies with its own background as rgb:RRRR/GGGG/BBBB.  Several do
+ * not, so it is a tenth of a second and then the dark default -- which is
+ * what a terminal driving a disk tool nearly always is.  HDDSCAN_THEME
+ * settles it by hand for a terminal that answers wrongly or not at all.
+ *
+ * The reply has to be read back here, in raw mode with echo off, or it
+ * would arrive later and be taken for a run of keystrokes.
+ */
+static void probe_background(void)
+{
+	struct pollfd pfd = { STDIN_FILENO, POLLIN, 0 };
+	char buf[64];
+	size_t n = 0;
+	const char *p;
+	unsigned r, g, b, top;
+	int w = 0;
+
+	p = getenv("HDDSCAN_THEME");
+	if (p && *p) {
+		g_term_light = !strcmp(p, "light");
+		return;
+	}
+	/* where a terminal sets it, this says the same thing with no round
+	 * trip: "fg;bg", a background of 7 or 15 being the light ones */
+	p = getenv("COLORFGBG");
+	if (p && (p = strrchr(p, ';'))) {
+		if (!strcmp(p + 1, "7") || !strcmp(p + 1, "15"))
+			g_term_light = 1;
+		return;
+	}
+	fputs("\033]11;?\033\\", stdout);
+	fflush(stdout);
+	while (n + 1 < sizeof(buf)) {
+		if (poll(&pfd, 1, 100) <= 0)
+			break;
+		if (read(STDIN_FILENO, buf + n, 1) != 1)
+			break;
+		n++;
+		if (buf[n - 1] == '\a' ||
+		    (n >= 2 && buf[n - 2] == 27 && buf[n - 1] == '\\'))
+			break;
+	}
+	buf[n] = 0;
+	p = strstr(buf, "rgb:");
+	if (!p || sscanf(p + 4, "%4x/%4x/%4x", &r, &g, &b) != 3)
+		return;
+	/* the components come back as one to four hex digits each */
+	while (w < 4 && isxdigit((unsigned char)p[4 + w]))
+		w++;
+	top = (1u << (4 * w)) - 1;
+	g_term_light = (r + g + b) / 3 > top / 2;
+}
+
 static int tui_raw(void)
 {
 	static int registered;
@@ -7773,6 +8115,8 @@ static int tui_raw(void)
 	/* alternate screen, hide cursor */
 	fputs("\033[?1049h\033[?25l", stdout);
 	fflush(stdout);
+	if (g_color)
+		probe_background();
 	return 0;
 }
 
@@ -7792,6 +8136,10 @@ static void tui_size(int *rows, int *cols)
 #define K_DOWN  1001
 #define K_LEFT  1002
 #define K_RIGHT 1003
+#define K_PGUP  1004
+#define K_PGDN  1005
+#define K_HOME  1006
+#define K_END   1007
 
 /* returns a key, or -1 if nothing is waiting */
 static int tui_key(int timeout_ms)
@@ -7817,13 +8165,61 @@ static int tui_key(int timeout_ms)
 	case 'B': return K_DOWN;
 	case 'C': return K_RIGHT;
 	case 'D': return K_LEFT;
-	default: return 27;
+	case 'H': return K_HOME;
+	case 'F': return K_END;
 	}
+	/*
+	 * A numbered sequence -- page up is ESC [ 5 ~ -- so the digits and
+	 * the '~' that closes them have to be read whether or not the key is
+	 * one we use.  Leaving the tail in the buffer made the next poll find
+	 * a stray '~' and treat it as a keypress of its own.
+	 */
+	if (c >= '0' && c <= '9') {
+		char num[8];
+		size_t k = 0;
+
+		while (c >= '0' && c <= '9') {
+			if (k + 1 < sizeof(num))
+				num[k++] = (char)c;
+			if (read(STDIN_FILENO, &c, 1) != 1)
+				return 27;
+		}
+		num[k] = 0;
+		if (c != '~')
+			return 27;
+		if (!strcmp(num, "5"))
+			return K_PGUP;
+		if (!strcmp(num, "6"))
+			return K_PGDN;
+		if (!strcmp(num, "1") || !strcmp(num, "7"))
+			return K_HOME;
+		if (!strcmp(num, "4") || !strcmp(num, "8"))
+			return K_END;
+	}
+	return 27;
 }
 
 static void tui_clear(void) { fputs("\033[2J\033[H", stdout); }
 static void tui_at(int r, int c) { printf("\033[%d;%dH", r, c); }
 static void tui_eol(void) { fputs("\033[K", stdout); }
+
+/*
+ * End a table row.  A stripe has to reach the right-hand edge or it is a
+ * ragged block behind the text rather than a band across the screen, and
+ * erase-to-end-of-line only paints it in terminals that implement the
+ * background colour erase -- so the spaces are written out.
+ */
+static void tui_row_end(int used, int cols, int striped)
+{
+	if (striped)
+		while (used < cols) {
+			fputc(' ', stdout);
+			used++;
+		}
+	tui_eol();
+	if (striped)
+		fputs("\033[0m", stdout);
+}
 
 static void tui_bar(int width, double frac)
 {
@@ -7851,9 +8247,23 @@ static void tui_bar(int width, double frac)
  * blanks holding whatever last scrolled into them, which is exactly what used
  * to happen.
  */
-static void tui_dashboard(const run_t *r, const jrec_t *j, int n, int nruns)
+/*
+ * What the watcher remembers about the screen between frames: which page of
+ * drives is on it and which of the two views is drawing.  A shelf of a
+ * hundred drives cannot be one screen of anything, so the table pages, and
+ * so does the overview.
+ */
+typedef struct {
+	int page;               /* which page of drives is showing */
+	int want_grid;          /* -1 let the drive count decide, else forced */
+	int showing_grid;       /* what the last frame actually drew */
+	int npages;             /* how many pages that came to */
+} dashview_t;
+
+static void tui_dashboard(const run_t *r, const jrec_t *j, int n, int nruns,
+			  dashview_t *v)
 {
-	int rows, cols, i, listrows, row = 1;
+	int rows, cols, i, avail, per_page, start, rec, sep, grid, row = 1;
 	int format = !strcmp(r->kind, "format");
 	tally_t t;
 	char b1[32], b2[32];
@@ -7901,8 +8311,8 @@ static void tui_dashboard(const run_t *r, const jrec_t *j, int n, int nruns)
 		printf("  a format cannot be interrupted once the drive has "
 		       "started it");
 	else
-		printf("  bad sectors %" PRIu64 "   weak %" PRIu64
-		       "   slow %" PRIu64, t.bad, t.weak, t.slow);
+		printf("  bad sectors %" PRIu64 "   weak %" PRIu64,
+		       t.bad, t.weak);
 	tui_eol();
 	tui_at(row++, 1);
 	tui_eol();
@@ -7911,50 +8321,80 @@ static void tui_dashboard(const run_t *r, const jrec_t *j, int n, int nruns)
 		printf("  the drive reports its own progress; a fast format "
 		       "reports none until it ends");
 	else
-		printf("  latency columns are milliseconds over the last 30 seconds");
+		printf("  RATE, ETA and latency are measured over the last 30 "
+		       "seconds; latency in ms");
 	tui_eol();
 	tui_at(row++, 1);
 	if (format)
 		printf("  %-8s %6s %-10s %-20s %-10s %s", "DRIVE", "PCT",
 		       "SIZE", "MODEL", "STATE", "LAST MESSAGE");
 	else
-		printf("  %-8s %6s %11s %7s %7s %8s %6s %6s %6s %6s %6s %9s %s",
-		       "DRIVE", "PCT", "RATE", "BAD", "WEAK", "SLOW", "MED",
-		       "AVG", "MIN", "MAX", "WMED", "ETA", "STATE");
+		printf("  %-8s %6s %11s %7s %8s %9s %s",
+		       "DRIVE", "PCT", "RATE", "BAD", "WEAK", "ETA", "STATE");
 	tui_eol();
 
-	listrows = rows - row - g_msg_count - 3;
-	if (listrows < 1)
-		listrows = 1;
+	avail = rows - row - g_msg_count - 2;
+	if (avail < 1)
+		avail = 1;
+	/*
+	 * A drive is two rows in the scan table -- what it is doing, then how
+	 * it is behaving -- separated by a rule.  One row per drive did fit
+	 * once, but only by running to a hundred columns and truncating on
+	 * anything narrower; splitting it is what makes the table honest at
+	 * eighty.  A format has no latency to report and stays one row.
+	 */
+	rec = format ? 1 : 2;
+	/*
+	 * With colour, one drive of every two sits on a shaded background and
+	 * the next line belongs to the next drive.  Without it there is
+	 * nothing to see, so a rule stands in -- and costs a line, which is
+	 * why the page holds fewer drives then.
+	 */
+	sep = (!g_color && rec > 1) ? 1 : 0;
+	per_page = avail / (rec + sep);
+	if (per_page < 1)
+		per_page = 1;
 
 	/*
-	 * Thirty drives do not fit a terminal as a table -- one row each needs
-	 * fifty lines, and a shelf is exactly the case this screen exists for.
-	 * When the table would be cut off, drop to a grid of small cells: the
-	 * name, the percentage and a bar, several to a line.  Less about each
-	 * drive, but every drive, which is the right trade when the question
-	 * is "how is the batch going".
+	 * The overview answers "how is the batch going" rather than "how is
+	 * this drive": a cell each -- name, percentage, bar -- several to a
+	 * line, which is the only way thirty of them are on screen at once.
+	 * A run with more drives than a screenful of records opens on it, and
+	 * 'g' swaps between the two whatever the size.  Both page, so no
+	 * drive is ever merely dropped off the end.
 	 */
-	if (n > listrows) {
+	grid = v->want_grid >= 0 ? v->want_grid : (n > avail);
+	v->showing_grid = grid;
+	if (grid) {
 		/*
 		 * A cell is " name(8) pct(6) " plus a 12-wide bar: 29
 		 * columns, and the line starts with one more.  Sizing it as
 		 * 27 put a fourth cell on a 112-column line and cut its bar
 		 * off at the edge.
 		 */
-		int cw = 29, percol = (cols - 1) / cw, k;
+		int cw = 29, percol = (cols - 1) / cw, ppg, k;
 
 		if (percol < 1)
 			percol = 1;
+		ppg = percol * avail;
+		if (ppg < 1)
+			ppg = 1;
+		v->npages = (n + ppg - 1) / ppg;
+		if (v->page >= v->npages)
+			v->page = v->npages - 1;
+		if (v->page < 0)
+			v->page = 0;
+		start = v->page * ppg;
 		/* undo the table's own header line; the grid has none */
 		tui_at(row - 1, 1);
 		printf("  %d drives, %d to a line - '%s --status %s' lists them "
 		       "in full", n, percol, PROG, r->id);
 		tui_eol();
-		for (i = 0; i < n && row < rows - 1; i += percol) {
+		for (i = start; i < n && i < start + ppg && row < rows - 1;
+		     i += percol) {
 			tui_at(row++, 1);
 			printf(" ");
-			for (k = i; k < n && k < i + percol; k++) {
+			for (k = i; k < n && k < i + percol && k < start + ppg; k++) {
 				const jrec_t *x = &j[k];
 
 				printf(" %s%-8.8s%s %5.1f%% ", jrec_color(x),
@@ -7965,54 +8405,92 @@ static void tui_dashboard(const run_t *r, const jrec_t *j, int n, int nruns)
 			}
 			tui_eol();
 		}
-		if (i < n) {
-			tui_at(row++, 1);
-			printf("  ... and %d more", n - i);
-			tui_eol();
-		}
 		goto drives_done;
 	}
 
-	for (i = 0; i < n && i < listrows; i++) {
+	v->npages = (n + per_page - 1) / per_page;
+	if (v->page >= v->npages)
+		v->page = v->npages - 1;
+	if (v->page < 0)
+		v->page = 0;
+	start = v->page * per_page;
+
+	for (i = start; i < n && i < start + per_page; i++) {
 		const jrec_t *x = &j[i];
 		const char *col = jrec_color(x);
+		const char *bg = c_stripe((i - start) % 2);
+		int striped = bg[0] != 0, used;
 
-		tui_at(row++, 1);
-		if (format) {
-			printf("  %-8.8s %5.1f%% %-10s %-20.20s %s%-10s%s %.*s",
-			       jrec_name(x), x->pct,
-			       human_size(x->size, b1, sizeof(b1)),
-			       x->model[0] ? x->model : "?",
-			       col, jrec_word(x, 1), c_off(),
-			       cols > 66 ? cols - 64 : 14, x->note);
-		} else {
-			char lat[64];
+		/* without colour, a rule stands in for the stripe */
+		if (sep && i > start) {
+			int k, w = cols > 8 ? cols - 4 : 4;
 
-			if (x->state == JS_RUNNING && x->lat_max > 0)
-				snprintf(lat, sizeof(lat),
-					 "%6.1f %6.1f %6.1f %6.1f", x->lat_med,
-					 x->lat_avg, x->lat_min, x->lat_max);
-			else
-				snprintf(lat, sizeof(lat), "%6s %6s %6s %6s",
-					 "-", "-", "-", "-");
-			/* writes are timed separately: a drive whose writes
-			 * crawl reads back at full speed */
-			if (x->state == JS_RUNNING && x->wlat_med > 0)
-				snprintf(lat + strlen(lat), sizeof(lat) - strlen(lat),
-					 " %6.1f", x->wlat_med);
-			else
-				snprintf(lat + strlen(lat), sizeof(lat) - strlen(lat),
-					 " %6s", "-");
-			printf("  %-8.8s %5.1f%% %9s/s %7" PRIu64 " %7" PRIu64
-			       " %8" PRIu64 " %s %9s %s%s%s",
-			       jrec_name(x), x->state == JS_DONE ? 100.0 : x->pct,
-			       human_size((uint64_t)x->rate, b1, sizeof(b1)),
-			       x->bad, x->weak, x->slow, lat,
-			       x->state == JS_RUNNING ?
-			       human_time(x->eta, b2, sizeof(b2)) : "-",
-			       col, jrec_word(x, 0), c_off());
+			if (w > 74)
+				w = 74;
+			tui_at(row++, 1);
+			printf("  %s", c_dim());
+			for (k = 0; k < w; k++)
+				fputc('-', stdout);
+			printf("%s", c_off());
+			tui_eol();
 		}
-		tui_eol();
+		tui_at(row++, 1);
+		printf("%s", bg);
+		if (format) {
+			used = printf("  %-8.8s %5.1f%% %-10s %-20.20s ",
+				      jrec_name(x), x->pct,
+				      human_size(x->size, b1, sizeof(b1)),
+				      x->model[0] ? x->model : "?");
+			printf("%s", col);
+			used += printf("%-10s", jrec_word(x, 1));
+			printf("%s", striped ? c_plain() : c_off());
+			used += printf(" %.*s", cols > 66 ? cols - 64 : 14,
+				       x->note);
+			tui_row_end(used, cols, striped);
+			continue;
+		}
+		used = printf("  %-8.8s %5.1f%% %9s/s %7" PRIu64 " %8" PRIu64
+			      " %9s ",
+			      jrec_name(x), x->state == JS_DONE ? 100.0 : x->pct,
+			      human_size((uint64_t)x->rate, b1, sizeof(b1)),
+			      x->bad, x->weak,
+			      x->state == JS_RUNNING ?
+			      human_time(x->eta, b2, sizeof(b2)) : "-");
+		printf("%s", col);
+		used += printf("%s", jrec_word(x, 0));
+		printf("%s", striped ? c_plain() : c_off());
+		tui_row_end(used, cols, striped);
+		/*
+		 * The second row is what the drive is doing now, which only a
+		 * running drive has: writes are timed on their own, because a
+		 * drive whose writes crawl reads back at full speed.  A drive
+		 * that is not running says what it is instead.
+		 */
+		tui_at(row++, 1);
+		printf("%s", bg);
+		if (x->state == JS_RUNNING && x->lat_max > 0) {
+			char wm[16];
+
+			if (x->wlat_med > 0)
+				snprintf(wm, sizeof(wm), "%6.1f", x->wlat_med);
+			else
+				snprintf(wm, sizeof(wm), "%6s", "-");
+			used = printf("  %10s med %6.1f  avg %6.1f  min %6.1f  "
+				      "max %6.1f  wmed %s", "", x->lat_med,
+				      x->lat_avg, x->lat_min, x->lat_max, wm);
+		} else {
+			used = printf("  %10s ", "");
+			printf("%s", c_dim());
+			used += printf("%-20.20s  %9s",
+				       x->model[0] ? x->model : "?",
+				       human_size(x->size, b1, sizeof(b1)));
+			if (x->note[0])
+				used += printf("  %.*s",
+					       cols > 50 ? cols - 48 : 20,
+					       x->note);
+			printf("%s", striped ? c_plain() : c_off());
+		}
+		tui_row_end(used, cols, striped);
 	}
 
 drives_done:
@@ -8031,11 +8509,37 @@ drives_done:
 		tui_at(row++, 1);
 		tui_eol();
 	}
+	/*
+	 * Colour does not take up columns but does take up bytes, so what is
+	 * left for the tail is counted as it is printed rather than measured
+	 * off the string afterwards.
+	 */
 	tui_at(rows, 1);
-	printf("  %sr runs%s   n new test   x stop   q quit - the run keeps "
-	       "going either way   reports in %s/",
-	       nruns > 1 ? "\033[1m" : "", nruns > 1 ? "\033[0m" : "",
-	       r->outdir);
+	{
+		int w = printf("  ");
+
+		if (v->npages > 1)
+			w += printf("page %d/%d  < > pages  ",
+				    v->page + 1, v->npages);
+		w += printf("g %s  ", grid ? "drive detail" : "overview");
+		if (nruns > 1)
+			printf("%s", c_bold());
+		w += printf("r runs");
+		if (nruns > 1)
+			printf("%s", c_off());
+		w += printf("  n new test  x stop  q quit");
+		/*
+		 * The reassurance that q does not stop anything is worth a
+		 * whole clause where there is room for one, and worth the
+		 * short form where there is not.
+		 */
+		if (cols - w > 34)
+			w += printf(" - the run keeps going either way");
+		else if (cols - w > 23)
+			w += printf(" - the run keeps going");
+		if (cols - w > 16)
+			printf("  reports in %.*s/", cols - w - 15, r->outdir);
+	}
 	tui_eol();
 	fflush(stdout);
 }
@@ -8069,6 +8573,7 @@ static void forward_stop(job_t *jobs, int n)
 static int tui_summary(const run_t *r, const jrec_t *j, int n, int nruns)
 {
 	int format = !strcmp(r->kind, "format");
+	int page = 0, npages = 1;
 
 	/*
 	 * The stop that ended the scan is spent; the workers are gone.  Clear
@@ -8114,7 +8619,21 @@ static int tui_summary(const run_t *r, const jrec_t *j, int n, int nruns)
 		listrows = rows - row - g_msg_count - 4;
 		if (listrows < 1)
 			listrows = 1;
-		for (i = 0; i < n && i < listrows; i++) {
+		/*
+		 * Thirty verdicts do not fit a screen and a hundred are not
+		 * close, and this is the screen that says how the run went --
+		 * so it pages rather than printing the first dozen and an
+		 * apology.
+		 */
+		npages = (n + listrows - 1) / listrows;
+		if (npages < 1)
+			npages = 1;
+		if (page >= npages)
+			page = npages - 1;
+		if (page < 0)
+			page = 0;
+		for (i = page * listrows;
+		     i < n && i < (page + 1) * listrows; i++) {
 			const jrec_t *x = &j[i];
 
 			tui_at(row++, 1);
@@ -8123,12 +8642,6 @@ static int tui_summary(const run_t *r, const jrec_t *j, int n, int nruns)
 			       x->model[0] ? x->model : "?",
 			       jrec_color(x), jrec_word(x, format), c_off(),
 			       cols > 56 ? cols - 54 : 20, x->report);
-			tui_eol();
-		}
-		if (n > listrows) {
-			tui_at(row++, 1);
-			printf("  ... and %d more (reports in %s/)",
-			       n - listrows, r->outdir);
 			tui_eol();
 		}
 
@@ -8146,14 +8659,54 @@ static int tui_summary(const run_t *r, const jrec_t *j, int n, int nruns)
 			tui_eol();
 		}
 		tui_at(rows, 1);
-		printf("  the full reports are on disk in %s/   "
-		       "\033[1mn\033[0m new test   %sr runs   %s"
-		       "\033[1mq\033[0m quit", r->outdir,
-		       nruns > 1 ? "\033[1m" : "", nruns > 1 ? "\033[0m" : "");
+		{
+			int w = printf("  ");
+
+			if (npages > 1)
+				w += printf("page %d/%d  < > pages  ",
+					    page + 1, npages);
+			printf("%s", c_bold());
+			w += printf("n");
+			printf("%s", c_off());
+			w += printf(" new test  ");
+			if (nruns > 1)
+				printf("%s", c_bold());
+			w += printf("r runs");
+			if (nruns > 1)
+				printf("%s", c_off());
+			w += printf("  ");
+			printf("%s", c_bold());
+			w += printf("q");
+			printf("%s", c_off());
+			w += printf(" quit");
+			if (cols - w > 20)
+				printf("   reports in %.*s/", cols - w - 16,
+				       r->outdir);
+		}
 		tui_eol();
 		fflush(stdout);
 
 		k = tui_key(200);
+		if (k == K_RIGHT || k == K_PGDN || k == '>' || k == '.' ||
+		    k == ']' || k == ' ') {
+			if (page + 1 < npages)
+				page++;
+			continue;
+		}
+		if (k == K_LEFT || k == K_PGUP || k == '<' || k == ',' ||
+		    k == '[') {
+			if (page > 0)
+				page--;
+			continue;
+		}
+		if (k == K_HOME) {
+			page = 0;
+			continue;
+		}
+		if (k == K_END) {
+			page = npages - 1;
+			continue;
+		}
 		if (k == 'n' || k == 'N' || k == '\r' || k == '\n')
 			return 1;
 		if (k == 'r' || k == 'R')
@@ -8175,6 +8728,7 @@ static int tui_summary(const run_t *r, const jrec_t *j, int n, int nruns)
 static int tui_watch(const char *id, int nruns)
 {
 	int arm = 0;
+	dashview_t view = { 0, -1, 0, 1 };
 
 	/*
 	 * Anything this process has to say from here on goes to the message
@@ -8218,7 +8772,7 @@ static int tui_watch(const char *id, int nruns)
 				return act == 1 ? 2 : act == 2 ? 1 : 0;
 			}
 		}
-		tui_dashboard(&r, j, n, nruns);
+		tui_dashboard(&r, j, n, nruns, &view);
 		if (arm) {
 			int rows, cols;
 
@@ -8248,7 +8802,38 @@ static int tui_watch(const char *id, int nruns)
 			store_stop(&r);
 			continue;
 		}
-		if (k == 'r' || k == 'R' || k == 'b' || k == K_LEFT)
+		/*
+		 * Paging, which a shelf of a hundred drives needs and three
+		 * drives never notice: the keys do nothing when there is one
+		 * page.  Left and right are the pages, so going back to the
+		 * list of runs is 'r' or 'b' rather than an arrow.
+		 */
+		if (k == K_RIGHT || k == K_PGDN || k == '>' || k == '.' ||
+		    k == ']' || k == ' ') {
+			if (view.page + 1 < view.npages)
+				view.page++;
+			continue;
+		}
+		if (k == K_LEFT || k == K_PGUP || k == '<' || k == ',' ||
+		    k == '[') {
+			if (view.page > 0)
+				view.page--;
+			continue;
+		}
+		if (k == K_HOME) {
+			view.page = 0;
+			continue;
+		}
+		if (k == K_END) {
+			view.page = view.npages - 1;
+			continue;
+		}
+		if (k == 'g' || k == 'G') {
+			view.want_grid = !view.showing_grid;
+			view.page = 0;
+			continue;
+		}
+		if (k == 'r' || k == 'R' || k == 'b')
 			return 1;
 		if (k == 'd' || k == 'D' || k == 'n' || k == 'N')
 			return 2;
@@ -10021,10 +10606,10 @@ static void status_one(const run_t *r, int json)
 			printf("\"size\": %" PRIu64 ", \"percent\": %.2f, "
 			       "\"rate\": %.0f, \"eta\": %.0f, "
 			       "\"bad\": %" PRIu64 ", \"weak\": %" PRIu64 ", "
-			       "\"slow\": %" PRIu64 ", \"bytes\": %" PRIu64
+			       "\"bytes\": %" PRIu64
 			       ", \"verdict\": %d }%s\n",
 			       x->size, x->state == JS_DONE ? 100.0 : x->pct,
-			       x->rate, x->eta, x->bad, x->weak, x->slow,
+			       x->rate, x->eta, x->bad, x->weak,
 			       x->bytes, x->verdict, i + 1 < n ? "," : "");
 		}
 		printf("    ]\n  }");
@@ -10044,7 +10629,7 @@ static void status_one(const run_t *r, int json)
 		out("   %s%d orphaned%s", c_yel(), t.orphaned, c_off());
 	out("\n  reports in %s/   records in %s\n\n", r->outdir, r->dir);
 	out("  %-10s %-9s %-20s %6s %9s %9s %-10s %s\n", "DRIVE", "SIZE",
-	    "MODEL", "PCT", "BAD", "SLOW", "STATE", format ? "MESSAGE" : "ETA");
+	    "MODEL", "PCT", "BAD", "WEAK", "STATE", format ? "MESSAGE" : "ETA");
 	for (i = 0; i < n; i++) {
 		const jrec_t *x = &j[i];
 
@@ -10052,7 +10637,7 @@ static void status_one(const run_t *r, int json)
 		    " %s%-10s%s %s\n", jrec_name(x),
 		    human_size(x->size, b1, sizeof(b1)),
 		    x->model[0] ? x->model : "?",
-		    x->state == JS_DONE ? 100.0 : x->pct, x->bad, x->slow,
+		    x->state == JS_DONE ? 100.0 : x->pct, x->bad, x->weak,
 		    jrec_color(x), jrec_word(x, format), c_off(),
 		    format ? x->note :
 		    x->state == JS_RUNNING ?
@@ -10506,6 +11091,8 @@ int main(int argc, char **argv)
 			o.json = NEXT();
 		} else if (!strcmp(a, "--csv")) {
 			o.csv = NEXT();
+		} else if (!strcmp(a, "--badblocks-from")) {
+			o.bb_from = NEXT();
 		} else if (!strcmp(a, "--badblocks-list")) {
 			o.badblocks = NEXT();
 		} else if (!strcmp(a, "--badblocks-blocksize")) {
@@ -10586,6 +11173,13 @@ int main(int argc, char **argv)
 	 * touched.  None of it needs root, a terminal, or anything to still
 	 * be running.
 	 */
+	if (o.bb_from) {
+		if (!o.badblocks)
+			die("--badblocks-from needs --badblocks-list FILE to "
+			    "write to");
+		return badblocks_replay(o.bb_from, o.badblocks, o.bb_blocksize,
+					o.bb_offset);
+	}
 	if (o.status)
 		return status_print(o.runarg, o.status_json);
 	if (o.stop) {

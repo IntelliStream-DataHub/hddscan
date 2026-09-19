@@ -28,6 +28,12 @@ summary holds the verdicts on screen — `n` starts another test, `q` quits. If
 something is already running on the machine, it shows you that first.
 
 ![The hddscan dashboard following a 24-drive write test](docs/tui-dashboard.svg)
+
+Each drive gets two rows — what it is doing, then how it is behaving — and the
+whole table fits an 80-column terminal. A shelf is more drives than any screen
+holds, so it pages: `<` and `>`, the arrow keys, page up and page down. `g`
+swaps the table for an overview that puts every drive on one line, and back.
+
 `--check-deps` says which
 optional tools are missing and prints the `dnf`/`apt` line that installs them.
 
@@ -110,6 +116,31 @@ Two flags matter more than they look on a drive that is already sick:
 Without them a drive with a defect band can spend days re-reading a few
 thousand sectors and cover almost none of the surface. The scan now notices
 that and says so, but the flags are the fix.
+
+## Putting a damaged drive back to work
+
+A drive with a few hundred bad sectors is not scrap. ext2/3/4 keeps a bad-block
+inode, and blocks listed in it are never allocated to anything else, so a
+filesystem built with that list simply steps around the damage. The end of scan
+report prints the commands with the numbers already filled in; the list itself
+can be built after the fact, from the scan's checkpoint or its `--csv`, once you
+know the block size and partition offset the filesystem will use:
+
+```sh
+hddscan --badblocks-from /var/lib/hddscan/RUN/sdb.ckpt \
+        --badblocks-list /root/sdb.bb \
+        --badblocks-blocksize 4096 --badblocks-offset 1M
+mkfs.ext4 -b 4096 -l /root/sdb.bb /dev/sdb1
+e2fsck -l /root/sdb.bb /dev/sdb1     # add more, after a later scan
+```
+
+Only ext2/3/4 can do this. XFS and btrfs have no equivalent, and mdraid and ZFS
+deliberately fault a drive out on a read error rather than routing around one —
+which is the right behaviour for redundancy and the wrong one for a drive you
+have decided to nurse. A drive kept this way belongs where a second copy exists:
+a backup target or a scratch disk, not an array or a pool. Re-scan every few
+months and add what turns up; the list only covers damage that had already
+appeared when it was made.
 
 ## Low level formatting
 

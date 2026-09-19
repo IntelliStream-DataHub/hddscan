@@ -58,8 +58,13 @@ A chunk is never faster than its slowest sector. hddscan reads in bulk chunks
 and times each one; a chunk that meets its latency budget therefore proves
 every sector inside it did too, and needs no further attention. A chunk that
 misses is re-read one block at a time until the responsible sectors are
-identified, and each of those is retried to separate a sector that was merely
-slow once from one that is consistently sick.
+identified, and each of those is retried. A sector that never answers is
+.BR bad ;
+one that answers late, or only on a retry, is
+.BR weak .
+How many attempts it took, and how many failed outright, is kept per sector
+in the report and in
+.BR \-\-csv .
 .PP
 Two things would break that guarantee, and both are handled. The drive's own
 read look-ahead can serve a marginal sector out of DRAM at full speed, so it is
@@ -68,6 +73,26 @@ kernel page cache would do the same, so all reads use
 .BR O_DIRECT .
 If look-ahead could not be turned off and the scan order is sequential, the
 report says so rather than presenting a result the tool cannot stand behind.
+.SS What the live columns mean
+.B RATE
+and
+.B ETA
+are measured over the last 30 seconds, like the latency columns beside them:
+on a scan measured in days a lifetime average cannot move, and the question
+being asked of a dashboard is what the drive is doing now. The throughput
+floor behind
+.B too slow
+is deliberately not windowed that way \(em see
+.BR \-\-min\-rate .
+.PP
+.B BAD
+counts sectors that failed every attempt;
+.B WEAK
+counts sectors that were over the latency budget, or came back only on a
+retry. Both are counted in sectors of
+.BR \-\-block
+bytes. The end of scan report breaks the same sectors down by how many tries
+and how many errors each one took.
 .SS Thresholds
 Budgets are calibrated per drive, using the same access pattern the scan will
 use. Timing scattered reads and then scanning sequentially would produce a
@@ -183,10 +208,29 @@ otherwise. Finished runs are kept for a week, then pruned; a live one is never
 pruned. On the dashboard,
 .B q
 leaves the run going,
-.B d
-returns to the list of runs and
+.B r
+returns to the list of runs,
+.B n
+starts another test and
 .B x
-stops it after asking.
+stops the run after asking.
+.SS Reading the dashboard
+A drive is two rows: what it is doing \(em percentage, rate, bad and weak
+sector counts, ETA and state \(em and then how it is behaving, which for a
+running drive is its read latency over the last thirty seconds and for any
+other is what the drive is. A rule separates one drive from the next. The
+whole table fits eighty columns.
+.PP
+More drives than the screen holds is the normal case on a shelf, so the table
+pages:
+.BR < " and " > ,
+the left and right arrows, page up and page down, and home and end. The
+footer says which page is showing.
+.B g
+swaps the table for an overview that puts every drive on one line as a name,
+a percentage and a bar \(em less about each drive, but far more of them at
+once \(em and swaps back. A run with more drives than the table can show
+opens on the overview. The summary the run ends on pages with the same keys.
 .TP
 .B \-\-detach
 Start the run and return to the shell, printing the run id. Nothing is watched
@@ -512,11 +556,21 @@ Write bad sectors in
 .BR badblocks (8)
 format, ready for
 .B mke2fs \-l
-so a new filesystem steps around them. Includes bad, corrupt and unstable
-sectors.
+so a new filesystem steps around them. Includes every sector the scan would
+not trust: bad, corrupt and weak alike.
+.TP
+.BI \-\-badblocks\-from " FILE"
+Build that list from a scan that has already finished, reading its checkpoint
+.RB ( \-\-state ,
+or the one a parallel run keeps for each drive) or its
+.BR \-\-csv .
+No drive is opened, so the block size and the partition offset can be chosen
+after the scan, once the partition they are for exists. Requires
+.BR \-\-badblocks\-list .
 .TP
 .BI \-\-badblocks\-blocksize " N"
-Unit for that list. Default 1024.
+Unit for that list. Default 1024. Use the block size the filesystem will be
+made with, usually 4096.
 .TP
 .BI \-\-badblocks\-offset " N"
 Subtract a partition's start offset from the block numbers, since
@@ -665,6 +719,27 @@ hddscan \-\-badblocks\-list bb.txt \-\-badblocks\-offset 1M /dev/sdb
 mke2fs \-l bb.txt /dev/sdb1
 .EE
 .RE
+.PP
+Put a drive with a few bad sectors back to work, from a scan that has
+already finished. The end of scan report prints these commands with the
+numbers filled in:
+.PP
+.RS
+.EX
+hddscan \-\-badblocks\-from /var/lib/hddscan/RUN/sdb.ckpt \e
+        \-\-badblocks\-list /root/sdb.bb \e
+        \-\-badblocks\-blocksize 4096 \-\-badblocks\-offset 1M
+mkfs.ext4 \-b 4096 \-l /root/sdb.bb /dev/sdb1
+e2fsck \-l /root/sdb.bb /dev/sdb1      # add more, later
+.EE
+.RE
+.PP
+Only ext2/3/4 can do this: the listed blocks go in the bad block inode and
+nothing is ever allocated inside it. XFS and btrfs have no equivalent, and
+.BR mdadm (8)
+and ZFS fault a drive out on a read error rather than stepping around it, so
+a drive kept this way belongs somewhere a second copy exists \(em a backup
+target or a scratch disk \(em and not in an array or a pool.
 .SH FILES
 .TP
 .IR ./hddscan- <device>.txt

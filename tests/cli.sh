@@ -121,6 +121,29 @@ run --mode check --badblocks-list "$TMP/bb2.txt" --badblocks-offset 1M "$f" >/de
 assert_eq  "badblocks offset shifts by exactly the partition start" \
 	"$(tr '\n' ' ' < "$TMP/bb2.txt")" "7168 7169 7170 7171 "
 
+# A scan that takes three days is over long before anyone knows the block size
+# and the partition offset the filesystem will want, so the list has to be
+# buildable again afterwards out of what the scan wrote down.
+run --mode check --csv "$TMP/bb.csv" --state "$TMP/bb.ckpt" "$f" >/dev/null
+run --badblocks-from "$TMP/bb.ckpt" --badblocks-list "$TMP/bb3.txt" >/dev/null
+assert_eq  "--badblocks-from rebuilds the list from a checkpoint" \
+	"$(tr '\n' ' ' < "$TMP/bb3.txt")" "8192 8193 8194 8195 "
+run --badblocks-from "$TMP/bb.csv" --badblocks-list "$TMP/bb4.txt" \
+	--badblocks-offset 1M >/dev/null
+assert_eq  "--badblocks-from reads a --csv too, and shifts it" \
+	"$(tr '\n' ' ' < "$TMP/bb4.txt")" "7168 7169 7170 7171 "
+run --badblocks-from "$TMP/bb.ckpt" --badblocks-list "$TMP/bb5.txt" \
+	--badblocks-blocksize 4096 >/dev/null
+assert_eq  "--badblocks-from in the filesystem's own block size" \
+	"$(tr '\n' ' ' < "$TMP/bb5.txt")" "2048 "
+assert_has "--badblocks-from with nowhere to write it is refused" \
+	"$(run --badblocks-from "$TMP/bb.ckpt")" "needs --badblocks-list"
+assert_has "the report says how to use the drive anyway" \
+	"$out" "Using this drive anyway"
+assert_has "the report gives a mkfs line for it" "$out" "mkfs.ext4 -b 4096"
+assert_has "the report warns the drive off arrays and pools" "$out" \
+	"mdraid array or a"
+
 echo "== the report must not contradict itself =="
 
 # REGRESSION: percentiles came from bucket interpolation and were reported as
@@ -317,9 +340,9 @@ echo "== over budget now and then is not a verdict =="
 # at the last chunk, so the test does not depend on how fast this machine is.
 f=$(image 32 over.bin)
 ckpt() {
-	printf 'hddscan-state 1\npos %s\nstep 255\nbytes 13090422784\n' \
+	printf 'hddscan-state 2\npos %s\nstep 255\nbytes 13090422784\n' \
 		$((255 * 131072)) > "$TMP/over.ckpt"
-	printf 'counters 100000 %s 0 0 0 0 0 0 0 0 0\nwrites %s\n' \
+	printf 'counters 100000 %s 0 0 0 0 0 0 0\nwrites %s\n' \
 		"$1" "$2" >> "$TMP/over.ckpt"
 	run --state "$TMP/over.ckpt" --resume "$f"
 }
@@ -352,9 +375,9 @@ echo "== a stretch of the surface far slower than expected =="
 # which is also where a resumed scan gets its surface map back from.
 f=$(image 32 band.bin)
 bandck() {
-	printf 'hddscan-state 1\npos %s\nstep 255\nbytes 13090422784\n' \
+	printf 'hddscan-state 2\npos %s\nstep 255\nbytes 13090422784\n' \
 		$((255 * 131072)) > "$TMP/band.ckpt"
-	printf 'counters 100000 0 0 0 0 0 0 0 0 0 0\n' >> "$TMP/band.ckpt"
+	printf 'counters 100000 0 0 0 0 0 0 0 0\n' >> "$TMP/band.ckpt"
 	printf 'band 200 64 0 0 0 %s 0 8388608\n' "$1" >> "$TMP/band.ckpt"
 	run --state "$TMP/band.ckpt" --resume --json "$TMP/band.json" "$f"
 }
@@ -480,9 +503,9 @@ echo "== unreadable is not unrepairable =="
 # image cannot return EIO, so the counts come from a checkpoint.
 f=$(image 32 unrep.bin)
 unrep() {
-	printf 'hddscan-state 1\npos %s\nstep 255\nbytes 13090422784\n' \
+	printf 'hddscan-state 2\npos %s\nstep 255\nbytes 13090422784\n' \
 		$((255 * 131072)) > "$TMP/unrep.ckpt"
-	printf 'counters 100000 0 0 0 0 %s 0 0 0 0 0\nunrepaired %s\n' \
+	printf 'counters 100000 0 0 0 0 %s 0 0 0\nunrepaired %s\n' \
 		"$1" "$2" >> "$TMP/unrep.ckpt"
 	run --state "$TMP/unrep.ckpt" --resume --json "$TMP/unrep.json" "$f"
 }
@@ -728,9 +751,9 @@ rm -f "$TMP/rate.big"
 # test can wait for, so it arrives the way a resumed scan would carry it: in
 # the checkpoint.
 f=$(image 32 stretch.bin)
-printf 'hddscan-state 1\npos %s\nstep 255\nbytes 13090422784\n' \
+printf 'hddscan-state 2\npos %s\nstep 255\nbytes 13090422784\n' \
 	$((255 * 131072)) > "$TMP/stretch.ckpt"
-printf 'counters 100000 0 0 0 0 0 0 0 0 0 0\nslowstretch 840 200000 3000000000\n' \
+printf 'counters 100000 0 0 0 0 0 0 0 0\nslowstretch 840 200000 3000000000\n' \
 	>> "$TMP/stretch.ckpt"
 out=$(run --state "$TMP/stretch.ckpt" --resume --json "$TMP/stretch.json" "$f")
 assert_has "a stretch under the floor is SUSPECT when the whole scan is not" \

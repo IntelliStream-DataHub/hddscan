@@ -22,6 +22,9 @@ os.environ["HDDSCAN_STATE_DIR"] = STATE
 ROWS, COLS = 24, 112
 DOWN, UP, RIGHT, LEFT, TAB = b"\x1b[B", b"\x1b[A", b"\x1b[C", b"\x1b[D", b"\t"
 CSI = re.compile(rb"\x1b\[([0-9;?]*)([a-zA-Z])")
+# an operating system command -- hddscan asks the terminal for its background
+# colour with one -- runs to a BEL or a string terminator and draws nothing
+OSC = re.compile(rb"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 
 passed = failed = 0
 
@@ -55,6 +58,10 @@ class Screen:
     def feed(self, data):
         i = 0
         while i < len(data):
+            m = OSC.match(data, i)
+            if m:
+                i = m.end()
+                continue
             m = CSI.match(data, i)
             if m:
                 args, cmd = m.group(1), m.group(2)
@@ -570,7 +577,8 @@ def main():
         # that starts the summary's first frame.  Asserting on live values
         # would be a race anyway; the values themselves are covered by the
         # progress-line test below.  What is pinned here is that a finished
-        # drive shows dashes rather than stale or zeroed numbers.
+        # drive's second row says what the drive is rather than holding the
+        # latency it had while it was still running.
         s.wait(lambda: s.on_screen("finished"), 12.0)
         raw = bytes(s.raw)
         fin = raw.find(b"finished")
@@ -585,9 +593,9 @@ def main():
                       if "DRIVE" in l and "STATE" in l), -1)
             return lines[h + 1:h + 8] if h >= 0 else []
 
-        check("a finished drive shows dashes, not stale latency numbers",
+        check("a finished drive shows no stale latency numbers",
               bool([l for l in rows_now() if l.strip()]) and
-              all("-      -      -      -" in l for l in rows_now() if l.strip()),
+              not any(" med " in l for l in rows_now()),
               "\n".join(rows_now() or lines[:14]))
         hdr = [i for i, l in enumerate(lines) if "DRIVE" in l and "STATE" in l]
         if not hdr:
@@ -604,20 +612,26 @@ def main():
             check("only one aggregate line is on screen",
                   sum("aggregate" in l for l in lines) == 1,
                   "\n".join(l for l in lines if "aggregate" in l))
-            # REGRESSION: slow was only ever shown as a total, so with two
-            # drives you could not tell which one was producing it.
-            check("the table has a per-drive SLOW column",
-                  "SLOW" in lines[i], lines[i])
-            # what the drive is doing *now*, which the cumulative report
-            # cannot show while a scan is still running
-            # writes are timed on their own: a drive whose writes crawl
-            # reads back at full speed, and the read columns hide it
-            for col in ("MED", "AVG", "MIN", "MAX", "WMED"):
-                check("the table has a %s latency column" % col,
+            # REGRESSION: the weak/slow count was only ever shown as a
+            # total, so with two drives you could not tell which one was
+            # producing it.
+            check("the table has a per-drive WEAK column",
+                  "WEAK" in lines[i], lines[i])
+            # WEAK and SLOW were two columns splitting one idea, and the
+            # split was never actionable: one column now, and the report
+            # carries the tries and errors behind each sector.
+            check("the table does not split weak sectors into two columns",
+                  "SLOW" not in lines[i], lines[i])
+            # the header carries the first row of a record; the second is
+            # labelled in place, and is checked against a running drive
+            # further down
+            for col in ("PCT", "RATE", "ETA", "STATE"):
+                check("the table has a %s column" % col,
                       col in lines[i], lines[i])
-            check("the latency columns say what unit and window they use",
-                  any("milliseconds over the last 30 seconds" in l
-                      for l in lines))
+            check("the table says what window and unit its numbers use",
+                  any("over the last 30 seconds" in l for l in lines))
+            check("the table has a RATE column",
+                  "RATE" in lines[i], lines[i])
 
         # A scan that ran for days must not scroll its result away the moment
         # it finishes: the summary holds the screen until a key, and 'n' goes
@@ -872,6 +886,104 @@ def main():
         check("a run small enough keeps the per-drive table",
               "LAST MESSAGE" not in "\n".join(s.screen.lines()),
               "the thirty-drive run should not be drawing the wide table")
+        s.send(b"q", 0.4)
+        s.close()
+
+        print("== a hundred drives, eighty columns ==")
+
+        # A shelf is the case this screen exists for, and eighty columns is
+        # the terminal everyone actually has.  Neither can be met by one row
+        # per drive, so a drive is two rows and a rule, and the table pages.
+        # Records written by hand: a hundred drives cannot be scanned for a
+        # test.
+        run = os.path.join(STATE, "runs", "20200404-050607")
+        os.makedirs(run, exist_ok=True)
+        pst = int(open("/proc/self/stat").read().rsplit(")", 1)[1].split()[19])
+        with open(os.path.join(run, "run"), "w") as f:
+            f.write("run 1\nid 20200404-050607\nkind scan\n"
+                    "what destructive write + verify\n"
+                    "detail destructive write + verify\n"
+                    "outdir %s\ncreated %d\nended 0\nsup %d\nsupstart %d\n"
+                    "njobs 100\n"
+                    % (tmp, int(time.time()) - 600, os.getpid(), pst))
+        for k in range(100):
+            with open(os.path.join(run, "sdk%03d.job" % k), "w") as f:
+                f.write("job 1\ndevice sdk%03d\npath /dev/sdk%03d\n"
+                        "model ST14000NM0168\nsize 14000519643136\n"
+                        "state 1\nverdict -1\npid %d\npidstart %d\n"
+                        "started %d\nupdated %d\npct %.1f\nrate 6320000\n"
+                        "eta 1915980\nbad 0\nweak %d\nbytes 22520000000000\n"
+                        "lat 47.70 76.30 36.30 264.70\nwlat 41.30\n"
+                        % (k, k, os.getpid(), pst, int(time.time()) - 600,
+                           int(time.time()), 13.5, 119 + k))
+
+        s = Session(["--attach", "20200404-050607", "--no-color"],
+                    rows=24, cols=80)
+        s.wait(lambda: s.on_screen("to a line") or s.on_screen("DRIVE"), 5.0)
+        # a hundred drives is too many for the table, so it opens on the
+        # overview, which pages too
+        check("a shelf opens on the overview",
+              s.on_screen("to a line"), "\n".join(s.screen.lines()[:12]))
+        check("the overview pages rather than dropping drives",
+              s.on_screen("page 1/"),
+              "\n".join(l for l in s.screen.lines() if "page" in l))
+        s.send(b"g", 0.6)
+        lines = s.screen.lines()
+        hdr = next((i for i, l in enumerate(lines)
+                    if "DRIVE" in l and "STATE" in l), -1)
+        check("g swaps the overview for the drive table", hdr >= 0,
+              "\n".join(lines[:12]))
+        if hdr >= 0:
+            first, second = lines[hdr + 1], lines[hdr + 2]
+            # if either row were wider than the terminal it would wrap and
+            # the pair would no longer line up like this
+            check("a drive is a row of its own, then a row of latency",
+                  first.lstrip().startswith("sdk") and
+                  " med " in second and " wmed " in second,
+                  "%r\n%r" % (first, second))
+            check("a rule separates one drive from the next",
+                  set(lines[hdr + 3].strip()) == {"-"} and
+                  lines[hdr + 4].lstrip().startswith("sdk"),
+                  "\n".join(lines[hdr + 1:hdr + 6]))
+            check("no row is wider than the terminal",
+                  all(len(l) <= 80 for l in lines) and
+                  not any(l.startswith("med") or l.startswith("h 1")
+                          for l in lines),
+                  "\n".join(lines))
+        page1 = [l for l in s.screen.lines() if l.lstrip().startswith("sdk")]
+        s.send(b">", 0.6)
+        page2 = [l for l in s.screen.lines() if l.lstrip().startswith("sdk")]
+        check("the table pages forward", bool(page1) and page1 != page2,
+              "page 1: %r\npage 2: %r" % (page1[:2], page2[:2]))
+        check("the footer says which page this is",
+              s.on_screen("page 2/"),
+              "\n".join(l for l in s.screen.lines() if "page" in l))
+        s.send(b"<", 0.6)
+        check("the table pages back",
+              [l for l in s.screen.lines() if l.lstrip().startswith("sdk")]
+              == page1, "did not return to the first page")
+        s.send(b"q", 0.4)
+        s.close()
+
+        # With colour the shaded background separates one drive from the
+        # next, so the rule is not drawn and does not cost a line: the same
+        # screen holds more drives.  Without colour there is nothing to see,
+        # which is why the rule is still there in the session above.
+        s = Session(["--attach", "20200404-050607"], rows=24, cols=80)
+        s.wait(lambda: s.on_screen("DRIVE") or s.on_screen("to a line"), 5.0)
+        s.send(b"g", 0.6)
+        lines = s.screen.lines()
+        rows = [l for l in lines if l.lstrip().startswith("sdk")]
+        check("colour separates drives without spending a line on a rule",
+              not any(l.strip() and set(l.strip()) == {"-"} for l in lines)
+              and len(rows) > len(page1),
+              "%d striped rows against %d ruled ones" % (len(rows), len(page1)))
+        raw = bytes(s.raw)
+        check("the terminal is asked which way its background goes",
+              b"\x1b]11;?" in raw, "no OSC 11 query in the stream")
+        check("every other drive is drawn on a background of its own",
+              raw.count(b"\x1b[48;5;") >= 2,
+              "%d background runs in the frame" % raw.count(b"\x1b[48;5;"))
         s.send(b"q", 0.4)
         s.close()
 
