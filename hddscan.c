@@ -2309,16 +2309,40 @@ static inline uint64_t splitmix64(uint64_t *x)
  * The pattern is derived from the byte offset, so a block written to the wrong
  * place on the platter fails verification even though it holds valid-looking
  * data.
+ *
+ * It is laid down in fixed units rather than per chunk, so what is on the
+ * platter does not depend on the chunk size it was written with.  Seeding the
+ * stream at each chunk's start did, and a pattern written in 1M chunks then
+ * checked in 128K ones failed at every 128K boundary: a decay run after a
+ * predeploy run with a different chunk would have called a healthy drive
+ * FAILING.  splitmix64 is a counter, so any word in a unit can be computed
+ * directly and a chunk may start anywhere.  The unit is 128 KiB because that
+ * was the default chunk, which keeps every pattern written before this change
+ * readable.
  */
+#define PAT_UNIT (128u * 1024u)
+
+static uint64_t pattern_state(uint64_t seed, uint64_t pos, uint64_t *unit_end)
+{
+	uint64_t base = pos - pos % PAT_UNIT;
+
+	*unit_end = base + PAT_UNIT;
+	return (seed ^ (base * 0x9E3779B97F4A7C15ull)) +
+	       (pos - base) / 8 * 0x9E3779B97F4A7C15ull;
+}
+
 static void pattern_fill(void *buf, size_t len, uint64_t off, uint64_t seed)
 {
-	uint64_t s = seed ^ (off * 0x9E3779B97F4A7C15ull);
 	uint8_t *p = buf;
+	uint64_t s = 0, end = 0;
 	size_t i;
 
 	for (i = 0; i + 8 <= len; i += 8) {
-		uint64_t v = splitmix64(&s);
+		uint64_t v;
 
+		if (off + i >= end)
+			s = pattern_state(seed, off + i, &end);
+		v = splitmix64(&s);
 		memcpy(p + i, &v, 8);
 	}
 	for (; i < len; i++)
@@ -2328,13 +2352,16 @@ static void pattern_fill(void *buf, size_t len, uint64_t off, uint64_t seed)
 static int pattern_check(const void *buf, size_t len, uint64_t off,
 			 uint64_t seed, uint64_t *bad_at)
 {
-	uint64_t s = seed ^ (off * 0x9E3779B97F4A7C15ull);
 	const uint8_t *p = buf;
+	uint64_t s = 0, end = 0;
 	size_t i;
 
 	for (i = 0; i + 8 <= len; i += 8) {
-		uint64_t v = splitmix64(&s), got;
+		uint64_t v, got;
 
+		if (off + i >= end)
+			s = pattern_state(seed, off + i, &end);
+		v = splitmix64(&s);
 		memcpy(&got, p + i, 8);
 		if (got != v) {
 			if (bad_at)

@@ -144,6 +144,21 @@ assert_has "the report gives a mkfs line for it" "$out" "mkfs.ext4 -b 4096"
 assert_has "the report warns the drive off arrays and pools" "$out" \
 	"mdraid array or a"
 
+# REGRESSION: the pattern was seeded at each chunk's start, so what was on
+# the platter depended on the chunk size it was written with.  Predeploy
+# moving to 1M chunks while decay stayed at 128K would have made every decay
+# run call a healthy drive FAILING.  12 KiB divides neither the unit nor 1M.
+f=$(image 16 chunkpat.bin)
+run --mode write --chunk 1M --confirm "$f" "$f" >/dev/null
+cp=0
+for c in 128K 4M 12K; do
+	n=$(run --mode check --chunk "$c" "$f" | awk '/wrong data/{print $5}')
+	[ "$n" = "0" ] || { cp=1; echo "     checked in $c: $n bad blocks"; }
+done
+[ "$cp" = 0 ] && ok "a pattern reads back whatever chunk size wrote it" \
+              || bad "a pattern reads back whatever chunk size wrote it" \
+                     "see above"
+
 echo "== the report must not contradict itself =="
 
 # REGRESSION: percentiles came from bucket interpolation and were reported as

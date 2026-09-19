@@ -370,6 +370,12 @@ scans of the same drive incomparable. **Chunk size** is a field on the form so
 the trade is one keystroke away when you want it, and `--sector-slow-ms` buys
 back the sensitivity at the cost of more drill-downs.
 
+The write pattern does not depend on the chunk size. It used to be
+seeded at each chunk's start, so a drive written in 1 MiB chunks and checked by
+`decay` at 128 KiB read back as wrong data at every 128 KiB boundary; it is now
+laid down in fixed 128 KiB units, which also keeps every pattern written at the
+old default readable.
+
 Write modes pay this twice, once for the write and once for the read-back that
 verifies it, which is why `--mode write` feels roughly half as fast as a read
 scan. The same fix applies and matters twice as much.
