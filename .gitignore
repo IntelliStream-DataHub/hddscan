@@ -1,0 +1,6 @@
+# What the Makefile builds. Anchored, so hddscan.c and hddscan.8 are safe.
+/hddscan
+/hddscan-static
+
+# What running tests/tui.py leaves behind.
+__pycache__/
