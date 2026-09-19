@@ -24,10 +24,9 @@
 <main>
 <section class="hero">
 	<div class="wrap">
-		<h1>Find the sectors that are <em>dying</em>, not just the ones already dead.</h1>
-		<p class="lead">hddscan times every read on a spinning disk and flags the
-		sectors the drive is quietly struggling with: the failure SMART reports
-		as OK.</p>
+		<h1><em>Slow</em> sectors are tomorrow’s bad sectors.</h1>
+		<p class="lead">SMART counts sectors that have already failed. hddscan
+		times every read, and finds the ones that are about to.</p>
 		<div class="cta">
 			<a class="btn primary" href="guide.html">Read the guide</a>
 			<a class="btn" href="https://github.com/IntelliStream-DataHub/hddscan">Source on GitHub</a>
@@ -36,6 +35,21 @@
 			<img src="img/tui-dashboard.svg" width="879" height="599"
 			     alt="The hddscan dashboard: 24 drives in a write test, five still scanning with their rate, weak-sector count and latency, the finished ones with their verdicts.">
 		</figure>
+	</div>
+</section>
+
+<section class="band">
+	<div class="wrap narrow">
+		<p class="kicker">Quick start</p>
+		<h2>Build it and run it</h2>
+<pre><code>git clone https://github.com/IntelliStream-DataHub/hddscan
+cd hddscan
+make                 # or: make static, for a binary with no glibc floor
+sudo ./hddscan       # opens the form</code></pre>
+		<p>The default profile writes, so a bare <code>hddscan /dev/sdb</code>
+		stops and asks for <code>--confirm</code> instead of doing anything:
+		an error, never data loss. For a drive with data on it, use
+		<code>--profile inservice</code>, which never writes.</p>
 	</div>
 </section>
 
@@ -179,42 +193,11 @@
 	</div>
 </section>
 
-<section class="band">
-	<div class="wrap narrow">
-		<p class="kicker">Quick start</p>
-		<h2>Build it and run it</h2>
-<pre><code>git clone https://github.com/IntelliStream-DataHub/hddscan
-cd hddscan
-make                 # or: make static, for a binary with no glibc floor
-sudo ./hddscan       # opens the form</code></pre>
-		<p>The default profile writes, so a bare <code>hddscan /dev/sdb</code>
-		stops and asks for <code>--confirm</code> instead of doing anything:
-		an error, never data loss. For a drive with data on it, use
-		<code>--profile inservice</code>, which never writes.</p>
-	</div>
-</section>
-
-<section class="band">
-	<div class="wrap narrow">
-		<p class="kicker">Honest about its limits</p>
-		<h2>What it has not been proven on</h2>
-		<p>The test suite runs against image files, with no root and no real
-		drive, so some paths have only been read, not run.
-		<a href="https://github.com/IntelliStream-DataHub/hddscan/blob/main/DESIGN.md#what-was-verified-during-development">DESIGN.md</a>
-		lists them, including:</p>
-		<ul class="limits">
-			<li>The <code>EIO</code> path from genuinely unreadable media</li>
-			<li>Shingled (SMR) drive gating</li>
-			<li>Loading a device-mapper map on a live system</li>
-			<li>The ATA half of the look-ahead control</li>
-		</ul>
-	</div>
-</section>
 </main>
 
 <footer>
 	<div class="wrap">
-		<span>hddscan · MIT licence · © 2026 Olav Gjerde</span>
+		<span>hddscan · MIT licence · © 2026 Olav Gjerde, IntelliStream AS</span>
 		<span><a href="guide.html">Guide</a> · <a href="https://github.com/IntelliStream-DataHub/hddscan">GitHub</a></span>
 	</div>
 </footer>

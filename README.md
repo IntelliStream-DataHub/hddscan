@@ -80,7 +80,7 @@ doing anything — an error, never data loss.
 ## Using a damaged drive anyway
 
 A drive with a few hundred bad sectors can still be a good backup target, as
-long as nothing is stored on them. ext4 can take a list of them at `mkfs` time,
+long as we make the bad/weak sectors inaccessible. ext4 can take a list of them at `mkfs` time,
 and the report prints the commands. For any other filesystem (ZFS, btrfs,
 XFS), hddscan can cut the damage out one layer down instead:
 

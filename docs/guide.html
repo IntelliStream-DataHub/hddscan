@@ -288,7 +288,8 @@ listed as not covered rather than counted as either good or bad.</p>
 
 <h3 id="hide">Hiding bad blocks</h3>
 <p>A drive with a few hundred bad sectors can still be a good backup target,
-as long as nothing is stored on them. There are two ways to arrange that:</p>
+as long as we make the bad/weak sectors inaccessible. There are two ways to
+arrange that:</p>
 <ul>
 	<li><b>ext2/3/4</b> can take a list of bad blocks when the filesystem is
 	made. The report prints the commands, with the numbers filled in.</li>
@@ -678,7 +679,7 @@ mode: <a href="#opt-mode"><code>--mode</code></a> read on predeploy saves nothin
 
 <footer>
 	<div class="wrap">
-		<span>hddscan · MIT licence · © 2026 Olav Gjerde</span>
+		<span>hddscan · MIT licence · © 2026 Olav Gjerde, IntelliStream AS</span>
 		<span><a href="./">Home</a> · <a href="https://github.com/IntelliStream-DataHub/hddscan">GitHub</a></span>
 	</div>
 </footer>
