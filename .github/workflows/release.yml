@@ -1,0 +1,96 @@
+# Push a tag v<VERSION> (the VERSION in hddscan.c) and this builds a static
+# Linux binary for each architecture on its own hardware, tests that exact
+# binary, and attaches the tarballs to a *draft* release.  Nothing is
+# published until someone reads the draft and presses the button.
+#
+#   git tag v1.0 && git push origin v1.0
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (must already exist)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: static build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      # a tarball called 1.1 holding a binary that says 1.0 is a support
+      # question waiting to happen
+      - name: Tag matches the version in the source
+        run: |
+          v=$(sed -n 's/^#define VERSION "\(.*\)"/\1/p' hddscan.c)
+          if [ "v$v" != "$TAG" ]; then
+            echo "::error::tag $TAG but hddscan.c says VERSION \"$v\""
+            exit 1
+          fi
+
+      - name: Build the release tarball
+        run: make dist ARCH=${{ matrix.arch }}
+
+      # Test the binary that ships, not a sibling of it: unpack the tarball
+      # and run every suite against what is inside.
+      - name: Test the shipped binary
+        run: |
+          d=$(basename hddscan-*-linux-${{ matrix.arch }}.tar.gz .tar.gz)
+          tar xzf "$d.tar.gz"
+          file "$d/hddscan" | grep -q 'statically linked'
+          "$d/hddscan" --version
+          "$d/dm-badblocks" --help >/dev/null
+          HDDSCAN="$d/hddscan" tests/cli.sh
+          BIN="$d/hddscan dm" bash tests/dm.sh
+          HDDSCAN="$d/hddscan" python3 tests/tui.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hddscan-linux-${{ matrix.arch }}
+          path: |
+            hddscan-*-linux-${{ matrix.arch }}.tar.gz
+            hddscan-*-linux-${{ matrix.arch }}.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    name: draft release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create the draft, or refresh its files
+        run: |
+          ls -l dist
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" dist/* --draft --generate-notes \
+              --title "hddscan ${TAG#v}" --repo "$GITHUB_REPOSITORY"
+          fi

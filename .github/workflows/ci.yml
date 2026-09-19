@@ -1,0 +1,58 @@
+# Every push and pull request: the build must stay warning-free, every suite
+# must pass, and neither the man page nor the site may drift from --help.
+# Nothing here has root or a real drive; the suites run against image files,
+# exactly as they do on a developer's machine.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: build and test (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      # AGENTS.md: -Wall -Wextra -Wshadow -Wformat=2 must stay silent.  CI is
+      # where a compiler newer or older than the author's gets a say.
+      - name: Build, warnings as errors
+        run: >
+          make CFLAGS="-O2 -g -std=c11 -Wall -Wextra -Wshadow -Wformat=2
+          -Wno-unused-parameter -Werror"
+
+      - name: Test suites (cli, dm, tui)
+        run: make test
+
+      - name: Man page agrees with --help
+        run: make mancheck
+
+      - name: Site option reference agrees with --help
+        run: make sitecheck
+
+      # The binary that ships is the static one, so it is the one tested too.
+      - name: Static build, and the suites against it
+        run: |
+          make static
+          file hddscan-static | grep -q 'statically linked'
+          HDDSCAN=./hddscan-static tests/cli.sh
+          BIN="./hddscan-static dm" bash tests/dm.sh
+
+      - name: glibc floor of the dynamic build
+        run: |
+          echo "dynamic build needs glibc $(nm -D --undefined-only hddscan \
+            | grep -oE 'GLIBC_[0-9.]+' | sort -uV | tail -1)"

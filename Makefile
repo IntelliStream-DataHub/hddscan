@@ -23,6 +23,26 @@ $(BIN): $(SRC)
 static: $(SRC)
 	$(CC) $(CFLAGS) -static -o $(BIN)-static $< $(LDFLAGS)
 
+# A release tarball: the static binary, stripped, with the man page, the boot
+# unit for the device-mapper maps, and the licence.  The same target builds the
+# GitHub release, so what is published can be reproduced by hand.
+VERSION := $(shell sed -n 's/^\#define VERSION "\(.*\)"/\1/p' $(SRC))
+ARCH    ?= $(shell uname -m)
+DIST    := $(BIN)-$(VERSION)-linux-$(ARCH)
+
+dist: static
+	rm -rf $(DIST) $(DIST).tar.gz $(DIST).tar.gz.sha256
+	mkdir -p $(DIST)/contrib
+	cp $(BIN)-static $(DIST)/$(BIN)
+	strip $(DIST)/$(BIN)
+	ln -s $(BIN) $(DIST)/dm-badblocks
+	cp $(MAN) README.md LICENSE $(DIST)/
+	cp contrib/dm-badblocks.service $(DIST)/contrib/
+	tar czf $(DIST).tar.gz --owner=0 --group=0 $(DIST)
+	sha256sum $(DIST).tar.gz > $(DIST).tar.gz.sha256
+	rm -rf $(DIST)
+	@echo "$(DIST).tar.gz"
+
 install: $(BIN)
 	install -d $(DESTDIR)$(PREFIX)/sbin
 	install -m 0755 $(BIN) $(DESTDIR)$(PREFIX)/sbin/$(BIN)
@@ -57,6 +77,6 @@ sitecheck: $(BIN)
 	@python3 tools/options.py --check
 
 clean:
-	rm -f $(BIN) $(BIN)-static
+	rm -f $(BIN) $(BIN)-static $(BIN)-*-linux-*.tar.gz*
 
-.PHONY: all static install clean mancheck sitecheck site test
+.PHONY: all static dist install clean mancheck sitecheck site test

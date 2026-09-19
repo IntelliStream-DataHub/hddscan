@@ -23,6 +23,17 @@ make
 sudo ./hddscan            # opens the form
 ```
 
+Or take a static binary for x86_64 or aarch64 from
+[Releases](https://github.com/IntelliStream-DataHub/hddscan/releases): one
+file, no glibc version floor, tested on its own architecture before it was
+published.
+
+```sh
+tar xzf hddscan-1.0-linux-x86_64.tar.gz
+sudo install hddscan-1.0-linux-x86_64/hddscan /usr/local/sbin/
+sudo ln -sf hddscan /usr/local/sbin/dm-badblocks   # optional: the map tool's own name
+```
+
 ## Quick start
 
 Run it on a terminal with no arguments and it opens a picker: choose drives,
