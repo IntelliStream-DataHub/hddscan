@@ -466,7 +466,12 @@ bandck() {
 	printf 'band 200 64 0 0 0 %s 0 8388608\n' "$1" >> "$TMP/band.ckpt"
 	run --state "$TMP/band.ckpt" --resume --json "$TMP/band.json" "$f"
 }
-out=$(bandck 6400000)
+# REGRESSION: the map's shading is relative, and the band had 100 ms a chunk
+# against the one chunk the resume reads for real.  A cold O_DIRECT read of a
+# file dd has only just written can take longer than that on a slow runner,
+# and on aarch64 CI it did: the fresh chunk became the '@' and the band from
+# the checkpoint a '.'.  Ten seconds a chunk is beyond any read that returns.
+out=$(bandck 640000000)
 assert_has "a band far slower than calibration expects is SUSPECT" \
 	"$out" "VERDICT: SUSPECT - 1 band of the surface"
 assert_has "the report says where the slow band is" "$out" "worst"
