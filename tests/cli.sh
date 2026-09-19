@@ -52,9 +52,11 @@ patterned() {
 # runner's shared disk now and then takes longer than that for one read.  A
 # clean image then came back SUSPECT and the badblocks lists carried sectors
 # nothing was wrong with.  What these tests check is where damage is and what
-# is said about it, not how fast a runner reads, so the floor is a second;
-# a test about the budget itself asks for the real floor, or its own
-# thresholds, and the last of a repeated option is the one that counts.
+# is said about it, not how fast a runner reads, so the floor is a second.
+# The floor raises an explicit --chunk-slow-ms too, so a test that needs its
+# threshold to mean exactly that number passes the floor it needs as well --
+# the last of a repeated option is the one that counts -- and so does a test
+# about the budget itself.
 FLOOR="--floor-ms 1000"
 run() { $HDDSCAN --no-color --outdir "$TMP" --profile inservice $FLOOR "$@" 2>&1; }
 runp() { $HDDSCAN --no-color --outdir "$TMP" $FLOOR "$@" 2>&1; }
@@ -256,8 +258,14 @@ badpct=$(awk -v a="$p50" -v b="$p95" -v c="$p99" -v d="$p999" -v m="$mx" \
 
 # REGRESSION: the "reads exceeding N ms" table counted whole histogram buckets,
 # so it claimed 284 reads over 25 ms while the exact counter said 0.
+#
+# On the shipped floor, not the suite's second: the floor raises even an
+# explicit threshold, so under it this scan judged chunks against 1000 ms
+# while the tier table counted reads over 25, and one slow read on a CI
+# runner set the two apart.  Here 25 is 25 on both sides, whatever a read
+# costs.
 f=$(image 24 tier.bin)
-out=$(run --chunk-slow-ms 25 "$f")
+out=$(run --floor-ms 25 --chunk-slow-ms 25 "$f")
 tier=$(awk '/> +25 ms/{print $5}' <<<"$out")
 budg=$(awk '/chunks over budget/{print $4}' <<<"$out")
 assert_eq "tier table agrees with the exact over-budget counter" "$tier" "$budg"
