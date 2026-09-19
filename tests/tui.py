@@ -235,9 +235,13 @@ def drawn_widths(raw):
 
 
 def img(d, name, mb):
+    # synced, as in cli.sh: an O_DIRECT read of pages still waiting for
+    # writeback waits with them, and a scan would time the wait
     p = os.path.join(d, name)
     with open(p, "wb") as f:
         f.write(os.urandom(mb << 20))
+        f.flush()
+        os.fsync(f.fileno())
     return p
 
 

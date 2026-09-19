@@ -31,9 +31,11 @@ assert_eq() {
 	if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "want [$3] got [$2]"; fi
 }
 
-# image SIZE_MB NAME -> path to a fresh random image
+# image SIZE_MB NAME -> path to a fresh random image.  Synced before the scan
+# sees it: an O_DIRECT read of a range still dirty in the page cache waits for
+# its writeback, and on a CI disk that wait made clean images read slow.
 image() {
-	dd if=/dev/urandom of="$TMP/$2" bs=1M count="$1" status=none
+	dd if=/dev/urandom of="$TMP/$2" bs=1M count="$1" conv=fsync status=none
 	echo "$TMP/$2"
 }
 # a written image carries a valid hddscan pattern
@@ -45,8 +47,17 @@ patterned() {
 # Most tests below are read-oriented, and the shipped default profile is
 # predeploy (which writes).  Ask for the non-destructive profile explicitly so
 # each test says what it is testing; the default itself is asserted separately.
-run() { $HDDSCAN --no-color --outdir "$TMP" --profile inservice "$@" 2>&1; }
-runp() { $HDDSCAN --no-color --outdir "$TMP" "$@" 2>&1; }
+#
+# REGRESSION: every scan here used the auto budget's floor of 25 ms, and a CI
+# runner's shared disk now and then takes longer than that for one read.  A
+# clean image then came back SUSPECT and the badblocks lists carried sectors
+# nothing was wrong with.  What these tests check is where damage is and what
+# is said about it, not how fast a runner reads, so the floor is a second;
+# a test about the budget itself asks for the real floor, or its own
+# thresholds, and the last of a repeated option is the one that counts.
+FLOOR="--floor-ms 1000"
+run() { $HDDSCAN --no-color --outdir "$TMP" --profile inservice $FLOOR "$@" 2>&1; }
+runp() { $HDDSCAN --no-color --outdir "$TMP" $FLOOR "$@" 2>&1; }
 
 echo "== profiles decide what a run does =="
 
@@ -175,7 +186,7 @@ echo "== hiding the damage behind device-mapper =="
 # The map is written for real -- it is this binary's own code -- and read back
 # with 'hddscan dm'.  Only activation needs device-mapper, and an image stops
 # short of it and says so.
-hide() { $HDDSCAN --no-color --outdir "$TMP" "$@" 2>&1; }
+hide() { $HDDSCAN --no-color --outdir "$TMP" $FLOOR "$@" 2>&1; }
 
 f=$(patterned 16 hide.bin)
 printf 'BADBADBAD' | dd of="$f" bs=1 seek=8388608 conv=notrunc status=none
@@ -253,6 +264,10 @@ assert_eq "tier table agrees with the exact over-budget counter" "$tier" "$budg"
 
 echo "== budgets and calibration =="
 
+# the budget itself is what this section is about, so it is the shipped one;
+# nothing here reads a verdict a slow runner could change
+FLOOR=
+
 # REGRESSION: the calibration line hardcoded "128K" whatever --chunk said.
 f=$(image 96 chunk.bin)
 assert_has "calibration reports the chunk size actually used" \
@@ -292,6 +307,7 @@ assert_has "an explicit --chunk-slow-ms stays flat" \
 	"$(run --chunk-slow-ms 25 "$f")" "chunk 25.0 ms, sector 25.0 ms"
 assert_hasnt "an explicit --sector-slow-ms stays flat" \
 	"$(run --sector-slow-ms 30 "$f")" "following the drive's own gradient"
+FLOOR="--floor-ms 1000"
 
 echo "== arguments that must be refused =="
 
