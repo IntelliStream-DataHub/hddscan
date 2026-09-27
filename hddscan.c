@@ -77,7 +77,7 @@
 #define DRATE_WINDOW_S 30   /* the trailing window RATE and ETA are shown over */
 #define DRATE_STEP_S 2      /* how often that window moves */
 #define DRATE_STEPS (DRATE_WINDOW_S / DRATE_STEP_S + 1)
-#define STATE_VERSION 2     /* --state file layout; see state_load() */
+#define STATE_VERSION 3     /* --state file layout; see state_load() */
 #define MAX_RETRIES 1000
 #define N_BANDS 512
 #define MAX_FINDINGS 200000
@@ -441,6 +441,14 @@ typedef struct {
 	long long started, updated, ended;
 	double pct, rate, eta;
 	uint64_t bad, weak, bytes;
+	/*
+	 * Chunk reads over their budget, out of how many were read.  A drive
+	 * whose slowness is spread across whole chunks rather than sitting in
+	 * a few sectors drills every chunk and finds nothing to count as weak,
+	 * so without this the one number that is climbing never reaches the
+	 * screen.  skipped is what --skip-slow jumped over without reading.
+	 */
+	uint64_t slow, chunks, skipped;
 	int too_slow;           /* under the throughput floor, see rate_judge() */
 	double lat_med, lat_avg, lat_min, lat_max;
 	double wlat_med;        /* 0 when nothing has been written */
@@ -647,6 +655,10 @@ static void jrec_put(const jrec_t *j)
 		j->bad, j->weak, j->bytes);
 	fprintf(f, "lat %.2f %.2f %.2f %.2f\n", j->lat_med, j->lat_avg,
 		j->lat_min, j->lat_max);
+	if (j->chunks)
+		fprintf(f, "over %" PRIu64 " %" PRIu64 "\n", j->slow, j->chunks);
+	if (j->skipped)
+		fprintf(f, "skipped %" PRIu64 "\n", j->skipped);
 	if (j->too_slow)
 		fprintf(f, "tooslow 1\n");
 	if (j->wlat_med > 0)
@@ -712,6 +724,10 @@ static int jrec_get(const char *path, jrec_t *j)
 			j->verdict = atoi(v);
 		else if (!strcmp(k, "tooslow"))
 			j->too_slow = atoi(v);
+		else if (!strcmp(k, "over"))
+			sscanf(v, "%" SCNu64 " %" SCNu64, &j->slow, &j->chunks);
+		else if (!strcmp(k, "skipped"))
+			j->skipped = strtoull(v, NULL, 10);
 		else if (!strcmp(k, "wlat"))
 			j->wlat_med = atof(v);
 		else if (!strcmp(k, "blat"))
@@ -2640,7 +2656,22 @@ typedef struct {
 	uint64_t sum_us;
 	uint64_t max_us;
 	uint64_t bytes;
+	uint64_t skipped;       /* condemned by --skip-slow without being read */
 } band_t;
+
+/*
+ * A stretch --skip-slow condemned, in steps of the scan order: [s0, s1) is
+ * condemned, and [k0, s1) of that was jumped over without being read -- the
+ * part before k0 is the run of slow chunks that set the skip off, which was
+ * scanned in full.  off and len are the same condemned stretch in bytes, for
+ * everything downstream that knows nothing of steps.
+ */
+typedef struct {
+	uint64_t s0, k0, s1;
+	uint64_t off, len;
+} skip_t;
+
+#define SKIP_WIN_MAX 1024
 
 typedef struct {
 	uint64_t us;
@@ -2719,6 +2750,8 @@ typedef struct {
 	int rewrite_weak;
 	int force_remap;
 	int second_pass;
+	int skip_slow;          /* --skip-slow: see skip_ahead() */
+	int pass;               /* 0 the first pass over the device, 1 after */
 	uint64_t seed;
 	uint64_t max_time;
 	uint64_t max_errors;
@@ -2784,6 +2817,16 @@ typedef struct {
 
 	band_t bands[N_BANDS];
 	topslow_t top[TOP_SLOW];
+
+	/* the trailing window --skip-slow judges, and what it condemned */
+	uint64_t sw_step[SKIP_WIN_MAX];
+	unsigned char sw_over[SKIP_WIN_MAX];
+	int sw_len, sw_n, sw_head, sw_cnt;
+	skip_t *skips;
+	int nskip, skipcap;
+	uint64_t skip_bytes;    /* condemned and never read */
+	uint64_t skip_cond;     /* condemned in all, read or not */
+	uint64_t skip_probes;   /* reads spent finding the edges */
 
 	finding_t *find;
 	int nfind, findcap;
@@ -3648,6 +3691,61 @@ static void *alloc_aligned(size_t len)
 }
 
 /* one timed pread; returns bytes read or -1, latency always reported */
+/*
+ * For the suite and nothing else: an image file never reads slowly, so
+ * nothing about a slow region -- --skip-slow above all -- could be tested
+ * without one.  HDDSCAN_SLOW names byte ranges as OFF:LEN[,OFF:LEN...], and
+ * every read overlapping one is *reported* HDDSCAN_SLOW_MS (default 200)
+ * milliseconds per MiB slower than it was.  Reported, not slept: the result
+ * is exact and costs no time.  Scaling by length is what a drive whose
+ * slowness is spread across the surface looks like -- a 1 MiB chunk misses
+ * its budget while each 4 KiB sector inside it comes back comfortably.
+ */
+#define SLOW_INJ_MAX 8
+static struct {
+	uint64_t off, len;
+} g_slow_inj[SLOW_INJ_MAX];
+static int g_slow_n = -1;
+static double g_slow_ms;
+
+static uint64_t slow_injected(uint64_t off, size_t len)
+{
+	uint64_t extra = 0;
+	int i;
+
+	if (g_slow_n < 0) {
+		const char *e = getenv("HDDSCAN_SLOW"), *m;
+		char buf[512], *save = NULL, *tok;
+
+		g_slow_n = 0;
+		m = getenv("HDDSCAN_SLOW_MS");
+		g_slow_ms = m ? atof(m) : 200.0;
+		if (e && strlen(e) < sizeof(buf)) {
+			snprintf(buf, sizeof(buf), "%s", e);
+			for (tok = strtok_r(buf, ",", &save);
+			     tok && g_slow_n < SLOW_INJ_MAX;
+			     tok = strtok_r(NULL, ",", &save)) {
+				char *colon = strchr(tok, ':');
+
+				if (!colon)
+					continue;
+				*colon = 0;
+				if (parse_size(tok, &g_slow_inj[g_slow_n].off) ||
+				    parse_size(colon + 1,
+					       &g_slow_inj[g_slow_n].len))
+					continue;
+				g_slow_n++;
+			}
+		}
+	}
+	for (i = 0; i < g_slow_n; i++)
+		if (off < g_slow_inj[i].off + g_slow_inj[i].len &&
+		    off + len > g_slow_inj[i].off)
+			extra = (uint64_t)(g_slow_ms * 1000.0 *
+					   (double)len / (1024.0 * 1024.0));
+	return extra;
+}
+
 static ssize_t timed_pread(int fd, void *buf, size_t len, uint64_t off,
 			   uint64_t *us, int *err)
 {
@@ -3656,6 +3754,8 @@ static ssize_t timed_pread(int fd, void *buf, size_t len, uint64_t off,
 
 	*us = now_us() - t0;
 	*err = (r < 0) ? errno : 0;
+	if (g_slow_n)
+		*us += slow_injected(off, len);
 	return r;
 }
 
@@ -4409,6 +4509,26 @@ static void progress(ctx_t *c, int final)
 		    c->dev->name, c_yel(), human_time(eta_avg, b3, sizeof(b3)),
 		    c_off(), c->retry_ios, c->chunks_read);
 	}
+	/*
+	 * The other way a scan stops covering the surface: nearly every chunk
+	 * over budget and drilled, nearly every sector inside back in time,
+	 * so the time goes on single-sector reads that find nothing.
+	 */
+	if (!c->stall_warned && el > 900 && eta_avg > 30.0 * 24 * 3600 &&
+	    c->chunks_slow * 2 > c->chunks_read && !c->skip_slow &&
+	    c->order != ORD_RANDOM && c->sample <= 1) {
+		c->stall_warned = 1;
+		msg(PROG ": %s: %sat this rate this scan needs %s%s, and %"
+		    PRIu64 " of %" PRIu64 " chunks\n"
+		    "         have been over budget: the drive is slow across "
+		    "whole regions, not in\n"
+		    "         single sectors, and drilling into each chunk finds "
+		    "little.  Stop it and\n"
+		    "         re-run with --skip-slow to condemn such regions "
+		    "without reading them.\n",
+		    c->dev->name, c_yel(), human_time(eta_avg, b3, sizeof(b3)),
+		    c_off(), c->chunks_slow, c->chunks_read);
+	}
 
 	/*
 	 * Hand the numbers to whoever is watching.  This is the only channel
@@ -4436,6 +4556,9 @@ static void progress(ctx_t *c, int final)
 		g_job.eta = eta;
 		g_job.bad = c->blocks_bad + c->blocks_corrupt;
 		g_job.weak = c->blocks_weak;
+		g_job.slow = c->chunks_slow;
+		g_job.chunks = c->chunks_read;
+		g_job.skipped = c->skip_bytes;
 		g_job.too_slow = c->too_slow;
 		g_job.bytes = c->bytes_done;
 		g_job.lat_med = med;
@@ -4484,6 +4607,8 @@ static void progress(ctx_t *c, int final)
  * checkpoint / resume
  * ------------------------------------------------------------------ */
 
+static skip_t *skip_add(ctx_t *c);
+
 static void state_save(ctx_t *c)
 {
 	char tmp[PATH_MAX];
@@ -4505,6 +4630,17 @@ static void state_save(ctx_t *c)
 		c->pos, c->step, (int)c->order);
 	fprintf(f, "start %" PRIu64 "\nend %" PRIu64 "\n", c->start, c->end);
 	fprintf(f, "bytes %" PRIu64 "\n", c->bytes_done);
+	/*
+	 * What --skip-slow condemned.  "skipped" is what ckpt_whole() adds to
+	 * the bytes read, so it must be written before the first finding --
+	 * which is where that reader stops.
+	 */
+	if (c->nskip)
+		fprintf(f, "skipped %" PRIu64 "\n", c->skip_bytes);
+	for (i = 0; i < c->nskip; i++)
+		fprintf(f, "skip %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64
+			" %" PRIu64 "\n", c->skips[i].s0, c->skips[i].k0,
+			c->skips[i].s1, c->skips[i].off, c->skips[i].len);
 	fprintf(f, "counters %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64
 		" %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 "\n",
 		c->chunks_read, c->chunks_slow, c->chunks_err, c->blocks_drilled,
@@ -4520,11 +4656,12 @@ static void state_save(ctx_t *c)
 	for (i = 0; i < N_BANDS; i++) {
 		const band_t *b = &c->bands[i];
 
-		if (b->chunks)
+		if (b->chunks || b->skipped)
 			fprintf(f, "band %d %" PRIu64 " %" PRIu64 " %" PRIu64
 				" %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64
-				"\n", i, b->chunks, b->slow_chunks, b->bad_blocks,
-				b->slow_blocks, b->sum_us, b->max_us, b->bytes);
+				" %" PRIu64 "\n", i, b->chunks, b->slow_chunks,
+				b->bad_blocks, b->slow_blocks, b->sum_us, b->max_us,
+				b->bytes, b->skipped);
 	}
 	fprintf(f, "chunklat %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 "\n",
 		c->chunk_lat.count, c->chunk_lat.sum_us,
@@ -4574,9 +4711,13 @@ static int state_usable(FILE *f, const ctx_t *c)
 	 * Version 1 wrote a counters line of eleven fields and finding states
 	 * numbered against the old six-state enum, both of which would land
 	 * in the wrong places here.  A scan that old restarts rather than
-	 * resumes into nonsense.
+	 * resumes into nonsense.  Version 3 only added the lines --skip-slow
+	 * writes, so a version 2 file is a version 3 file without any; the
+	 * number went up so that a build which cannot read those lines
+	 * restarts rather than resuming past a region it does not know was
+	 * never read.
 	 */
-	if (ver != STATE_VERSION) {
+	if (ver != STATE_VERSION && ver != 2) {
 		msg(PROG ": state file is format %d, this build writes %d "
 		    "- ignoring\n", ver, STATE_VERSION);
 		return 0;
@@ -4621,11 +4762,28 @@ static int state_load(ctx_t *c)
 
 			memset(&b, 0, sizeof(b));
 			if (sscanf(line + 5, "%d %" SCNu64 " %" SCNu64 " %" SCNu64
-				   " %" SCNu64 " %" SCNu64 " %" SCNu64 " %" SCNu64,
+				   " %" SCNu64 " %" SCNu64 " %" SCNu64 " %" SCNu64
+				   " %" SCNu64,
 				   &bi, &b.chunks, &b.slow_chunks, &b.bad_blocks,
 				   &b.slow_blocks, &b.sum_us, &b.max_us,
-				   &b.bytes) == 8 && bi >= 0 && bi < N_BANDS)
+				   &b.bytes, &b.skipped) >= 8 && bi >= 0 &&
+			    bi < N_BANDS)
 				c->bands[bi] = b;
+		} else if (!strncmp(line, "skipped ", 8)) {
+			c->skip_bytes = strtoull(line + 8, NULL, 10);
+		} else if (!strncmp(line, "skip ", 5)) {
+			skip_t k;
+
+			if (sscanf(line + 5, "%" SCNu64 " %" SCNu64 " %" SCNu64
+				   " %" SCNu64 " %" SCNu64, &k.s0, &k.k0, &k.s1,
+				   &k.off, &k.len) == 5) {
+				skip_t *x = skip_add(c);
+
+				if (x) {
+					*x = k;
+					c->skip_cond += k.len;
+				}
+			}
 		} else if (!strncmp(line, "slowstretch ", 12)) {
 			sscanf(line + 12, "%" SCNu64 " %lf %" SCNu64, &c->slow_secs,
 			       &c->slow_worst, &c->slow_worst_pos);
@@ -5111,6 +5269,280 @@ static void check_temperature(ctx_t *c)
 	}
 }
 
+/* ------------------------------------------------------------------ *
+ * --skip-slow: stepping over a region that is slow as a whole
+ *
+ * A drive whose trouble is spread over a region -- every chunk over budget,
+ * hardly a sector inside one that is slow on its own -- is the worst case
+ * for drill-down.  Each chunk is re-read a sector at a time, each sector
+ * behind a cache-busting seek, and nearly all of it comes back in budget, so
+ * the scan crawls through the region at a few hundred KiB a second and finds
+ * almost nothing to count.  Hundreds of gigabytes of that is weeks.
+ *
+ * So once most of a trailing window of chunks has been over budget, stop
+ * reading the region and find where it ends instead: probe a short run of
+ * chunks 1 GiB further on, and again, until a probe comes back in budget;
+ * then bisect between the last slow probe and that one down to 16 MiB, and
+ * resume the ordinary scan there.  What was jumped over is condemned: it is
+ * written down as a slow region, --hide-bad cuts it out with the rest of the
+ * damage, and the report says -- on its Coverage line and under the verdict
+ * -- that it was never read.  Condemning is the safe direction to be wrong
+ * in: the cost is capacity, never data.
+ *
+ * Every probe is judged against the same per-offset budget as the scan
+ * (invariant 1b).  A region is slow because calibration says it should be
+ * quicker there, never because it is slower than its neighbours.
+ *
+ * Only for an order that walks the drive: sequential or reverse, unsampled.
+ * A random order has no "further on", and a sampled scan has not read
+ * enough of anything to condemn it.
+ * ------------------------------------------------------------------ */
+#define SKIP_WIN_BYTES (64ull << 20)    /* how much slow reading is "a while" */
+#define SKIP_WIN_MIN 32
+#define SKIP_OVER_NUM 3                 /* ... of which three quarters over */
+#define SKIP_OVER_DEN 4
+#define SKIP_JUMP (1ull << 30)
+#define SKIP_RES (16ull << 20)
+#define SKIP_PROBE_BYTES (8ull << 20)
+#define SKIP_PROBE_MIN 4
+#define SKIP_PROBE_MAX 64
+#define MAX_SKIPS 4096
+
+/* the bytes [a, b) covers in the scan order, which only ever walks */
+static void steps_extent(const ctx_t *c, uint64_t a, uint64_t b,
+			 uint64_t *off, uint64_t *len)
+{
+	uint64_t lo = a, hi = b, e;
+
+	if (c->order == ORD_REVERSE) {
+		lo = c->nchunks - b;
+		hi = c->nchunks - a;
+	}
+	*off = c->start + lo * (uint64_t)c->chunk;
+	e = c->start + hi * (uint64_t)c->chunk;
+	if (e > c->end)
+		e = c->end;
+	*len = e > *off ? e - *off : 0;
+}
+
+static void skip_setup(ctx_t *c)
+{
+	uint64_t w = SKIP_WIN_BYTES / (uint64_t)c->chunk;
+
+	if (!c->skip_slow)
+		return;
+	if (c->order == ORD_RANDOM || c->sample > 1) {
+		msg(PROG ": %s: --skip-slow needs a scan that walks the drive; "
+		    "not with %s\n", c->dev->name, c->sample > 1 ?
+		    "--sample" : "--order random");
+		c->skip_slow = 0;
+		return;
+	}
+	if (w < SKIP_WIN_MIN)
+		w = SKIP_WIN_MIN;
+	if (w > SKIP_WIN_MAX)
+		w = SKIP_WIN_MAX;
+	c->sw_len = (int)w;
+}
+
+static uint64_t skip_probe_len(const ctx_t *c)
+{
+	uint64_t n = SKIP_PROBE_BYTES / (uint64_t)c->chunk;
+
+	if (n < SKIP_PROBE_MIN)
+		n = SKIP_PROBE_MIN;
+	if (n > SKIP_PROBE_MAX)
+		n = SKIP_PROBE_MAX;
+	return n;
+}
+
+/* the step a condemned stretch sends a scan standing at step on to, or 0 */
+static uint64_t skip_at(const ctx_t *c, uint64_t step)
+{
+	int i;
+
+	for (i = 0; i < c->nskip; i++)
+		if (step >= c->skips[i].k0 && step < c->skips[i].s1)
+			return c->skips[i].s1;
+	return 0;
+}
+
+static void skip_band_add(ctx_t *c, uint64_t off, uint64_t len)
+{
+	uint64_t span = (c->dev->size ? c->dev->size : 1) / N_BANDS + 1;
+
+	while (len) {
+		int b = band_of(c, off);
+		uint64_t bend = (uint64_t)(b + 1) * span, take;
+
+		take = b == N_BANDS - 1 || bend - off > len ? len : bend - off;
+		c->bands[b].skipped += take;
+		off += take;
+		len -= take;
+	}
+}
+
+static skip_t *skip_add(ctx_t *c)
+{
+	if (c->nskip == c->skipcap) {
+		int cap = c->skipcap ? c->skipcap * 2 : 16;
+		skip_t *v = realloc(c->skips, (size_t)cap * sizeof(*v));
+
+		if (!v)
+			return NULL;
+		c->skips = v;
+		c->skipcap = cap;
+	}
+	memset(&c->skips[c->nskip], 0, sizeof(skip_t));
+	return &c->skips[c->nskip++];
+}
+
+/*
+ * One chunk's verdict into the trailing window; 1 when the window is full
+ * and at least three quarters of it was over budget.
+ */
+static int skip_note(ctx_t *c, uint64_t step, int over)
+{
+	if (!c->sw_len)
+		return 0;
+	if (c->sw_n == c->sw_len)
+		c->sw_cnt -= c->sw_over[c->sw_head];
+	else
+		c->sw_n++;
+	c->sw_step[c->sw_head] = step;
+	c->sw_over[c->sw_head] = (unsigned char)(over != 0);
+	c->sw_cnt += over != 0;
+	c->sw_head = (c->sw_head + 1) % c->sw_len;
+	return c->sw_n == c->sw_len &&
+	       c->sw_cnt * SKIP_OVER_DEN >= c->sw_len * SKIP_OVER_NUM;
+}
+
+/*
+ * Is the region starting at step s slow?  A short run of chunks read with no
+ * drill-down, the first one thrown away because it carries the seek that got
+ * us here.  A read the kernel refused for alignment, or the drive refused
+ * for its protection information, is no evidence either way (invariant 3);
+ * a probe with no evidence is not slow, so the scan reads the place instead
+ * of condemning it unseen.
+ */
+static int skip_probe(ctx_t *c, uint64_t s, void *buf)
+{
+	uint64_t n = skip_probe_len(c), i;
+	int over = 0, judged = 0;
+
+	if (s + n > c->nchunks)
+		n = c->nchunks - s;
+	for (i = 0; i < n && !g_stop; i++) {
+		uint64_t pos = c->start + order_index(c, s + i) * (uint64_t)c->chunk;
+		size_t len;
+		uint64_t us;
+		int err;
+		ssize_t r;
+
+		if (pos >= c->end)
+			continue;
+		len = (size_t)(c->end - pos < (uint64_t)c->chunk ?
+			       c->end - pos : (uint64_t)c->chunk);
+		r = timed_pread(c->fd, buf, len, pos, &us, &err);
+		c->skip_probes++;
+		if (r < 0 && (err == EINVAL || err == EILSEQ))
+			continue;
+		if (dev_gone(c, r, err, len))
+			return 0;
+		if (i == 0 && n > 1)
+			continue;
+		judged++;
+		if (r != (ssize_t)len || us > chunk_thr_at(c, pos))
+			over++;
+	}
+	progress(c, 0);
+	return judged && over * 2 > judged;
+}
+
+/*
+ * The window just filled with slow chunks at step t.  Find where the slow
+ * region ends, condemn what lies between, and return the step to carry on
+ * from -- t + 1 when there turned out to be nothing worth skipping.
+ */
+static uint64_t skip_ahead(ctx_t *c, void *buf)
+{
+	uint64_t t = c->step, L = t, F = 0, p, s0, s1, unread, off;
+	uint64_t pn = skip_probe_len(c);
+	uint64_t jump = SKIP_JUMP / (uint64_t)c->chunk;
+	uint64_t res = SKIP_RES / (uint64_t)c->chunk;
+	int to_end = 0, i;
+	skip_t *k;
+	char b1[32], b2[32], b3[32];
+
+	c->sw_n = c->sw_cnt = c->sw_head = 0;
+	if (c->nskip >= MAX_SKIPS)
+		return t + 1;
+	if (jump < 1)
+		jump = 1;
+	if (res < pn)
+		res = pn;
+	/* forward a gigabyte at a time until a probe comes back in budget */
+	while (!F && !to_end) {
+		if (g_stop || c->dev_gone)
+			return t + 1;
+		p = L + jump;
+		if (p + pn > c->nchunks)
+			p = c->nchunks > pn ? c->nchunks - pn : 0;
+		if (p <= L) {
+			F = L + 1;      /* too close to the end to bother */
+			break;
+		}
+		if (!skip_probe(c, p, buf))
+			F = p;
+		else if (p + pn >= c->nchunks)
+			to_end = 1;
+		else
+			L = p;
+	}
+	/* and back: halve the gap until the edge is known to 16 MiB */
+	while (!to_end && F - L > res && !g_stop && !c->dev_gone) {
+		uint64_t m = L + (F - L) / 2;
+
+		if (skip_probe(c, m, buf))
+			L = m;
+		else
+			F = m;
+	}
+	if (g_stop || c->dev_gone)
+		return t + 1;
+	s1 = to_end ? c->nchunks : L == t ? t + 1 : L + 1;
+	if (s1 <= t + 1)
+		return t + 1;
+
+	/* the condemned stretch starts at the first slow chunk in the window */
+	s0 = t;
+	for (i = 0; i < c->sw_len; i++)
+		if (c->sw_over[i] && c->sw_step[i] < s0 &&
+		    c->sw_step[i] + (uint64_t)c->sw_len > t)
+			s0 = c->sw_step[i];
+	if (c->nskip && s0 < c->skips[c->nskip - 1].s1)
+		s0 = c->skips[c->nskip - 1].s1;
+	k = skip_add(c);
+	if (!k)
+		return t + 1;
+	k->s0 = s0;
+	k->k0 = t + 1;
+	k->s1 = s1;
+	steps_extent(c, s0, s1, &k->off, &k->len);
+	steps_extent(c, t + 1, s1, &off, &unread);
+	skip_band_add(c, off, unread);
+	c->skip_bytes += unread;
+	c->skip_cond += k->len;
+	memset(c->sw_over, 0, sizeof(c->sw_over));
+	msg(PROG ": %s: %s%s from %s read over budget as a whole; skipped %s "
+	    "of it without reading%s (--skip-slow) and carried on %s\n",
+	    c->dev->name, c_yel(), human_size(k->len, b1, sizeof(b1)),
+	    human_size(k->off, b2, sizeof(b2)),
+	    human_size(unread, b3, sizeof(b3)), c_off(),
+	    to_end ? "to the end" : "past it");
+	return s1;
+}
+
 static void scan_loop(ctx_t *c, int verify_only_pass)
 {
 	void *buf = alloc_aligned(c->chunk);
@@ -5126,11 +5558,20 @@ static void scan_loop(ctx_t *c, int verify_only_pass)
 		uint64_t us = 0;
 		int err = 0;
 		ssize_t r;
-		int drill = 0, prot_write = 0;
+		int drill = 0, prot_write = 0, over = 0;
 		int band;
 
 		if (c->sample > 1 && (c->step % c->sample))
 			continue;
+		/* condemned and never read: nothing there to read or verify */
+		if (c->nskip) {
+			uint64_t to = skip_at(c, c->step);
+
+			if (to) {
+				c->step = to - 1;
+				continue;
+			}
+		}
 
 		c->pos = c->start + order_index(c, c->step) * (uint64_t)c->chunk;
 		if (c->pos >= c->end)
@@ -5161,6 +5602,7 @@ static void scan_loop(ctx_t *c, int verify_only_pass)
 				c->chunks_slow++;
 				c->bands[band].slow_chunks++;
 				drill = 1;
+				over = 1;
 			}
 		} else if (r < 0 && err == EINVAL) {
 			c->align_errors++;
@@ -5216,6 +5658,7 @@ static void scan_loop(ctx_t *c, int verify_only_pass)
 			c->chunks_err++;
 			c->hard_errors++;
 			drill = 1;
+			over = 1;
 		}
 
 		if (verify_only_pass && r == (ssize_t)len) {
@@ -5392,6 +5835,8 @@ static void scan_loop(ctx_t *c, int verify_only_pass)
 		check_temperature(c);
 		kmsg_poll(c, 0);
 		rate_window(c);
+		if (c->sw_len && !c->pass && skip_note(c, c->step, over))
+			c->step = skip_ahead(c, buf) - 1;
 		progress(c, 0);
 		if (c->state_path && now_us() - last_state > 15000000ull) {
 			state_save(c);
@@ -5570,7 +6015,8 @@ static void print_map(ctx_t *c)
 	out("    ");
 	for (i = 0; i < cells; i++) {
 		int lo = i * N_BANDS / cells, hi = (i + 1) * N_BANDS / cells;
-		uint64_t chunks = 0, bad = 0, slow = 0, sum = 0;
+		uint64_t chunks = 0, bad = 0, slow = 0, sum = 0, skip = 0;
+		uint64_t bytes = 0;
 		int j;
 		char ch;
 
@@ -5579,8 +6025,13 @@ static void print_map(ctx_t *c)
 			bad += c->bands[j].bad_blocks;
 			slow += c->bands[j].slow_blocks + c->bands[j].slow_chunks;
 			sum += c->bands[j].sum_us;
+			skip += c->bands[j].skipped;
+			bytes += c->bands[j].bytes;
 		}
-		if (!chunks)
+		/* mostly jumped over: what was read of it is not the story */
+		if (skip && skip >= bytes)
+			ch = '~';
+		else if (!chunks)
 			ch = '_';
 		else if (bad)
 			ch = 'X';
@@ -5602,6 +6053,9 @@ static void print_map(ctx_t *c)
 	}
 	out("\n    legend: '.:-=+*#@' fastest to slowest average read, "
 	    "'!' weak sectors, 'X' bad sectors, '_' not scanned\n");
+	if (c->nskip)
+		out("            '~' slow as a whole, skipped unread and "
+		    "condemned (--skip-slow)\n");
 	{
 		slowbands_t sb;
 		char b1[32], b2[32];
@@ -5811,6 +6265,18 @@ static int verdict_of(ctx_t *c, const char **why)
 		*why = buf;
 		return 1;
 	}
+	if (c->nskip) {
+		char b1[32], b2[32];
+
+		snprintf(buf, sizeof(buf), "%d region%s of the surface (%s) read "
+			 "over budget as a whole; %s of %s was skipped without "
+			 "being read", c->nskip, c->nskip == 1 ? "" : "s",
+			 human_size(c->skip_cond, b1, sizeof(b1)),
+			 human_size(c->skip_bytes, b2, sizeof(b2)),
+			 c->nskip == 1 ? "it" : "them");
+		*why = buf;
+		return 1;
+	}
 	if (over_too_often(c->chunks_slow, c->chunks_read)) {
 		snprintf(buf, sizeof(buf), "%" PRIu64 " of %" PRIu64 " chunk reads "
 			 "were over the latency budget, more than one in %d, "
@@ -5925,7 +6391,7 @@ static void fs_plan(const ctx_t *c)
 	char b1[32], b2[32], slug[96], target[160];
 	int i;
 
-	if (!c->nfind)
+	if (!c->nfind && !c->nskip)
 		return;
 	/*
 	 * mke2fs runs on a partition, which is where a filesystem goes on a
@@ -5941,6 +6407,24 @@ static void fs_plan(const ctx_t *c)
 		lost += c->find[i].len ? c->find[i].len : (uint32_t)c->block;
 
 	out("\n Using this drive anyway\n");
+	/*
+	 * A slow region is gigabytes, not sectors: a bad-block inode is the
+	 * wrong tool for it, so lead with the one that is not.
+	 */
+	if (c->nskip) {
+		out("   %d slow region%s (%s) and %d sector%s the scan would not "
+		    "trust, of %s.\n", c->nskip, c->nskip == 1 ? "" : "s",
+		    human_size(c->skip_cond, b1, sizeof(b1)), c->nfind,
+		    c->nfind == 1 ? "" : "s",
+		    human_size(c->dev->size, b2, sizeof(b2)));
+		out("   Regions that size are for device-mapper, not a "
+		    "filesystem's bad-block list:\n"
+		    "        %s --hide-bad --rescan --confirm %s %s\n"
+		    "      builds /dev/mapper/bb-* without them and tests "
+		    "what is left. Needs root.\n",
+		    PROG, c->dev->name, c->dev->path);
+		return;
+	}
 	out("   %d sector%s the scan would not trust, %s of %s. A filesystem can\n"
 	    "   be told to keep what it stores off them:\n",
 	    c->nfind, c->nfind == 1 ? "" : "s",
@@ -6039,6 +6523,13 @@ static void report(ctx_t *c)
 			out("  Coverage         %sSAMPLED: 1 chunk in %" PRIu64
 			    ", so most sectors were never read%s\n",
 			    c_yel(), c->sample, c_off());
+		else if (whole && !c->abort_reason[0] && !g_stop &&
+			 c->step >= c->nchunks && c->skip_bytes)
+			out("  Coverage         %severy sector was read or condemned: "
+			    "%s in %d slow region%s\n                   was "
+			    "skipped without being read (--skip-slow)%s\n",
+			    c_yel(), human_size(c->skip_bytes, b1, sizeof(b1)),
+			    c->nskip, c->nskip == 1 ? "" : "s", c_off());
 		else if (whole && !c->abort_reason[0] && !g_stop && c->step >= c->nchunks)
 			out("  Coverage         every sector of the device was read\n");
 		else if (whole)
@@ -6053,6 +6544,12 @@ static void report(ctx_t *c)
 			out("  Not covered      %s%s refused by the drive's protection "
 			    "information%s\n", c_yel(),
 			    human_size(c->prot_bytes, b1, sizeof(b1)), c_off());
+		if (c->skip_bytes && !(whole && !c->abort_reason[0] && !g_stop &&
+				       c->step >= c->nchunks))
+			out("  Not covered      %s%s in %d slow region%s skipped "
+			    "without being read (--skip-slow)%s\n", c_yel(),
+			    human_size(c->skip_bytes, b1, sizeof(b1)), c->nskip,
+			    c->nskip == 1 ? "" : "s", c_off());
 	}
 	if (c->grad_budget) {
 		uint64_t lo = UINT64_MAX, hi = 0;
@@ -6427,6 +6924,25 @@ no_modes:	;
 	}
 
 	/* findings */
+	if (c->nskip) {
+		out("\n  --- Slow regions, condemned by --skip-slow ---\n");
+		out("    %-18s %-18s %12s %12s\n", "from byte", "to byte",
+		    "size", "not read");
+		for (i = 0; i < c->nskip && i < 50; i++) {
+			const skip_t *k = &c->skips[i];
+			uint64_t o, unread;
+
+			steps_extent(c, k->k0, k->s1, &o, &unread);
+			out("    %s%-18" PRIu64 " %-18" PRIu64 "%s %12s %12s\n",
+			    c_yel(), k->off, k->off + k->len, c_off(),
+			    human_size(k->len, b1, sizeof(b1)),
+			    human_size(unread, b2, sizeof(b2)));
+		}
+		if (c->nskip > 50)
+			out("    ... and %d more (the checkpoint and --json list "
+			    "them all)\n", c->nskip - 50);
+	}
+
 	if (c->nfind) {
 		out("\n  --- Suspect sectors (worst first) ---\n");
 		qsort(c->find, (size_t)c->nfind, sizeof(finding_t), find_cmp_sev);
@@ -6494,6 +7010,16 @@ no_modes:	;
 		    " cover the device -- and destroy everything on it. So would\n"
 		    " reformatting without protection ('sg_format --fmtpinfo=0').\n");
 	}
+	if (c->nskip) {
+		out("\n %sNot covered:%s %s in %d slow region%s was skipped without "
+		    "being read.\n", c_yel(), c_off(),
+		    human_size(c->skip_bytes, b1, sizeof(b1)), c->nskip,
+		    c->nskip == 1 ? "" : "s");
+		out(" The scan found where each one starts and ends and condemned "
+		    "it whole;\n nothing above says anything about the sectors "
+		    "inside. --hide-bad cuts\n them out with the rest of the "
+		    "damage.\n");
+	}
 	if (v == 2 && c->blocks_unrepaired)
 		out(" Do not trust this drive with data. Copy anything valuable off it now,\n"
 		    " then replace it. Writing over those sectors did not make them readable,\n"
@@ -6507,6 +7033,10 @@ no_modes:	;
 		    " Run a write pass (--profile predeploy on an empty drive, or --repair)\n"
 		    " to find out whether this one still can. If they stay unreadable after\n"
 		    " being written, it is failing.\n");
+	else if (v == 1 && c->nskip)
+		out(" Whole regions of this drive are slow. Keep data off them: "
+		    "--hide-bad builds\n a device without them, and --rescan "
+		    "then tests what is left.\n");
 	else if (v == 1)
 		out(" The drive works but showed weak spots. Re-run the scan in a few days;\n"
 		    " if the same offsets are slow again, or SMART counters keep growing,\n"
@@ -6640,6 +7170,18 @@ static void write_json(ctx_t *c, const char *path)
 			c->smart_after.cmd_timeout, c->smart_after.grown);
 		fprintf(f, "    \"temperature_max_c\": %lld\n  },\n", c->temp_max);
 	}
+	fprintf(f, "  \"bytes_skipped\": %" PRIu64 ",\n", c->skip_bytes);
+	fprintf(f, "  \"slow_regions\": [\n");
+	for (i = 0; i < c->nskip; i++) {
+		const skip_t *k = &c->skips[i];
+		uint64_t o, unread;
+
+		steps_extent(c, k->k0, k->s1, &o, &unread);
+		fprintf(f, "    {\"offset\": %" PRIu64 ", \"length\": %" PRIu64
+			", \"unread\": %" PRIu64 "}%s\n", k->off, k->len, unread,
+			i + 1 < c->nskip ? "," : "");
+	}
+	fprintf(f, "  ],\n");
 	fprintf(f, "  \"findings\": [\n");
 	for (i = 0; i < c->nfind; i++) {
 		finding_t *x = &c->find[i];
@@ -6673,8 +7215,14 @@ static void write_json(ctx_t *c, const char *path)
  * filesystem that steps around the damage.  Offsets here are device-relative;
  * mke2fs runs on a partition, so --badblocks-offset subtracts its start.
  */
+/*
+ * ranges writes a condemned region as one "FIRST-LAST" line rather than a
+ * line per block.  That is not badblocks(8) format -- mke2fs cannot read it
+ * -- and only the list handed to the device-mapper map uses it: a region of
+ * a few hundred gigabytes is a hundred million lines otherwise.
+ */
 static void write_badblocks(ctx_t *c, const char *path, uint64_t bs,
-			    uint64_t part_off)
+			    uint64_t part_off, int ranges)
 {
 	FILE *f;
 	int i;
@@ -6702,9 +7250,31 @@ static void write_badblocks(ctx_t *c, const char *path, uint64_t bs,
 			n++;
 		}
 	}
+	for (i = 0; i < c->nskip; i++) {
+		const skip_t *k = &c->skips[i];
+		uint64_t first, last, b;
+
+		if (!k->len || k->off + k->len <= part_off)
+			continue;
+		first = (k->off < part_off ? 0 : k->off - part_off) / bs;
+		last = (k->off + k->len - part_off - 1) / bs;
+		n += last - first + 1;
+		if (ranges) {
+			fprintf(f, "%" PRIu64 "-%" PRIu64 "\n", first, last);
+			continue;
+		}
+		for (b = first; b <= last; b++)
+			fprintf(f, "%" PRIu64 "\n", b);
+	}
 	fclose(f);
 	msg(PROG ": wrote %s (%" PRIu64 " blocks of %" PRIu64 " bytes)\n",
 	    path, n, bs);
+	if (c->nskip && !ranges)
+		msg(PROG ": %d of the regions in it are slow regions --skip-slow "
+		    "condemned whole; a bad-block\n         list that long is "
+		    "more than a filesystem is meant to carry, and\n         "
+		    "--hide-bad is the better way to keep data off them\n",
+		    c->nskip);
 }
 
 /*
@@ -6716,7 +7286,7 @@ static void write_badblocks(ctx_t *c, const char *path, uint64_t bs,
  * for a scan that was never asked to produce a list at all.
  */
 static int badblocks_replay(const char *src, const char *out, uint64_t bs,
-			    uint64_t part_off)
+			    uint64_t part_off, int ranges)
 {
 	FILE *f = fopen(src, "re");
 	char line[1024];
@@ -6745,20 +7315,39 @@ static int badblocks_replay(const char *src, const char *out, uint64_t bs,
 		if (csv) {
 			finding_t *x;
 			char st[32] = "";
-			uint64_t off = 0, lba;
-			unsigned len = 0;
+			uint64_t off = 0, lba, len = 0;
 
-			if (sscanf(line, "%*[^,],%" SCNu64 ",%" SCNu64 ",%u,%31[^,],",
-				   &off, &lba, &len, st) != 4)
+			if (sscanf(line, "%*[^,],%" SCNu64 ",%" SCNu64 ",%" SCNu64
+				   ",%31[^,],", &off, &lba, &len, st) != 4)
 				continue;
+			if (!strcmp(st, "slowregion")) {
+				skip_t *k = skip_add(&c);
+
+				if (!k)
+					break;
+				k->off = off;
+				k->len = len;
+				continue;
+			}
 			x = find_add(&c);
 			if (!x)
 				break;
 			x->offset = off;
-			x->len = len;
+			x->len = (uint32_t)len;
 			x->status = status_of_name(st);
 		} else if (!strncmp(line, "block ", 6)) {
 			c.block = (size_t)strtoull(line + 6, NULL, 10);
+		} else if (!strncmp(line, "skip ", 5)) {
+			skip_t k, *x;
+
+			if (sscanf(line + 5, "%" SCNu64 " %" SCNu64 " %" SCNu64
+				   " %" SCNu64 " %" SCNu64, &k.s0, &k.k0, &k.s1,
+				   &k.off, &k.len) != 5)
+				continue;
+			x = skip_add(&c);
+			if (!x)
+				break;
+			*x = k;
 		} else if (!strncmp(line, "finding ", 8)) {
 			finding_t *x = find_add(&c);
 			int st = 0;
@@ -6773,8 +7362,9 @@ static int badblocks_replay(const char *src, const char *out, uint64_t bs,
 	fclose(f);
 	if (!c.block)
 		c.block = DEF_BLOCK;
-	write_badblocks(&c, out, bs, part_off);
+	write_badblocks(&c, out, bs, part_off, ranges);
 	free(c.find);
+	free(c.skips);
 	return 0;
 }
 
@@ -6902,6 +7492,12 @@ static void write_csv(ctx_t *c, const char *path)
 			x->errnum, errname(x->errnum), x->rewritten,
 			x->fixed_by_rewrite);
 	}
+	/* a region, not a sector: its length is the whole stretch */
+	for (i = 0; i < c->nskip; i++)
+		fprintf(f, "%s,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",slowregion,"
+			"0,0,0,0,0,0,0,,0,0\n", c->dev->name, c->skips[i].off,
+			c->skips[i].off / (uint64_t)c->dev->logical_bs,
+			c->skips[i].len);
 	fclose(f);
 	msg(PROG ": wrote %s\n", path);
 }
@@ -6951,6 +7547,9 @@ typedef struct {
 	int fix_config;         /* apply the configuration the report advises */
 	int fix_config_set;     /* named on the command line, either way */
 	int hide_bad;           /* hand the last scan's damage to dm-badblocks */
+	int rescan;             /* and then test the device that made */
+	int rescan_ok;          /* the targets are what --hide-bad just made:
+				 * its --confirm covered writing to them */
 	int apply_only;         /* apply the settings and stop, do not scan */
 	int format;             /* low level format instead of a scan */
 	int fmt_bs;             /* 0 keep, else the logical block size to set */
@@ -6967,6 +7566,7 @@ typedef struct {
 	int rewrite_weak;
 	int force_remap;
 	int second_pass;
+	int skip_slow;          /* condemn a region slow as a whole, unread */
 	int repair;             /* the whole repair sequence in one flag */
 	const char *profile;    /* which profile produced these defaults */
 	int retries;
@@ -7055,24 +7655,30 @@ typedef struct {
 	int fix_config;         /* save the recommended configuration */
 	int bms;                /* turn the background scan on, saved */
 	int bms_interval;       /* its interval in hours, 0 keep */
+	/*
+	 * Skip regions that are slow as a whole: only for repair, which is
+	 * already a drive being salvaged.  Everywhere else a report has to
+	 * keep meaning every sector was tested.
+	 */
+	int skip_slow;
 } profile_t;
 
 static const profile_t g_profiles[] = {
 	{ "predeploy",
 	  "no data on it yet: write every sector and verify it reads back",
-	  MODE_WRITE, 1, 0, 1, 0, 1024u * 1024, 0, 1, 1, 168 },
+	  MODE_WRITE, 1, 0, 1, 0, 1024u * 1024, 0, 1, 1, 168, 0 },
 	{ "inservice",
 	  "it holds data you want to keep: never writes anything",
-	  MODE_READ,  0, 0, 0, 0, 0, -1, 0, 0, 0 },
+	  MODE_READ,  0, 0, 0, 0, 0, -1, 0, 0, 0, 0 },
 	{ "survey",
 	  "quick triage of a shelf: samples the surface, read only",
-	  MODE_READ,  0, 0, 0, 64, 1024u * 1024, -1, 0, 0, 0 },
+	  MODE_READ,  0, 0, 0, 64, 1024u * 1024, -1, 0, 0, 0, 0 },
 	{ "decay",
 	  "weeks after a predeploy run: has the pattern rotted?",
-	  MODE_CHECK, 0, 0, 0, 0, 0, -1, 0, 0, 0 },
+	  MODE_CHECK, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0 },
 	{ "repair",
 	  "predeploy, plus forcing a reallocation of anything unreadable",
-	  MODE_WRITE, 1, 1, 1, 0, 1024u * 1024, 0, 1, 1, 168 },
+	  MODE_WRITE, 1, 1, 1, 0, 1024u * 1024, 0, 1, 1, 168, 1 },
 };
 #define NPROFILES ((int)(sizeof(g_profiles) / sizeof(g_profiles[0])))
 
@@ -7117,7 +7723,8 @@ static void usage(void)
 "                                      surface, read only\n"
 "                           decay      weeks after predeploy: has it rotted?\n"
 "                           repair     predeploy, plus forcing a reallocation\n"
-"                                      of anything unreadable\n"
+"                                      of anything unreadable, and\n"
+"                                      --skip-slow\n"
 "                         Any explicit flag overrides what the profile set,\n"
 "                         whichever order they appear in.  The drive\n"
 "                         settings a profile carries apply only in its own\n"
@@ -7197,6 +7804,13 @@ static void usage(void)
 "                         DRAM is not a repair you verified\n"
 "  --second-pass          after --mode write, re-read the whole device and\n"
 "                         re-verify the pattern (catches slow data decay)\n"
+"  --skip-slow            when most chunks over the last 64 MiB missed their\n"
+"                         budget, stop reading: probe 1 GiB on, and on, until\n"
+"                         a probe is fast, bisect back to the edge, carry on\n"
+"                         there.  What was jumped over is condemned unread;\n"
+"                         the report says so and --hide-bad cuts it out.\n"
+"                         Sequential or reverse order only.  On under repair\n"
+"  --no-skip-slow         read every region, however slow, under repair too\n"
 "  --rewrite-weak         rewrite readable-but-slow sectors in place to make\n"
 "                         the drive refresh or remap them (needs verify/write,\n"
 "                         or read mode plus this flag for read-modify-write)\n"
@@ -7364,6 +7978,10 @@ static void usage(void)
 "                         damage cut out, for any filesystem (see 'dm' below).\n"
 "                         Whatever is on the drive becomes unreachable, so it\n"
 "                         needs --confirm like a write\n"
+"  --rescan               with --hide-bad, then write and verify every sector\n"
+"                         of the new device: proves what is left is sound and\n"
+"                         that data written through the map reads back.  The\n"
+"                         form always does this after hiding\n"
 "  --prometheus FILE      write metrics for node_exporter's textfile collector\n"
 "  --journal FILE         crash journal for --mode verify: the original bytes\n"
 "                         are fsynced here before the pattern is written, so a\n"
@@ -7558,6 +8176,8 @@ static int scan_device(device_t *d, const opts_t *o, const char *json_path,
 		die("%s: empty test range", d->name);
 	c.pos = c.start;
 	order_setup(&c, o->segment);
+	c.skip_slow = o->skip_slow;
+	skip_setup(&c);
 
 	kmsg_open(&c);
 	if (!o->no_smart)
@@ -7823,6 +8443,7 @@ static int scan_device(device_t *d, const opts_t *o, const char *json_path,
 		out("\n  second pass: re-reading and verifying the pattern\n");
 		c.pos = c.start;
 		c.step = 0;
+		c.pass = 1;
 		scan_loop(&c, 1);
 	}
 	c.t_end_us = now_us();
@@ -7871,12 +8492,13 @@ static int scan_device(device_t *d, const opts_t *o, const char *json_path,
 	if (csv_path)
 		write_csv(&c, csv_path);
 	if (bb_path)
-		write_badblocks(&c, bb_path, o->bb_blocksize, o->bb_offset);
+		write_badblocks(&c, bb_path, o->bb_blocksize, o->bb_offset, 0);
 	if (prom_path)
 		write_prometheus(&c, prom_path);
 
 	v = verdict_of(&c, &why);
 	free(c.find);
+	free(c.skips);
 	g_ctx = NULL;
 	if (g_stop)
 		return 130;
@@ -8437,6 +9059,53 @@ static int tui_count(uint64_t v, int width, const char *col, int striped)
 }
 
 /*
+ * OVER: the share of chunk reads that missed their budget, over the whole
+ * scan.  Over the whole scan rather than the last thirty seconds because it
+ * is what the verdict holds against one in OVER_ONE_IN, and a column that
+ * turned red on a different rule from the verdict would be a screen
+ * contradicting its own report.  It turns red exactly when that rule does.
+ */
+static const char *over_str(uint64_t slow, uint64_t chunks, char *b, size_t n)
+{
+	double pct;
+
+	if (!chunks) {
+		snprintf(b, n, "-");
+		return b;
+	}
+	pct = 100.0 * (double)slow / (double)chunks;
+	if (!slow)
+		snprintf(b, n, "0%%");
+	else if (pct < 0.1)
+		snprintf(b, n, "<0.1%%");
+	else if (pct < 10)
+		snprintf(b, n, "%.1f%%", pct);
+	else
+		snprintf(b, n, "%.0f%%", pct);
+	return b;
+}
+
+static const char *over_col(uint64_t slow, uint64_t chunks)
+{
+	if (!slow)
+		return "";
+	return over_too_often(slow, chunks) ? c_red() : c_yel();
+}
+
+static int tui_over(const jrec_t *x, int width, int striped)
+{
+	const char *col = over_col(x->slow, x->chunks);
+	char b[16];
+	int used;
+
+	printf("%s", col);
+	used = printf("%*s", width, over_str(x->slow, x->chunks, b, sizeof(b)));
+	if (col[0])
+		printf("%s", striped ? c_plain() : c_off());
+	return used;
+}
+
+/*
  * printf(), or -- with draw off -- only the width printf() would have used.
  * A layout decided by measuring one thing and then drawing another is a
  * layout that wraps the day the two disagree, so the tail of a drive's row is
@@ -8553,7 +9222,7 @@ static int tui_drive_tail(const jrec_t *x, int pw, int ident, int room,
 #define DBAR_MIN 10
 
 typedef struct {
-	int rate, bad, weak, eta, state;
+	int rate, bad, weak, over, eta, state;
 	int size;               /* width of the size column, with ident */
 	int one;                /* each drive on a single row */
 	int ident;              /* model and size columns after the name */
@@ -8568,6 +9237,7 @@ static void tui_dcols(const jrec_t *j, int n, int cols, dcols_t *dc)
 	dc->rate = 11;
 	dc->bad = 7;
 	dc->weak = 8;
+	dc->over = 5;
 	dc->eta = 10;
 	dc->state = 5;
 	dc->size = 4;
@@ -8588,6 +9258,9 @@ static void tui_dcols(const jrec_t *j, int n, int cols, dcols_t *dc)
 		w = snprintf(b1, sizeof(b1), "%" PRIu64, x->weak);
 		if (w > dc->weak)
 			dc->weak = w;
+		w = (int)strlen(over_str(x->slow, x->chunks, b1, sizeof(b1)));
+		if (w > dc->over)
+			dc->over = w;
 		if (x->state == JS_RUNNING) {
 			w = (int)strlen(human_time(x->eta, b2, sizeof(b2)));
 			if (w > dc->eta)
@@ -8606,9 +9279,9 @@ static void tui_dcols(const jrec_t *j, int n, int cols, dcols_t *dc)
 		if (w > tail_id)
 			tail_id = w;
 	}
-	/* "  name(8) pct(6) rate bad weak eta state" */
+	/* "  name(8) pct(6) rate bad weak over eta state" */
 	left = 2 + 8 + 1 + 6 + 1 + dc->rate + 1 + dc->bad + 1 + dc->weak +
-	       1 + dc->eta + 1 + dc->state;
+	       1 + dc->over + 1 + dc->eta + 1 + dc->state;
 	dc->one = left + tail <= cols;
 	if (!dc->one)
 		return;
@@ -8741,8 +9414,9 @@ static void tui_dashboard(const run_t *r, const jrec_t *j, int n, int nruns,
 		printf(" %6s", "PCT");
 		if (dc.bar)
 			printf(" %*s", dc.bar + 2, "");
-		printf(" %*s %*s %*s %*s %s", dc.rate, "RATE", dc.bad, "BAD",
-		       dc.weak, "WEAK", dc.eta, "ETA", "STATE");
+		printf(" %*s %*s %*s %*s %*s %s", dc.rate, "RATE", dc.bad,
+		       "BAD", dc.weak, "WEAK", dc.over, "OVER", dc.eta, "ETA",
+		       "STATE");
 	}
 	tui_eol();
 
@@ -8878,6 +9552,8 @@ static void tui_dashboard(const run_t *r, const jrec_t *j, int n, int nruns,
 		used += tui_count(x->bad, dc.bad, c_red(), striped);
 		used += printf(" ");
 		used += tui_count(x->weak, dc.weak, c_yel(), striped);
+		used += printf(" ");
+		used += tui_over(x, dc.over, striped);
 		used += printf(" %*s ", dc.eta, x->state == JS_RUNNING ?
 			       human_time(x->eta, b2, sizeof(b2)) : "-");
 		printf("%s", col);
@@ -8966,7 +9642,13 @@ static void forward_stop(job_t *jobs, int n)
 }
 
 static int ckpt_whole(const char *path, uint64_t size);
-static int hide_bad(device_t *t, int n, const opts_t *o);
+#define DMBB_NAME_MAX_LEN 63
+typedef char mapname_t[DMBB_NAME_MAX_LEN + 1];
+static int hide_bad(device_t *t, int n, const opts_t *o, mapname_t *made);
+static void hide_name(const device_t *d, char *name, size_t len);
+/* a device the summary just made, for the form to test next: --rescan */
+static mapname_t g_rescan;
+static char g_rescan_over[64];
 
 /*
  * Can the damage this drive's scan found be handed to --hide-bad from the
@@ -8979,7 +9661,7 @@ static int summary_can_hide(const run_t *r, const jrec_t *x)
 	char ck[STORE_MAX + 128];
 
 	if (strcmp(r->kind, "scan") || x->state != JS_DONE ||
-	    !(x->bad + x->weak))
+	    !(x->bad + x->weak + x->skipped))
 		return 0;
 	if (snprintf(ck, sizeof(ck), "%s/%s.ckpt", r->dir, x->slug) >=
 	    (int)sizeof(ck))
@@ -9017,7 +9699,7 @@ static int summary_hide(const jrec_t *x)
 			_exit(2);
 		memset(&ho, 0, sizeof(ho));
 		ho.tui = 1;     /* the y on the summary was the confirmation */
-		st = hide_bad(&d, 1, &ho);
+		st = hide_bad(&d, 1, &ho, NULL);
 		fflush(stdout);
 		fflush(stderr);
 		_exit(st);
@@ -9027,10 +9709,31 @@ static int summary_hide(const jrec_t *x)
 			;
 		rc = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
 	}
-	printf("\n  %s%s%s\n\n  press any key to return to the summary",
+	/*
+	 * An image stops at writing the map; a drive gets a device, and the
+	 * form tests that next, as --rescan does on the command line.
+	 */
+	g_rescan[0] = 0;
+	if (rc == 0) {
+		device_t d;
+		char name[sizeof(g_rescan)], dev[PATH_MAX];
+		struct stat sb;
+
+		if (resolve_target(x->path, &d) == 0) {
+			hide_name(&d, name, sizeof(name));
+			snprintf(dev, sizeof(dev), "/dev/mapper/%s", name);
+			if (!d.is_file && !stat(dev, &sb)) {
+				snprintf(g_rescan, sizeof(g_rescan), "%s", name);
+				snprintf(g_rescan_over, sizeof(g_rescan_over),
+					 "%s", d.name);
+			}
+		}
+	}
+	printf("\n  %s%s%s\n\n  press any key to %s",
 	       rc == 0 ? c_grn() : c_red(),
 	       rc == 0 ? "done" : "nothing was changed by the step that failed",
-	       c_off());
+	       c_off(), g_rescan[0] ? "write and verify every sector of what "
+	       "is left" : "return to the summary");
 	fflush(stdout);
 	while (tui_key(1000) < 0 && !g_stop)
 		;
@@ -9190,8 +9893,14 @@ static int tui_summary(const run_t *r, const jrec_t *j, int n, int nruns)
 			continue;
 		if (arm && k >= 0) {
 			arm = 0;
-			if (k == 'y' && summary_hide(&j[sel]) == 0)
+			if (k == 'y' && summary_hide(&j[sel]) == 0) {
 				can[sel] = 0;   /* it has a map now */
+				/* as if 'n': main() finds it pending */
+				if (g_rescan[0]) {
+					free(can);
+					return 1;
+				}
+			}
 			continue;
 		}
 		if (anyhide && (k == K_UP || k == K_DOWN)) {
@@ -9666,6 +10375,7 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 	static const int fpi_v[] = { -1, 0, 1, 2 };
 	int fbs_sel = 0, fpi_sel = 0, ffast_sel = 0;
 	int persist_sel = o->persist ? 1 : 0, fix_sel = o->fix_config ? 1 : 0;
+	int skip_sel = o->skip_slow ? 1 : 0;
 	int awre_sel = o->awre < 0 ? 0 : o->awre + 1;
 	int rc_sel = o->read_cache < 0 ? 0 : o->read_cache + 1;
 	long long rtl = o->recovery_ms;
@@ -9698,6 +10408,8 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 	  NULL, 0, 0, 0, &chunk_sel },
 	{ NULL, 0, "Scan order", "sequential is fastest; random defeats drive prefetch",
 	  0, 3, { "sequential", "reverse", "random" }, NULL, 0, 0, 0, &order_sel },
+	{ NULL, 0, "Skip slow regions", "jump a region slow as a whole; it is condemned",
+	  0, 2, { "no", "yes" }, NULL, 0, 0, 0, &skip_sel },
 	{ NULL, 0, "Retries per sector", "re-reads before judging a suspect sector",
 	  1, 0, { 0 }, &retries, 0, 1000, 5, NULL },
 	{ NULL, 0, "Shuffle segment (MiB)", "must exceed the drive cache; random order only",
@@ -9824,6 +10536,7 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 			if (p->force_remap)
 				mode_sel = nmode;       /* the repair entry */
 			sample = p->sample ? (long long)p->sample : 0;
+			skip_sel = p->skip_slow;
 			/* reset, not just set: leaving survey has to put the
 			 * chunk back or its 1 MiB follows you to every other
 			 * profile */
@@ -10147,6 +10860,7 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 			o->rewrite_weak = g_profiles[prof_sel].rewrite_weak;
 			o->force_remap = g_profiles[prof_sel].force_remap;
 			o->second_pass = g_profiles[prof_sel].second_pass;
+			o->skip_slow = skip_sel;
 			o->order = (order_t)order_sel;
 			o->lookahead = la_sel == 0 ? 0 : -1;
 			o->bms = bms_sel;
@@ -10397,7 +11111,6 @@ static const char *g_dmbb_cmd = PROG " dm";
 #define DMBB_H_NAME      96          /* 64 bytes, NUL padded */
 #define DMBB_H_CREATED   160
 #define DMBB_H_SUM       168
-#define DMBB_NAME_MAX_LEN 63
 
 typedef struct {
 	uint64_t l;             /* logical extent */
@@ -10890,6 +11603,22 @@ static int dmbb_meta_read_at(int fd, uint64_t off, uint64_t dev, dmbb_map_t *m)
 		free(b);
 		return -1;
 	}
+	/*
+	 * The name came off the drive, and activate-all reads every drive on
+	 * the machine at boot, as root.  A map this code wrote always has a
+	 * name dmbb_name_ok() accepts, so one that does not is not a copy of
+	 * a map at all -- whoever wrote it, it never reaches dmsetup.
+	 */
+	{
+		char nm[DMBB_NAME_MAX_LEN + 1];
+
+		memcpy(nm, b + DMBB_H_NAME, DMBB_NAME_MAX_LEN);
+		nm[DMBB_NAME_MAX_LEN] = 0;
+		if (!dmbb_name_ok(nm)) {
+			free(b);
+			return -1;
+		}
+	}
 	memset(m, 0, sizeof(*m));
 	m->gen = dmbb_get64(b + DMBB_H_GEN);
 	m->ext = ext;
@@ -11062,13 +11791,76 @@ static void dmbb_emit_table(FILE *f, const dmbb_map_t *m, const char *dev)
  * dmsetup
  * ------------------------------------------------------------------ */
 
-static int dmbb_run_cmd(const char *cmd)
-{
-	int st = system(cmd);
+static void dmbb_emit_table(FILE *f, const dmbb_map_t *m, const char *dev);
 
-	if (g_dmbb_verbose)
-		dmbb_msg("  $ %s -> %d\n", cmd, st);
-	return st != -1 && WIFEXITED(st) && WEXITSTATUS(st) == 0 ? 0 : -1;
+/*
+ * Run dmsetup with these arguments, feeding it m's table on stdin when m is
+ * given.  Never through a shell: the map name is read back off the drive,
+ * and a name is an argument here, not text for sh to parse.
+ */
+static int dmsetup_run(const char *const *argv, const dmbb_map_t *m,
+		       const char *dev)
+{
+	int p[2] = { -1, -1 }, st = -1, i;
+	pid_t pid;
+
+	if (g_dmbb_verbose) {
+		dmbb_msg("  $");
+		for (i = 0; argv[i]; i++)
+			dmbb_msg(" %s", argv[i]);
+		dmbb_msg("\n");
+	}
+	if (m && pipe(p) < 0)
+		return -1;
+	fflush(stdout);
+	fflush(stderr);
+	pid = fork();
+	if (pid < 0) {
+		if (m) {
+			close(p[0]);
+			close(p[1]);
+		}
+		return -1;
+	}
+	if (pid == 0) {
+		if (m) {
+			dup2(p[0], STDIN_FILENO);
+			close(p[0]);
+			close(p[1]);
+		}
+		execvp(argv[0], (char *const *)argv);
+		_exit(127);
+	}
+	if (m) {
+		FILE *f;
+
+		close(p[0]);
+		f = fdopen(p[1], "w");
+		if (f) {
+			dmbb_emit_table(f, m, dev);
+			fclose(f);
+		} else {
+			close(p[1]);
+		}
+	}
+	while (waitpid(pid, &st, 0) < 0)
+		if (errno != EINTR)
+			return -1;
+	return WIFEXITED(st) && WEXITSTATUS(st) == 0 ? 0 : -1;
+}
+
+/* dmsetup VERB NAME, for the verbs that take nothing else */
+static int dmsetup_verb(const char *verb, const char *name)
+{
+	const char *argv[4];
+
+	if (!dmbb_name_ok(name))
+		return -1;
+	argv[0] = "dmsetup";
+	argv[1] = verb;
+	argv[2] = name;
+	argv[3] = NULL;
+	return dmsetup_run(argv, NULL, NULL);
 }
 
 static int dmbb_read_line(const char *path, char *out, size_t len)
@@ -11141,24 +11933,26 @@ static int dmbb_active(const char *name)
 /* "create NAME" or "reload NAME", with the table on stdin */
 static int dmbb_load(const char *verb, const dmbb_map_t *m, const char *dev)
 {
-	char cmd[256], uuid[64] = "";
-	FILE *f;
-	int st, i;
+	char uuid[64];
+	const char *argv[6];
+	int i, n = 0;
 
+	if (!dmbb_name_ok(m->name))
+		return -1;
+	argv[n++] = "dmsetup";
+	argv[n++] = verb;
 	if (!strcmp(verb, "create")) {
 		char *u = uuid;
 
-		u += sprintf(u, "--uuid DMBB-");
+		u += sprintf(u, "DMBB-");
 		for (i = 0; i < 16; i++)
 			u += sprintf(u, "%02x", m->uuid[i]);
+		argv[n++] = "--uuid";
+		argv[n++] = uuid;
 	}
-	snprintf(cmd, sizeof(cmd), "dmsetup %s %s %s", verb, uuid, m->name);
-	f = popen(cmd, "w");
-	if (!f)
-		return -1;
-	dmbb_emit_table(f, m, dev);
-	st = pclose(f);
-	return st != -1 && WIFEXITED(st) && WEXITSTATUS(st) == 0 ? 0 : -1;
+	argv[n++] = m->name;
+	argv[n] = NULL;
+	return dmsetup_run(argv, m, dev);
 }
 
 /* ------------------------------------------------------------------ *
@@ -11195,6 +11989,21 @@ static uint64_t *dmbb_read_badlist(const char *path, uint64_t bs, uint64_t ext,
 			dmbb_die("%s: not a block number: %s", path, line);
 		off = (uint64_t)blk * bs;
 		last = (off + bs - 1) / ext;
+		/*
+		 * FIRST-LAST, both inclusive: a whole region in one line,
+		 * which is how hddscan hands over what --skip-slow condemned.
+		 * Not badblocks(8) syntax, and nothing else writes it.
+		 */
+		if (*end == '-') {
+			const char *r = end + 1;
+			unsigned long long hi;
+
+			errno = 0;
+			hi = strtoull(r, &end, 10);
+			if (errno || end == r || hi < blk)
+				dmbb_die("%s: not a block range: %s", path, line);
+			last = ((uint64_t)hi * bs + bs - 1) / ext;
+		}
 		for (e = off / ext; e <= last; e++) {
 			if (n == cap) {
 				cap = cap ? cap * 2 : 256;
@@ -11641,10 +12450,7 @@ static int dmbb_cmd_remap(const dmbb_opts_t *o)
 	dmbb_map_clone(&m, &before);
 
 	if (active) {
-		char cmd[160];
-
-		snprintf(cmd, sizeof(cmd), "dmsetup suspend %s", m.name);
-		if (dmbb_run_cmd(cmd) < 0)
+		if (dmsetup_verb("suspend", m.name) < 0)
 			dmbb_die("could not suspend %s (need root?)", m.name);
 	}
 
@@ -11723,7 +12529,7 @@ static int dmbb_cmd_remap(const dmbb_opts_t *o)
 			fails++;
 		}
 		snprintf(cmd, sizeof(cmd), "dmsetup resume %s", m.name);
-		if (dmbb_run_cmd(cmd) < 0)
+		if (dmsetup_verb("resume", m.name) < 0)
 			dmbb_msg(DMBB_PROG ": could not resume %s; run '%s' by hand\n",
 			    m.name, cmd);
 	}
@@ -11828,12 +12634,9 @@ static int dmbb_cmd_activate_all(void)
 
 static int dmbb_cmd_deactivate(const char *name)
 {
-	char cmd[160];
-
 	if (!dmbb_name_ok(name))
 		dmbb_die("bad device name '%s'", name ? name : "");
-	snprintf(cmd, sizeof(cmd), "dmsetup remove %s", name);
-	return dmbb_run_cmd(cmd) < 0 ? 1 : 0;
+	return dmsetup_verb("remove", name) < 0 ? 1 : 0;
 }
 
 static void dmbb_usage(void)
@@ -11971,13 +12774,15 @@ static int ckpt_whole(const char *path, uint64_t size)
 {
 	FILE *f = fopen(path, "re");
 	char line[256];
-	uint64_t sz = 0, start = 1, end = 0, bytes = 0, v;
+	uint64_t sz = 0, start = 1, end = 0, bytes = 0, skipped = 0, v;
 
 	if (!f)
 		return 0;
 	while (fgets(line, sizeof(line), f)) {
 		if (sscanf(line, "size %" SCNu64, &v) == 1)
 			sz = v;
+		else if (sscanf(line, "skipped %" SCNu64, &v) == 1)
+			skipped = v;
 		else if (sscanf(line, "start %" SCNu64, &v) == 1)
 			start = v;
 		else if (sscanf(line, "end %" SCNu64, &v) == 1)
@@ -11988,7 +12793,13 @@ static int ckpt_whole(const char *path, uint64_t size)
 			break;
 	}
 	fclose(f);
-	return sz == size && start == 0 && end == size && bytes >= size;
+	/*
+	 * What --skip-slow jumped over was not read, but it was condemned: it
+	 * is in the list as a region, so the list still accounts for every
+	 * byte of the drive.
+	 */
+	return sz == size && start == 0 && end == size &&
+	       bytes + skipped >= size;
 }
 
 /* the checkpoint of the newest finished whole-drive scan of d, if any */
@@ -12026,14 +12837,63 @@ static int last_whole_scan(const device_t *d, char *ckpt, size_t len,
 	return found;
 }
 
-static int hide_bad(device_t *t, int n, const opts_t *o)
+/*
+ * The extent size for a map of this list.  The map keeps one entry per
+ * skipped extent, all of them inside one extent of its own, and a region
+ * --skip-slow condemned can be hundreds of gigabytes -- far more 1 MiB
+ * entries than fit.  So take the smallest extent whose entries fill no more
+ * than half the map, leaving the other half for the remaps a live drive goes
+ * on needing.  A coarser extent hides more around each bad sector; that is
+ * capacity, never data.
+ */
+static uint64_t hide_extent(const char *list)
+{
+	uint64_t ext;
+
+	for (ext = DMBB_DEF_EXTENT; ext < DMBB_MAX_EXTENT; ext <<= 1) {
+		uint32_t cnt = 0;
+		uint64_t *v = dmbb_read_badlist(list, 4096, ext, &cnt);
+
+		free(v);
+		if (DMBB_HDR_BYTES + (uint64_t)cnt * 8 <= ext / 2)
+			break;
+	}
+	if (ext != DMBB_DEF_EXTENT) {
+		char b1[32];
+
+		out("  the damage is too widespread for %s extents; using %s\n",
+		    human_size(DMBB_DEF_EXTENT, b1, sizeof(b1)),
+		    human_size(ext, (char[32]){0}, 32));
+	}
+	return ext;
+}
+
+/* what --hide-bad calls the device it makes over d */
+static void hide_name(const device_t *d, char *name, size_t len)
+{
+	char slug[56];
+
+	report_slug(d->serial[0] ? d->serial : d->name, slug, sizeof(slug));
+	snprintf(name, len, "bb-%s", slug);
+	if (!dmbb_name_ok(name))
+		snprintf(name, len, "bb-%.60s", d->name);
+}
+
+/*
+ * made, when given, gets the name of each device actually activated, and
+ * an empty string for every drive that did not get one -- an image, a dry
+ * run, a refusal.  --rescan tests exactly those and nothing else.
+ */
+static int hide_bad(device_t *t, int n, const opts_t *o, mapname_t *made)
 {
 	int i, worst = 0;
 
+	for (i = 0; made && i < n; i++)
+		made[i][0] = 0;
 	for (i = 0; i < n; i++) {
 		device_t *d = &t[i];
 		char ckpt[STORE_MAX + 128], list[STORE_MAX + 128];
-		char runid[48], slug[56], name[DMBB_NAME_MAX_LEN + 1];
+		char runid[48], name[DMBB_NAME_MAX_LEN + 1];
 		dmbb_opts_t dop;
 		int ok = o->tui || (o->confirm &&
 			 (!strcmp(o->confirm, d->name) ||
@@ -12059,19 +12919,15 @@ static int hide_bad(device_t *t, int n, const opts_t *o)
 		}
 		snprintf(list, sizeof(list), "%.*s.dmbb",
 			 (int)(strlen(ckpt) - 5), ckpt);
-		if (badblocks_replay(ckpt, list, 4096, 0))
+		if (badblocks_replay(ckpt, list, 4096, 0, 1))
 			return 2;
-		report_slug(d->serial[0] ? d->serial : d->name, slug,
-			    sizeof(slug));
-		snprintf(name, sizeof(name), "bb-%s", slug);
-		if (!dmbb_name_ok(name))
-			snprintf(name, sizeof(name), "bb-%s", d->name);
+		hide_name(d, name, sizeof(name));
 
 		memset(&dop, 0, sizeof(dop));
 		dop.dev = d->path;
 		dop.bad = list;
 		dop.bs = 4096;
-		dop.ext = DMBB_DEF_EXTENT;
+		dop.ext = hide_extent(list);
 		dop.reserve = DMBB_DEF_RESERVE;
 		dop.name = name;
 		dop.confirm = d->path;
@@ -12080,7 +12936,9 @@ static int hide_bad(device_t *t, int n, const opts_t *o)
 		    runid);
 		if (o->dry_run) {
 			out("  dry run: would write a map of it to %s and "
-			    "activate /dev/mapper/%s\n", d->path, name);
+			    "activate /dev/mapper/%s%s\n", d->path, name,
+			    o->rescan ? ", then write and verify every sector "
+			    "of that" : "");
 			continue;
 		}
 		/* create refuses a drive that already carries a map */
@@ -12097,12 +12955,70 @@ static int hide_bad(device_t *t, int n, const opts_t *o)
 			worst = 2;
 			continue;
 		}
+		if (made)
+			snprintf(made[i], sizeof(made[i]), "%s", name);
 		out("\n  /dev/mapper/%s is %s with its damage cut out.  Put the "
 		    "filesystem on that,\n  never on %s itself.  Damage found "
 		    "later: '%s dm remap %s --bad LIST'\n", name, d->path,
 		    d->path, PROG, d->path);
 	}
 	return worst;
+}
+
+/*
+ * --rescan: after --hide-bad, test what is left.  The device --hide-bad just
+ * made is empty and nothing can be on it yet, so the test is the predeploy
+ * one -- write every sector, verify it reads back -- and that is the point:
+ * a read pass would only time the surviving surface, while data written
+ * through the map and read back through it proves the map puts every byte
+ * where it will be found again.  No drive setting is touched: the device is
+ * a map, and the drive under it was configured, if at all, by the scan that
+ * found the damage.
+ */
+
+static int rescan_target(const char *name, const char *over, device_t *d)
+{
+	char link[PATH_MAX], real[PATH_MAX];
+
+	snprintf(link, sizeof(link), "/dev/mapper/%s", name);
+	if (!realpath(link, real)) {
+		msg(PROG ": %s: %s; nothing to rescan\n", link, strerror(errno));
+		return -1;
+	}
+	if (resolve_target(real, d) < 0)
+		return -1;
+	snprintf(d->model, sizeof(d->model), "%.*s over %.*s", 38, name, 30,
+		 over);
+	return 0;
+}
+
+static void rescan_opts(opts_t *o)
+{
+	const profile_t *p = profile_by_name("predeploy");
+
+	o->profile = p->name;
+	o->mode = p->mode;
+	o->rewrite_weak = p->rewrite_weak;
+	o->force_remap = 0;
+	o->second_pass = p->second_pass;
+	o->skip_slow = 0;       /* the point is to see all of what is left */
+	o->sample = 0;
+	o->chunk = p->chunk;
+	o->start = o->end = 0;
+	o->state = NULL;
+	o->resume = 0;
+	o->fix_config = o->bms = o->bms_interval = 0;
+	o->write_cache = o->read_cache = -1;
+	o->awre = o->arre = -1;
+	o->recovery_ms = o->rd_retries = o->wr_retries = -1;
+	o->persist = 0;
+	o->write_cache_set = o->read_cache_set = o->lookahead_set = 0;
+	/* a map reports what the drive under it does, but a kernel that does
+	 * not pass the flag up must not turn this into a refusal */
+	o->include_ssd = 1;
+	o->hide_bad = o->rescan = 0;
+	o->repair = o->format = o->apply_only = 0;
+	o->rescan_ok = 1;
 }
 
 /*
@@ -13027,10 +13943,14 @@ static void status_one(const run_t *r, int json)
 			printf("\"size\": %" PRIu64 ", \"percent\": %.2f, "
 			       "\"rate\": %.0f, \"eta\": %.0f, "
 			       "\"bad\": %" PRIu64 ", \"weak\": %" PRIu64 ", "
+			       "\"chunks_read\": %" PRIu64 ", "
+			       "\"chunks_over_budget\": %" PRIu64 ", "
+			       "\"bytes_skipped\": %" PRIu64 ", "
 			       "\"bytes\": %" PRIu64
 			       ", \"verdict\": %d }%s\n",
 			       x->size, x->state == JS_DONE ? 100.0 : x->pct,
-			       x->rate, x->eta, x->bad, x->weak,
+			       x->rate, x->eta, x->bad, x->weak, x->chunks,
+			       x->slow, x->skipped,
 			       x->bytes, x->verdict, i + 1 < n ? "," : "");
 		}
 		printf("    ]\n  }");
@@ -13049,17 +13969,21 @@ static void status_one(const run_t *r, int json)
 	if (t.orphaned)
 		out("   %s%d orphaned%s", c_yel(), t.orphaned, c_off());
 	out("\n  reports in %s/   records in %s\n\n", r->outdir, r->dir);
-	out("  %-10s %-9s %-20s %6s %9s %9s %-10s %s\n", "DRIVE", "SIZE",
-	    "MODEL", "PCT", "BAD", "WEAK", "STATE", format ? "MESSAGE" : "ETA");
+	out("  %-10s %-9s %-20s %6s %9s %9s %6s %-10s %s\n", "DRIVE", "SIZE",
+	    "MODEL", "PCT", "BAD", "WEAK", "OVER", "STATE",
+	    format ? "MESSAGE" : "ETA");
 	for (i = 0; i < n; i++) {
 		const jrec_t *x = &j[i];
+		char ob[16];
 
 		out("  %-10.10s %-9s %-20.20s %5.1f%% %9" PRIu64 " %9" PRIu64
-		    " %s%-10s%s %s\n", jrec_name(x),
+		    " %s%6s%s %s%-10s%s %s\n", jrec_name(x),
 		    human_size(x->size, b1, sizeof(b1)),
 		    x->model[0] ? x->model : "?",
 		    x->state == JS_DONE ? 100.0 : x->pct, x->bad, x->weak,
-		    jrec_color(x), jrec_word(x, format), c_off(),
+		    over_col(x->slow, x->chunks),
+		    over_str(x->slow, x->chunks, ob, sizeof(ob)),
+		    x->slow ? c_off() : "", jrec_color(x), jrec_word(x, format), c_off(),
 		    format ? x->note :
 		    x->state == JS_RUNNING ?
 		    human_time(x->eta, b2, sizeof(b2)) : x->note);
@@ -13274,6 +14198,7 @@ int main(int argc, char **argv)
 		o.rewrite_weak = p->rewrite_weak;
 		o.force_remap = p->force_remap;
 		o.second_pass = p->second_pass;
+		o.skip_slow = p->skip_slow;
 		if (p->sample)
 			o.sample = p->sample;
 		if (p->chunk)
@@ -13362,6 +14287,10 @@ int main(int argc, char **argv)
 			o.repair = 1;
 		} else if (!strcmp(a, "--second-pass")) {
 			o.second_pass = 1;
+		} else if (!strcmp(a, "--skip-slow")) {
+			o.skip_slow = 1;
+		} else if (!strcmp(a, "--no-skip-slow")) {
+			o.skip_slow = 0;
 		} else if (!strcmp(a, "--start")) {
 			if (parse_size(NEXT(), &o.start))
 				die("bad --start value");
@@ -13448,6 +14377,8 @@ int main(int argc, char **argv)
 			o.apply_only = 1;
 		} else if (!strcmp(a, "--hide-bad")) {
 			o.hide_bad = 1;
+		} else if (!strcmp(a, "--rescan")) {
+			o.rescan = 1;
 		} else if (!strcmp(a, "--fix-config") ||
 			   !strcmp(a, "--no-fix-config")) {
 			o.fix_config = !strcmp(a, "--fix-config");
@@ -13652,7 +14583,7 @@ int main(int argc, char **argv)
 			die("--badblocks-from needs --badblocks-list FILE to "
 			    "write to");
 		return badblocks_replay(o.bb_from, o.badblocks, o.bb_blocksize,
-					o.bb_offset);
+					o.bb_offset, 0);
 	}
 	if (o.status)
 		return status_print(o.runarg, o.status_json);
@@ -13785,6 +14716,28 @@ tui_again:
 			if (store_live_count() > 0 && !tui_runs()) {
 				tui_cooked();
 				return worst;
+			}
+		}
+		/*
+		 * A device the summary just hid a drive's damage behind: test
+		 * it, rather than showing a form nobody asked for.
+		 */
+		if (g_rescan[0]) {
+			device_t d;
+			int got = !rescan_target(g_rescan, g_rescan_over, &d);
+
+			g_rescan[0] = 0;
+			if (got) {
+				free(targets);
+				targets = malloc(sizeof(*targets));
+				if (!targets)
+					die("out of memory");
+				targets[0] = d;
+				ntargets = 1;
+				rescan_opts(&o);
+				tui_clear();
+				g_quiet = 1;
+				goto rescan_go;
 			}
 		}
 		n = enumerate_devices(&all);
@@ -13934,8 +14887,50 @@ tui_again:
 	 * exits (invariant 7b).  --apply-settings has no run at all, so it
 	 * does the work here and now.
 	 */
-	if (o.hide_bad)
-		return hide_bad(targets, ntargets, &o);
+	if (o.rescan && !o.hide_bad)
+		die("--rescan goes with --hide-bad: it tests the device that "
+		    "makes");
+	if (o.hide_bad) {
+		mapname_t *made = calloc((size_t)ntargets, sizeof(*made));
+		int st, k = 0;
+
+		if (!made)
+			die("out of memory");
+		/* the form has no field for it: there, it always follows */
+		if (o.tui)
+			o.rescan = 1;
+		st = hide_bad(targets, ntargets, &o, made);
+		if (!o.rescan || o.dry_run) {
+			free(made);
+			return st;
+		}
+		for (i = 0; i < ntargets; i++) {
+			device_t d;
+
+			if (!made[i][0])
+				continue;
+			if (rescan_target(made[i], targets[i].name, &d) < 0) {
+				st = 2;
+				continue;
+			}
+			targets[k++] = d;
+		}
+		free(made);
+		if (!k)
+			return st;
+		ntargets = k;
+		worst = st;
+		rescan_opts(&o);
+		out("\n  testing what is left: writing and verifying every "
+		    "sector of %d device%s\n", k, k == 1 ? "" : "s");
+		if (o.tui) {
+			if (tui_raw() < 0)
+				die("the interactive UI needs a terminal");
+			tui_clear();
+			g_quiet = 1;
+		}
+	}
+rescan_go:
 	if (o.apply_only) {
 		if (!settings_wanted(&o))
 			die("--apply-settings without any setting to apply. "
@@ -14050,7 +15045,7 @@ tui_again:
 			    "health. Use --include-remote if you really want to test it.",
 			    d->path, transport_name(d->transport));
 		if (mode_writes(o.mode) || o.force_remap || o.rewrite_weak) {
-			int ok = o.tui || (o.confirm &&
+			int ok = o.tui || o.rescan_ok || (o.confirm &&
 				 (!strcmp(o.confirm, d->name) ||
 				  (d->serial[0] && !strcmp(o.confirm, d->serial))));
 

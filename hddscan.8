@@ -123,6 +123,14 @@ retry. Both are counted in sectors of
 bytes, and once either is not zero it is coloured, red and yellow. The end of
 scan report breaks the same sectors down by how many tries and how many errors
 each one took.
+.PP
+.B OVER
+is the share of chunk reads, over the whole scan so far, that missed their
+budget. It is the number to watch on a drive that is slow across whole
+regions: every chunk there is drilled into, nearly every sector inside comes
+back in time, and WEAK barely moves while the scan crawls. It is yellow once
+any chunk has been over, and red once more than one in a thousand have, which
+is the same line at which the verdict turns SUSPECT for it.
 .SS Thresholds
 Budgets are calibrated per drive, using the same access pattern the scan will
 use. Timing scattered reads and then scanning sequentially would produce a
@@ -171,7 +179,8 @@ Quick triage of a shelf: samples the surface, read only.
 Weeks after a predeploy run: has the pattern rotted?
 .TP
 .B repair
-predeploy, plus forcing a reallocation of anything unreadable.
+predeploy, plus forcing a reallocation of anything unreadable, and
+.BR \-\-skip\-slow .
 .RE
 .IP
 The drive settings a profile carries apply only in its own mode.
@@ -363,6 +372,28 @@ drive's own DRAM is not a repair you verified.
 After
 .BI \-\-mode " write" ,
 re-read the whole device and re-verify the pattern, catching slow data decay.
+.TP
+.B \-\-skip\-slow
+For a drive that is slow across whole regions rather than in single sectors,
+where drilling into every chunk finds little and takes weeks. Once three
+quarters of the chunks over the last 64 MiB have missed their budget, stop
+reading: probe a few chunks 1 GiB further on, and again, until a probe comes
+back in budget, then bisect between the last slow probe and that one down to
+16 MiB and carry on scanning there. Every probe is judged against the same
+calibrated budget as the scan. What was jumped over is
+.B condemned without being read:
+the report says so on its Coverage line and under the verdict, draws it as
+.B ~
+on the surface map, and lists each region;
+.B \-\-hide\-bad
+cuts the regions out with the rest of the damage, and a scan with skips still
+counts as covering the whole drive for it. Any skip makes the verdict at least
+SUSPECT. Sequential or reverse order only, and not with
+.BR \-\-sample .
+On under the repair profile.
+.TP
+.B \-\-no\-skip\-slow
+Read every region however slow, including under the repair profile.
 .TP
 .B \-\-rewrite\-weak
 Rewrite readable-but-slow sectors in place so the drive refreshes or remaps
@@ -653,7 +684,25 @@ damage that happened to be looked at. Whatever is on the drive becomes
 unreachable, so it needs
 .B \-\-confirm
 exactly as a write mode does. The drive is found in the run store by serial,
-since its name can change between boots.
+since its name can change between boots. When the damage includes regions
+.B \-\-skip\-slow
+condemned, the map uses extents as coarse as it needs, up to 64 MiB, to hold
+them.
+.TP
+.B \-\-rescan
+With
+.BR \-\-hide\-bad ,
+test the device it just activated: a predeploy pass over
+.IR /dev/mapper/bb\-<serial> ,
+writing every sector and verifying it reads back. That proves both that what
+is left of the surface is sound and that data written through the map comes
+back from where it should. The device is empty, and
+.B \-\-confirm
+for
+.B \-\-hide\-bad
+covers it; no drive setting is changed. The interactive form always does this
+after hiding a drive's damage. An image file gets its map written but no
+device, so there is nothing to rescan.
 .TP
 .BI \-\-badblocks\-blocksize " N"
 Unit for that list. Default 1024. Use the block size the filesystem will be

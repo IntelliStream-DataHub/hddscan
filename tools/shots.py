@@ -349,6 +349,8 @@ def demo_store(state, live_pid):
                            j.get("rate", 0), j.get("eta", 0), j.get("bad", 0),
                            j.get("weak", 0), j.get("bytes", 0),
                            *j.get("lat", (0, 0, 0, 0))))
+                if j.get("chunks"):
+                    f.write("over %d %d\n" % (j.get("over", 0), j["chunks"]))
                 if j.get("wlat"):
                     f.write("wlat %.2f\n" % j["wlat"])
                 if j.get("note"):
@@ -370,6 +372,9 @@ def demo_store(state, live_pid):
                              rate=(169.75 + 5.7 * i) * (1 << 20),
                              eta=(5 * 3600 + 50 * 60) + i * 1600,
                              weak=40 + 23 * i, bytes=int(size * pct / 50),
+                             chunks=int(size * pct / 100) >> 20,
+                             over=(int(size * pct / 100) >> 20) // 3
+                             if i == 2 else 5 * i,
                              lat=(11.0 + 0.4 * i, 12.8 + 0.6 * i, 7.5,
                                   26.7 + 9 * i), wlat=21.4))
         else:
@@ -378,7 +383,8 @@ def demo_store(state, live_pid):
             scan.append(dict(dev=n, model=model, serial="ZL2%05d" % i,
                              size=size, state=2, verdict=1 if bad or weak else 0,
                              pct=100, ended=now - 3600 * (i % 5), bad=bad,
-                             weak=weak, bytes=size * 2,
+                             weak=weak, bytes=size * 2, chunks=size >> 20,
+                             over=40 if n == "sdg" else 0,
                              lat=(10.9, 12.1, 7.4, 31.0)))
     run("20260912-080512", "scan", "write (predeploy)",
         "destructive write + verify", "predeploy", now - 83 * 3600, scan)
