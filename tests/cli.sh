@@ -514,6 +514,163 @@ assert_has "a resumed scan's surface map keeps the bands scanned before" \
 assert_has "a band only microseconds over expectations is not held against it" \
 	"$(bandck 3200)" "VERDICT: HEALTHY"
 
+echo "== a region slow as a whole: --skip-slow =="
+
+# A drive slow across whole regions drills every chunk there and finds almost
+# nothing, so the scan crawls.  --skip-slow condemns such a region unread.  An
+# image never reads slowly, so HDDSCAN_SLOW makes reads in a byte range
+# *report* extra milliseconds per MiB -- exact, and costing no time.  Per MiB
+# is the point: a 1 MiB chunk misses a one-second budget while each 4 KiB
+# sector inside it comes back in 20 ms, which is the drive this is for.  The
+# images are sparse, so gigabytes cost nothing to read.
+G=1073741824
+slowimg() { rm -f "$TMP/$1"; truncate -s "$2" "$TMP/$1"; echo "$TMP/$1"; }
+slowrun() {
+	local range=$1; shift
+	HDDSCAN_SLOW=$range HDDSCAN_SLOW_MS=5000 \
+		run --chunk 1M --chunk-slow-ms 1000 --retries 1 "$@"
+}
+# json_region FILE -> "offset end" of the first slow region
+json_region() {
+	awk -F'[:,}]' '/"offset".*"length".*"unread"/ {
+		gsub(/ /, ""); print $2, $2 + $4; exit }' "$1"
+}
+
+f=$(slowimg skip.bin 3G)
+out=$(slowrun 1G:1G --skip-slow --state "$TMP/skip.ckpt" \
+	--json "$TMP/skip.json" --csv "$TMP/skip.csv" "$f")
+assert_has "a slow region is skipped once the window fills" "$out" \
+	"skipped"
+assert_has "the Coverage line says what was never read" "$out" \
+	"every sector was read or condemned"
+assert_has "a skip makes the drive at least SUSPECT" "$out" \
+	"VERDICT: SUSPECT - 1 region of the surface"
+assert_has "and the verdict box says the region was not tested" "$out" \
+	"Not covered:"
+assert_has "the surface map marks the region" "$out" "~~~~"
+assert_has "and its legend says what the mark means" "$out" \
+	"'~' slow as a whole"
+assert_has "the report lists the region" "$out" \
+	"Slow regions, condemned by --skip-slow"
+read -r roff rend <<< "$(json_region "$TMP/skip.json")"
+assert_eq "the region starts at the first slow chunk" "$roff" "$G"
+# the edge is found to 16 MiB plus a probe, and never past it: condemning
+# fast surface costs capacity, but only the slow chunks may pay for it
+if [ -n "$rend" ] && [ "$rend" -le $((2 * G)) ] &&
+   [ "$rend" -ge $((2 * G - 32 * 1048576)) ]; then
+	ok "the region ends within 32 MiB short of the slow range's end"
+else
+	bad "the region ends within 32 MiB short of the slow range's end" \
+	    "ended at ${rend:-nothing}"
+fi
+assert_has "the JSON counts what was skipped" "$(cat "$TMP/skip.json")" \
+	'"bytes_skipped": '
+assert_has "the CSV carries the region" "$(cat "$TMP/skip.csv")" \
+	",slowregion,"
+assert_has "the checkpoint carries the region" "$(cat "$TMP/skip.ckpt")" \
+	"skip "
+rid=$(ls -t "$HDDSCAN_STATE_DIR/runs" | head -1)
+st=$($HDDSCAN --no-color --status "$rid" 2>&1)
+assert_has "--status has an OVER column" "$st" "OVER"
+assert_has "--status-json counts chunks over budget" \
+	"$($HDDSCAN --status-json "$rid" 2>&1)" '"chunks_over_budget": '
+
+out=$(slowrun 1G:1G "$f")
+assert_hasnt "without --skip-slow nothing is skipped" "$out" "skipped"
+assert_has "and every sector is read" "$out" \
+	"every sector of the device was read"
+assert_has "--no-skip-slow wins over an earlier --skip-slow" \
+	"$(slowrun 1G:1G --skip-slow --no-skip-slow "$f")" \
+	"every sector of the device was read"
+assert_has "--skip-slow is refused for an order that does not walk" \
+	"$(slowrun 1G:1G --skip-slow --order random "$f")" \
+	"needs a scan that walks the drive"
+
+f=$(slowimg skipend.bin 3G)
+out=$(slowrun 1G:2G --skip-slow --json "$TMP/skipend.json" "$f")
+assert_has "a region slow to the end of the drive is condemned to it" \
+	"$out" "carried on to the end"
+read -r roff rend <<< "$(json_region "$TMP/skipend.json")"
+assert_eq "and the region ends where the drive does" "$rend" $((3 * G))
+
+f=$(slowimg skiprev.bin 3G)
+out=$(slowrun 1G:1G --skip-slow --order reverse --json "$TMP/skiprev.json" "$f")
+read -r roff rend <<< "$(json_region "$TMP/skiprev.json")"
+if [ -n "$roff" ] && [ "$roff" -ge "$G" ] && [ "$roff" -le $((G + 32 * 1048576)) ] &&
+   [ "$rend" = $((2 * G)) ]; then
+	ok "a reverse scan finds the same region from its other end"
+else
+	bad "a reverse scan finds the same region from its other end" \
+	    "got ${roff:-?}..${rend:-?}"
+fi
+
+# A resumed scan has to know what it skipped before, or it would call the
+# drive fully read.  Resumed at the step just past the region, from the
+# checkpoint the first run left.
+f=$TMP/skip.bin
+out=$(HDDSCAN_SLOW=1G:1G HDDSCAN_SLOW_MS=5000 run --chunk 1M \
+	--chunk-slow-ms 1000 --skip-slow --state "$TMP/skip.ckpt" --resume "$f")
+assert_has "a resumed scan keeps the regions it skipped before" "$out" \
+	"Slow regions, condemned by --skip-slow"
+# and one resumed inside the region jumps it rather than reading it.  The
+# region still reads slow and --skip-slow is off, so every chunk of it read
+# would be one more over budget.  The only slow chunks it may read are the
+# strip between where the region was condemned to and where the slowness
+# really ends at 2 GiB -- the edge is only found to 16 MiB -- which this
+# finished checkpoint, sent back to step 1500, has already counted once.
+sed -e 's/^step .*/step 1500/' -e 's/^pos .*/pos 1572864000/' \
+	"$TMP/skip.ckpt" > "$TMP/skip2.ckpt"
+was=$(awk '/^counters /{print $3}' "$TMP/skip2.ckpt")
+s1=$(awk '/^skip /{print $4; exit}' "$TMP/skip2.ckpt")
+out=$(slowrun 1G:1G --state "$TMP/skip2.ckpt" --resume "$f")
+assert_eq "a scan resumed inside a skipped region does not read it" \
+	"$(awk '/chunks over budget/{print $4}' <<< "$out")" \
+	"$((was + 2048 - s1))"
+assert_has "and still says the region was never read" "$out" \
+	"every sector was read or condemned"
+
+# --hide-bad takes a skipped region with the rest of the damage, and the scan
+# still counts as covering the whole drive for it
+f=$(slowimg skiphide.bin 3G)
+slowrun 1G:1G --skip-slow "$f" >/dev/null
+out=$(hide --hide-bad --dry-run --rescan --confirm "$f" "$f")
+assert_has "--hide-bad --rescan --dry-run says it would test what is left" \
+	"$out" "then write and verify every sector"
+out=$(hide --hide-bad --rescan --confirm "$f" "$f"); rc=$?
+assert_eq "a scan with a skip is whole enough for --hide-bad" "$rc" "0"
+st=$($HDDSCAN dm status "$f" 2>&1)
+if n=$(sed -n 's/.*skipped *\([0-9]*\) extents bad.*/\1/p' <<< "$st") &&
+   [ -n "$n" ] && [ "$n" -ge 1000 ] && [ "$n" -le 1024 ]; then
+	ok "the map skips the whole region"
+else
+	bad "the map skips the whole region" "$st"
+fi
+assert_has "an offset inside the region is not on the new device" \
+	"$($HDDSCAN dm map "$f" $((G + G / 2)) --physical)" \
+	"not part of the virtual device"
+assert_has "an image gets its map but no device, so no rescan" "$out" \
+	"needs a loop device"
+assert_hasnt "and no rescan is attempted" "$out" "testing what is left"
+assert_has "--rescan needs --hide-bad" \
+	"$(runp --rescan "$f")" "--rescan goes with --hide-bad"
+out=$($HDDSCAN --badblocks-from "$TMP/skip.ckpt" --badblocks-list \
+	"$TMP/skip.bb" --badblocks-blocksize 4096 2>&1)
+assert_has "a badblocks list names every block of a region" \
+	"$(head -1 "$TMP/skip.bb")" "262144"
+assert_has "and warns that the list is the wrong tool for it" "$out" \
+	"--hide-bad is the better way"
+
+# Under a destructive pass the skipped region is never written, so the verify
+# pass after it must not read it: a pattern that was never put there would be
+# every block corrupt.
+f=$(slowimg skipw.bin 1300M)
+out=$(HDDSCAN_SLOW=16M:1184M HDDSCAN_SLOW_MS=5000 runp --profile repair \
+	--chunk-slow-ms 1000 --retries 1 --confirm "$f" "$f")
+assert_has "the repair profile skips slow regions by default" "$out" \
+	"skipped"
+assert_has "the verify pass leaves the unwritten region alone" "$out" \
+	"sectors with wrong data              0"
+
 echo "== what the kernel logged against the drive =="
 
 # A drive that stops answering is aborted, reset and retried by the kernel,

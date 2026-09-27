@@ -320,6 +320,19 @@ def main():
               s.set_choice("Profile", "decay")
               and s.wait(lambda: s.value_of("Chunk size") == "128K"),
               "chunk %r" % s.value_of("Chunk size"))
+        # --skip-slow condemns what it jumps over, so only the profile for
+        # a drive already being salvaged turns it on
+        check("decay reads every region however slow",
+              s.wait(lambda: s.value_of("Skip slow regions") == "no"),
+              "got %r" % s.value_of("Skip slow regions"))
+        check("repair skips regions slow as a whole",
+              s.set_choice("Profile", "repair")
+              and s.wait(lambda: s.value_of("Skip slow regions") == "yes"),
+              "got %r" % s.value_of("Skip slow regions"))
+        check("and leaving repair turns it off again",
+              s.set_choice("Profile", "predeploy")
+              and s.wait(lambda: s.value_of("Skip slow regions") == "no"),
+              "got %r" % s.value_of("Skip slow regions"))
         s.send(b"q"); s.close()
 
         print("== the form is grouped by what a setting changes ==")
@@ -703,6 +716,12 @@ def main():
             # carries the tries and errors behind each sector.
             check("the table does not split weak sectors into two columns",
                   "SLOW" not in lines[i], lines[i])
+            # chunks over budget are a different number from weak sectors:
+            # a drive slow across whole regions drills every chunk and
+            # finds almost no sector to count, so WEAK sits still while the
+            # scan crawls, and this is the column that moves
+            check("the table has an OVER column for chunks over budget",
+                  "OVER" in lines[i], lines[i])
             # the header carries the first row of a record; the second is
             # labelled in place, and is checked against a running drive
             # further down
@@ -1255,7 +1274,8 @@ def main():
             s.close()
             return ls, raw
 
-        lines, raw = wide(134)
+        # 140 is exactly what one row needs: the OVER column put it up six
+        lines, raw = wide(140)
         h, w = state_cols(lines)
         check("a wide terminal puts each drive on one row",
               any(l.lstrip().startswith("sdc ") and "4800.2" in l
@@ -1266,7 +1286,7 @@ def main():
               h > 0 and len(w) == 5 and set(w) == {h},
               "STATE at %d, state words at %r" % (h, w))
         check("one row per drive never runs past the terminal",
-              drawn_widths(raw) and max(drawn_widths(raw)) <= 134,
+              drawn_widths(raw) and max(drawn_widths(raw)) <= 140,
               "widest row drawn: %d" % max(drawn_widths(raw) or [0]))
         # and a terminal wider still is not left half empty: the model and
         # size go beside the name, then a bar of each drive's progress
@@ -1284,7 +1304,7 @@ def main():
         check("the widest layout fills the terminal and no more",
               max(drawn_widths(raw) or [0]) == 214,
               "widest row drawn: %d" % max(drawn_widths(raw) or [0]))
-        lines, raw = wide(133)
+        lines, raw = wide(139)
         check("a terminal one column short keeps two rows",
               not any(l.lstrip().startswith("sdc ") and "med" in l
                       for l in lines) and

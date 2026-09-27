@@ -308,6 +308,67 @@ reads eight times the chunk size — and tells you what it found:
   bring this scan to about 5h 12m.
 ```
 
+### A drive slow across whole regions
+
+Drill-down assumes trouble is concentrated: a chunk over budget holds a sector
+that is slow on its own, and reading the chunk a sector at a time finds it.
+Some drives are slow the other way — across a whole region, a revolution or
+two of internal retry spread over every track, so that a 1 MiB chunk takes 70
+ms instead of 16 while each 4 KiB sector inside it comes back comfortably in
+budget. Such a drive drills every chunk of the region, pays a cache-busting
+seek for every sector of it, finds almost nothing to call weak, and crawls: a
+real one did 83% of its surface at 390 KiB/s, with an ETA of 1822 hours and a
+WEAK count that had stopped moving.
+
+Two things follow. The dashboard has an `OVER` column, the share of chunk
+reads over budget across the whole scan, because on this drive it is the only
+number that moves. It turns red at the same one-in-a-thousand line at which
+the verdict holds it against the drive, so the screen and the report cannot
+disagree about it.
+
+And `--skip-slow` (on under the repair profile) stops reading such a region.
+When three quarters of the chunks in the last 64 MiB have been over budget, it
+probes a few chunks 1 GiB further on, and again, until a probe comes back in
+budget, then bisects between the last slow probe and that one down to 16 MiB
+and carries on scanning from there. The first probe read of each run is thrown
+away because it carries the seek. The steps are fixed rather than doubling, so
+a healthy island more than a gigabyte wide is still found.
+
+What was jumped over is **condemned without being read**. That is the whole
+cost, and the design makes sure it is paid in the open:
+
+- **Every probe is judged against the calibrated per-offset budget**, the same
+  one the scan uses (invariant 1b). A region is slow because the platter's
+  geometry says it should be quicker there, never because it is slower than its
+  neighbours.
+- **A probe that learns nothing condemns nothing.** Reads refused for alignment
+  or protection information are not evidence (invariant 3). A probe with no
+  evidence counts as fast, so the scan reads the place instead.
+- **The report says it**, on the Coverage line, as a `Not covered` paragraph
+  under the verdict, as `~` on the surface map, and as a table of regions.
+  Any skip makes the verdict at least SUSPECT.
+- **The regions are damage.** They go into the checkpoint, the CSV, the JSON
+  and the badblocks list. The finished scan still counts as covering the whole
+  drive for `--hide-bad`, because every byte was either read or condemned.
+  Being wrong this way costs capacity, never data.
+- **A destructive pass never writes the region**, so its verify pass skips it
+  too. Otherwise the pattern that was never written would read back as a
+  drive's worth of corruption.
+
+The dm map keeps one entry per skipped extent inside a single extent of its
+own, and a region can be hundreds of gigabytes. So `--hide-bad` picks the
+smallest extent, up to 64 MiB, whose entries fill no more than half the map,
+leaving the other half for later remaps. The list it hands the map writes each
+region as one `FIRST-LAST` line rather than a hundred million single blocks.
+That syntax is the map's alone: a list for `mke2fs` still names every block,
+and says it is the wrong tool for regions that size.
+
+`--hide-bad --rescan` (automatic from the form) then tests what is left. It
+runs a predeploy pass over `/dev/mapper/bb-*`: every sector written through the
+map and read back through it. That proves the surviving surface is sound and
+that the map puts every byte back where it will be found. No drive setting is
+touched, because the device is a map.
+
 ### The budget follows the platter
 
 A disk spins at a fixed rate, so an outer track sweeps further per revolution
@@ -1161,7 +1222,8 @@ MIT. See [LICENSE](LICENSE). Copyright (c) 2026 Olav Gjerde.
 
 **The device-mapper side of `hddscan dm` has not been run.** Activating a map,
 remapping on a live device (suspend, reload, resume, and putting the old map
-back when a reload fails), and the boot unit all need root. The suite proves
+back when a reload fails), the boot unit, and `--rescan` of an activated
+device all need root. The suite proves
 the table arithmetic and that data survives a remap by applying each table
 with `dd`, not the kernel.
 

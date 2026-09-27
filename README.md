@@ -63,7 +63,7 @@ depends entirely on what you are about to do with it:
 | **inservice** | read | It holds data you want to keep. Never writes anything. |
 | **survey** | read, sampled | Quick triage of a shelf. |
 | **decay** | check | Weeks after a predeploy run: has the pattern rotted? |
-| **repair** | write | predeploy, plus forcing a reallocation of anything unreadable. |
+| **repair** | write | predeploy, plus forcing a reallocation of anything unreadable, and skipping regions slow as a whole (`--skip-slow`). |
 
 A drive being prepared is the one moment someone is deliberately configuring
 it, so predeploy (and repair) also **save** the configuration it should run
@@ -89,6 +89,7 @@ XFS), hddscan can cut the damage out one layer down instead:
 ```sh
 sudo hddscan --profile inservice /dev/sdc            # a whole-drive scan
 sudo hddscan --hide-bad --confirm sdc /dev/sdc       # -> /dev/mapper/bb-<serial>
+sudo hddscan --hide-bad --rescan --confirm sdc /dev/sdc   # ... and test what is left
 sudo zpool create -o ashift=12 -O compression=zstd backup /dev/mapper/bb-<serial>
 ```
 
@@ -98,7 +99,9 @@ later is moved to spares held back for it (`hddscan dm remap`), and
 `contrib/dm-badblocks.service` sets the devices up again at boot. The form
 offers it as **Mode → hide bad**, and the summary a scan ends on offers it as
 `h` for any drive the scan found damage on: pick the drive with ↑/↓, press `h`,
-confirm with `y`. See `DESIGN.md` for how the map works.
+confirm with `y`. From the form either way, a write-and-verify pass over the
+new device follows, which is what `--rescan` does on the command line. See
+`DESIGN.md` for how the map works.
 
 ## Runs keep going without you
 
@@ -163,6 +166,15 @@ Two flags matter more than they look on a drive that is already sick:
 Without them a drive with a defect band can spend days re-reading a few
 thousand sectors and cover almost none of the surface. The scan now notices
 that and says so, but the flags are the fix.
+
+A drive can also be slow across whole regions rather than in single sectors:
+every chunk there misses its budget, nearly every sector inside comes back in
+time, and the scan crawls while its WEAK count stands still. The dashboard's
+**OVER** column, the share of chunks over budget, is the number that moves.
+`--skip-slow` (on under repair) stops reading such a region: it probes 1 GiB
+on, and on, until the drive is fast again, bisects back to the edge, and
+carries on there. What it jumped over is condemned unread, and the report says
+so plainly.
 
 ## Putting a damaged drive back to work
 

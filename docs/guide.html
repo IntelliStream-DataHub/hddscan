@@ -420,7 +420,8 @@ the mode and the passes that go with it.  Default
              surface, read only
   decay      weeks after predeploy: has it rotted?
   repair     predeploy, plus forcing a reallocation
-             of anything unreadable
+             of anything unreadable, and
+             <a href="#opt-skip-slow"><code>--skip-slow</code></a>
 Any explicit flag overrides what the profile set,
 whichever order they appear in.  The drive
 settings a profile carries apply only in its own
@@ -505,6 +506,10 @@ mode: <a href="#opt-mode"><code>--mode</code></a> read on predeploy saves nothin
 <dd>give a drive its best chance, in one flag: overwrite every sector, which is what refreshes a weak one; rewrite anything still slow after that; force a reallocation on anything that will not read at all; then re-read the whole device to prove it held. Implies <a href="#opt-mode"><code>--mode</code></a> write and so DESTROYS ALL DATA and needs <a href="#opt-confirm"><code>--confirm</code></a>.  Also turns the drive&#x27;s read cache off, since a repair verified out of the drive&#x27;s own DRAM is not a repair you verified</dd>
 <dt id="opt-second-pass"><code>--second-pass</code></dt>
 <dd>after <a href="#opt-mode"><code>--mode</code></a> write, re-read the whole device and re-verify the pattern (catches slow data decay)</dd>
+<dt id="opt-skip-slow"><code>--skip-slow</code></dt>
+<dd>when most chunks over the last 64 MiB missed their budget, stop reading: probe 1 GiB on, and on, until a probe is fast, bisect back to the edge, carry on there.  What was jumped over is condemned unread; the report says so and <a href="#opt-hide-bad"><code>--hide-bad</code></a> cuts it out. Sequential or reverse order only.  On under repair</dd>
+<dt id="opt-no-skip-slow"><code>--no-skip-slow</code></dt>
+<dd>read every region, however slow, under repair too</dd>
 <dt id="opt-rewrite-weak"><code>--rewrite-weak</code></dt>
 <dd>rewrite readable-but-slow sectors in place to make the drive refresh or remap them (needs verify/write, or read mode plus this flag for read-modify-write)</dd>
 <dt id="opt-force-remap"><code>--force-remap</code></dt>
@@ -623,6 +628,8 @@ mode: <a href="#opt-mode"><code>--mode</code></a> read on predeploy saves nothin
 <dd>build that list from a scan that has already finished, reading its checkpoint (<a href="#opt-state"><code>--state</code></a>, or the one a parallel run keeps per drive) or its <a href="#opt-csv"><code>--csv</code></a>. Touches no drive, so the block size and offset can be chosen once the partition exists</dd>
 <dt id="opt-hide-bad"><code>--hide-bad</code></dt>
 <dd>write a map of the damage the last finished whole-drive scan found onto the drive, and activate /dev/mapper/bb-&lt;serial&gt;: the same drive with the damage cut out, for any filesystem (see &#x27;dm&#x27; below). Whatever is on the drive becomes unreachable, so it needs <a href="#opt-confirm"><code>--confirm</code></a> like a write</dd>
+<dt id="opt-rescan"><code>--rescan</code></dt>
+<dd>with <a href="#opt-hide-bad"><code>--hide-bad</code></a>, then write and verify every sector of the new device: proves what is left is sound and that data written through the map reads back.  The form always does this after hiding</dd>
 <dt id="opt-prometheus"><code>--prometheus FILE</code></dt>
 <dd>write metrics for node_exporter&#x27;s textfile collector</dd>
 <dt id="opt-journal"><code>--journal FILE</code></dt>
