@@ -442,11 +442,10 @@ typedef struct {
 	double pct, rate, eta;
 	uint64_t bad, weak, bytes;
 	/*
-	 * Chunk reads over their budget, out of how many were read.  A drive
-	 * whose slowness is spread across whole chunks rather than sitting in
-	 * a few sectors drills every chunk and finds nothing to count as weak,
-	 * so without this the one number that is climbing never reaches the
-	 * screen.  skipped is what --skip-slow jumped over without reading.
+	 * Chunk reads over their budget, out of how many were read, for
+	 * --status-json; and what --skip-slow condemned without reading,
+	 * which the weak count cannot show: a region never read has no
+	 * sectors to count.
 	 */
 	uint64_t slow, chunks, skipped;
 	int too_slow;           /* under the throughput floor, see rate_judge() */
@@ -5352,8 +5351,8 @@ static void check_temperature(ctx_t *c)
  * The other worst case is the opposite shape: only a few chunks over budget,
  * but each so full of weak sectors -- twenty retries apiece, each behind a
  * seek -- that one chunk costs minutes.  A real drive spent six and a half
- * minutes on its first forty megabytes that way, OVER at 4.4% and climbing
- * weak count and all, with an ETA of four years.
+ * minutes on its first forty megabytes that way, 4.4% of chunks over
+ * budget and a climbing weak count, with an ETA of four years.
  *
  * So a region is slow when either of two things holds over a trailing
  * window of chunks: most of them were over budget, or scanning them -- every
@@ -5389,9 +5388,10 @@ static void check_temperature(ctx_t *c)
 #define SKIP_OVER_DEN 4
 #define SKIP_JUMP (1ull << 30)
 #define SKIP_RES (16ull << 20)
-#define SKIP_PROBE_BYTES (8ull << 20)
+#define SKIP_PROBE_BYTES (8ull << 20)    /* to find an edge */
+#define SKIP_WIDE_BYTES (64ull << 20)    /* to find damage: 4% of it, 94% */
 #define SKIP_PROBE_MIN 4
-#define SKIP_PROBE_MAX 64
+#define SKIP_PROBE_MAX 512
 #define SKIP_RATE_MIN_CHUNKS 8          /* the rate rule, once it has these */
 #define SKIP_RATE_MIN_US (60ull * 1000000)      /* and a minute of I/O */
 #define SKIP_DRILL_CAP_US (30ull * 1000000)     /* one chunk's drill-down */
@@ -5434,9 +5434,9 @@ static void skip_setup(ctx_t *c)
 	c->sw_len = (int)w;
 }
 
-static uint64_t skip_probe_len(const ctx_t *c)
+static uint64_t skip_probe_len(const ctx_t *c, uint64_t bytes)
 {
-	uint64_t n = SKIP_PROBE_BYTES / (uint64_t)c->chunk;
+	uint64_t n = bytes / (uint64_t)c->chunk;
 
 	if (n < SKIP_PROBE_MIN)
 		n = SKIP_PROBE_MIN;
@@ -5576,9 +5576,9 @@ static int skip_note(ctx_t *c, uint64_t step, int over)
  * a probe with no evidence is not slow, so the scan reads the place instead
  * of condemning it unseen.
  */
-static int skip_probe(ctx_t *c, uint64_t s, void *buf)
+static int skip_probe(ctx_t *c, uint64_t s, uint64_t n, void *buf)
 {
-	uint64_t n = skip_probe_len(c), i, spent = 0, bytes = 0;
+	uint64_t i, spent = 0, bytes = 0;
 	int over = 0, judged = 0;
 
 	if (s + n > c->nchunks)
@@ -5632,7 +5632,8 @@ static int skip_probe(ctx_t *c, uint64_t s, void *buf)
 static uint64_t skip_ahead(ctx_t *c, void *buf)
 {
 	uint64_t t = c->step, L = t, F = 0, p, s0, s1, unread, off;
-	uint64_t pn = skip_probe_len(c);
+	uint64_t pn = skip_probe_len(c, SKIP_PROBE_BYTES);
+	uint64_t wn = skip_probe_len(c, SKIP_WIDE_BYTES);
 	uint64_t jump = SKIP_JUMP / (uint64_t)c->chunk;
 	uint64_t res = SKIP_RES / (uint64_t)c->chunk;
 	int to_end = 0, i;
@@ -5646,29 +5647,39 @@ static uint64_t skip_ahead(ctx_t *c, void *buf)
 		jump = 1;
 	if (res < pn)
 		res = pn;
-	/* forward a gigabyte at a time until a probe comes back in budget */
+	/*
+	 * Forward a gigabyte at a time until a probe comes back fast.  These
+	 * probes are wide: damage in one chunk of twenty-five slips past an
+	 * eight-chunk probe more often than not, and the drive would be called
+	 * clean a gigabyte on when it is not.
+	 */
 	while (!F && !to_end) {
 		if (g_stop || c->dev_gone)
 			return t + 1;
 		p = L + jump;
-		if (p + pn > c->nchunks)
-			p = c->nchunks > pn ? c->nchunks - pn : 0;
+		if (p + wn > c->nchunks)
+			p = c->nchunks > wn ? c->nchunks - wn : 0;
 		if (p <= L) {
 			F = L + 1;      /* too close to the end to bother */
 			break;
 		}
-		if (!skip_probe(c, p, buf))
+		if (!skip_probe(c, p, wn, buf))
 			F = p;
-		else if (p + pn >= c->nchunks)
+		else if (p + wn >= c->nchunks)
 			to_end = 1;
 		else
 			L = p;
 	}
-	/* and back: halve the gap until the edge is known to 16 MiB */
+	/*
+	 * And back: halve the gap until the edge is known to 16 MiB.  Wide
+	 * probes while the gap is wider than one, narrow ones to place the
+	 * edge -- a wide probe straddling it says only which side most of it
+	 * is on.
+	 */
 	while (!to_end && F - L > res && !g_stop && !c->dev_gone) {
 		uint64_t m = L + (F - L) / 2;
 
-		if (skip_probe(c, m, buf))
+		if (skip_probe(c, m, F - L > wn ? wn : pn, buf))
 			L = m;
 		else
 			F = m;
@@ -9227,47 +9238,40 @@ static int tui_count(uint64_t v, int width, const char *col, int striped)
 }
 
 /*
- * OVER: the share of chunk reads that missed their budget, over the whole
- * scan.  Over the whole scan rather than the last thirty seconds because it
- * is what the verdict holds against one in OVER_ONE_IN, and a column that
- * turned red on a different rule from the verdict would be a screen
- * contradicting its own report.  It turns red exactly when that rule does.
+ * SKIP: how much of the drive --skip-slow has condemned without reading it.
+ * The weak count cannot say this -- a skipped region was never read, so it
+ * has no sectors to count -- and a scan whose percentage jumps a gigabyte at
+ * a time should say where that gigabyte went.  Short units, so the column
+ * stays as narrow as a count: 960M, 1.0G, 12T.  Yellow, because any skip
+ * makes the verdict at least SUSPECT.
  */
-static const char *over_str(uint64_t slow, uint64_t chunks, char *b, size_t n)
+static const char *skip_str(uint64_t v, char *b, size_t n)
 {
-	double pct;
+	double m = (double)v / 1048576.0;
 
-	if (!chunks) {
+	if (!v)
 		snprintf(b, n, "-");
-		return b;
-	}
-	pct = 100.0 * (double)slow / (double)chunks;
-	if (!slow)
-		snprintf(b, n, "0%%");
-	else if (pct < 0.1)
-		snprintf(b, n, "<0.1%%");
-	else if (pct < 10)
-		snprintf(b, n, "%.1f%%", pct);
+	else if (m < 1)
+		snprintf(b, n, "<1M");
+	else if (m < 1000)
+		snprintf(b, n, "%.0fM", m);
+	else if (m / 1024 < 100)
+		snprintf(b, n, "%.1fG", m / 1024);
+	else if (m / 1024 < 1000)
+		snprintf(b, n, "%.0fG", m / 1024);
 	else
-		snprintf(b, n, "%.0f%%", pct);
+		snprintf(b, n, "%.1fT", m / 1048576);
 	return b;
 }
 
-static const char *over_col(uint64_t slow, uint64_t chunks)
+static int tui_skip(const jrec_t *x, int width, int striped)
 {
-	if (!slow)
-		return "";
-	return over_too_often(slow, chunks) ? c_red() : c_yel();
-}
-
-static int tui_over(const jrec_t *x, int width, int striped)
-{
-	const char *col = over_col(x->slow, x->chunks);
+	const char *col = x->skipped ? c_yel() : "";
 	char b[16];
 	int used;
 
 	printf("%s", col);
-	used = printf("%*s", width, over_str(x->slow, x->chunks, b, sizeof(b)));
+	used = printf("%*s", width, skip_str(x->skipped, b, sizeof(b)));
 	if (col[0])
 		printf("%s", striped ? c_plain() : c_off());
 	return used;
@@ -9390,7 +9394,7 @@ static int tui_drive_tail(const jrec_t *x, int pw, int ident, int room,
 #define DBAR_MIN 10
 
 typedef struct {
-	int rate, bad, weak, over, eta, state;
+	int rate, bad, weak, skip, eta, state;
 	int size;               /* width of the size column, with ident */
 	int one;                /* each drive on a single row */
 	int ident;              /* model and size columns after the name */
@@ -9405,7 +9409,7 @@ static void tui_dcols(const jrec_t *j, int n, int cols, dcols_t *dc)
 	dc->rate = 11;
 	dc->bad = 7;
 	dc->weak = 8;
-	dc->over = 5;
+	dc->skip = 5;
 	dc->eta = 10;
 	dc->state = 5;
 	dc->size = 4;
@@ -9426,9 +9430,9 @@ static void tui_dcols(const jrec_t *j, int n, int cols, dcols_t *dc)
 		w = snprintf(b1, sizeof(b1), "%" PRIu64, x->weak);
 		if (w > dc->weak)
 			dc->weak = w;
-		w = (int)strlen(over_str(x->slow, x->chunks, b1, sizeof(b1)));
-		if (w > dc->over)
-			dc->over = w;
+		w = (int)strlen(skip_str(x->skipped, b1, sizeof(b1)));
+		if (w > dc->skip)
+			dc->skip = w;
 		if (x->state == JS_RUNNING) {
 			w = (int)strlen(human_time(x->eta, b2, sizeof(b2)));
 			if (w > dc->eta)
@@ -9447,9 +9451,9 @@ static void tui_dcols(const jrec_t *j, int n, int cols, dcols_t *dc)
 		if (w > tail_id)
 			tail_id = w;
 	}
-	/* "  name(8) pct(6) rate bad weak over eta state" */
+	/* "  name(8) pct(6) rate bad weak skip eta state" */
 	left = 2 + 8 + 1 + 6 + 1 + dc->rate + 1 + dc->bad + 1 + dc->weak +
-	       1 + dc->over + 1 + dc->eta + 1 + dc->state;
+	       1 + dc->skip + 1 + dc->eta + 1 + dc->state;
 	dc->one = left + tail <= cols;
 	if (!dc->one)
 		return;
@@ -9583,7 +9587,7 @@ static void tui_dashboard(const run_t *r, const jrec_t *j, int n, int nruns,
 		if (dc.bar)
 			printf(" %*s", dc.bar + 2, "");
 		printf(" %*s %*s %*s %*s %*s %s", dc.rate, "RATE", dc.bad,
-		       "BAD", dc.weak, "WEAK", dc.over, "OVER", dc.eta, "ETA",
+		       "BAD", dc.weak, "WEAK", dc.skip, "SKIP", dc.eta, "ETA",
 		       "STATE");
 	}
 	tui_eol();
@@ -9721,7 +9725,7 @@ static void tui_dashboard(const run_t *r, const jrec_t *j, int n, int nruns,
 		used += printf(" ");
 		used += tui_count(x->weak, dc.weak, c_yel(), striped);
 		used += printf(" ");
-		used += tui_over(x, dc.over, striped);
+		used += tui_skip(x, dc.skip, striped);
 		used += printf(" %*s ", dc.eta, x->state == JS_RUNNING ?
 			       human_time(x->eta, b2, sizeof(b2)) : "-");
 		printf("%s", col);
@@ -14138,7 +14142,7 @@ static void status_one(const run_t *r, int json)
 		out("   %s%d orphaned%s", c_yel(), t.orphaned, c_off());
 	out("\n  reports in %s/   records in %s\n\n", r->outdir, r->dir);
 	out("  %-10s %-9s %-20s %6s %9s %9s %6s %-10s %s\n", "DRIVE", "SIZE",
-	    "MODEL", "PCT", "BAD", "WEAK", "OVER", "STATE",
+	    "MODEL", "PCT", "BAD", "WEAK", "SKIP", "STATE",
 	    format ? "MESSAGE" : "ETA");
 	for (i = 0; i < n; i++) {
 		const jrec_t *x = &j[i];
@@ -14149,9 +14153,9 @@ static void status_one(const run_t *r, int json)
 		    human_size(x->size, b1, sizeof(b1)),
 		    x->model[0] ? x->model : "?",
 		    x->state == JS_DONE ? 100.0 : x->pct, x->bad, x->weak,
-		    over_col(x->slow, x->chunks),
-		    over_str(x->slow, x->chunks, ob, sizeof(ob)),
-		    x->slow ? c_off() : "", jrec_color(x), jrec_word(x, format), c_off(),
+		    x->skipped ? c_yel() : "",
+		    skip_str(x->skipped, ob, sizeof(ob)),
+		    x->skipped ? c_off() : "", jrec_color(x), jrec_word(x, format), c_off(),
 		    format ? x->note :
 		    x->state == JS_RUNNING ?
 		    human_time(x->eta, b2, sizeof(b2)) : x->note);

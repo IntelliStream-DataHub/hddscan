@@ -320,17 +320,12 @@ seek for every sector of it, finds almost nothing to call weak, and crawls: a
 real one did 83% of its surface at 390 KiB/s, with an ETA of 1822 hours and a
 WEAK count that had stopped moving.
 
-Two things follow. The dashboard has an `OVER` column, the share of chunk
-reads over budget across the whole scan, because on this drive it is the only
-number that moves. It turns red at the same one-in-a-thousand line at which
-the verdict holds it against the drive, so the screen and the report cannot
-disagree about it.
 
 The opposite shape is as bad. Only a few chunks are over budget, but each is
 so full of weak sectors that its retries (twenty apiece, each behind a seek)
 cost minutes. Another real drive spent six and a half minutes on its first
-forty megabytes that way: OVER at 4.4%, a climbing weak count, and an ETA of
-four years.
+forty megabytes that way: 4.4% of chunks over budget, a climbing weak count,
+and an ETA of four years.
 
 `--skip-slow` (on under the repair profile) handles both. A region is too slow
 to scan when, over a trailing window of chunks, either:
@@ -341,10 +336,17 @@ to scan when, over a trailing window of chunks, either:
   drill-down, retry and cache-busting seek counted, once there are at least 8
   chunks and a minute of I/O to judge.
 
-Then it stops reading. It probes a few chunks 1 GiB further on, and again,
-until a probe comes back fast, then bisects between the last slow probe and
-that one down to 16 MiB and carries on scanning from there. The first read of
-each probe is thrown away because it carries the seek. A probe is slow if most
+Then it stops reading. It probes 64 MiB 1 GiB further on, and again, until a
+probe comes back fast, then bisects between the last slow probe and that one
+down to 16 MiB and carries on scanning from there. The forward probes are
+wide because damage in one chunk of twenty-five slips past an 8 MiB probe
+more often than not, and the drive would be called clean a gigabyte on when
+it is not. The bisection switches to 8 MiB probes once the gap is narrower
+than a wide one, because a wide probe straddling the edge only says which
+side most of it is on. The first read of
+each probe is thrown away because it carries the seek. The dashboard's `SKIP`
+column shows how much has been condemned so far, because the weak count
+cannot: a skipped region was never read, so it has no sectors to count. A probe is slow if most
 of its chunks are over budget, or if drilling the ones that are would bring it
 under the floor. That cost is estimated from what drilling has cost on this
 drive so far; it is a cost, not a budget, and decides nothing about what counts

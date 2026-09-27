@@ -124,13 +124,14 @@ bytes, and once either is not zero it is coloured, red and yellow. The end of
 scan report breaks the same sectors down by how many tries and how many errors
 each one took.
 .PP
-.B OVER
-is the share of chunk reads, over the whole scan so far, that missed their
-budget. It is the number to watch on a drive that is slow across whole
-regions: every chunk there is drilled into, nearly every sector inside comes
-back in time, and WEAK barely moves while the scan crawls. It is yellow once
-any chunk has been over, and red once more than one in a thousand have, which
-is the same line at which the verdict turns SUSPECT for it.
+.B SKIP
+is how much of the drive
+.B \-\-skip\-slow
+has condemned without reading, in short units: 960M, 1.0G, 12T. A skipped
+region was never read, so it has no sectors to count and WEAK does not include
+it. Yellow once anything is skipped, since any skip makes the verdict at least
+SUSPECT. How many chunk reads missed their budget is in the report and in
+.BR \-\-status\-json .
 .SS Thresholds
 Budgets are calibrated per drive, using the same access pattern the scan will
 use. Timing scattered reads and then scanning sequentially would produce a
@@ -381,9 +382,10 @@ apiece. A region counts as too slow once three quarters of the chunks over
 the last 64 MiB have missed their budget, or once scanning it \(em every
 drill-down, retry and seek included \(em has run below the
 .B \-\-min\-rate
-floor for a minute of I/O. Then stop reading: probe a few chunks 1 GiB further
-on, and again, until a probe comes back fast, then bisect between the last
-slow probe and that one down to 16 MiB and carry on scanning there. Every
+floor for a minute of I/O. Then stop reading: probe 64 MiB 1 GiB further on,
+and again, until a probe comes back fast, then bisect between the last slow
+probe and that one down to 16 MiB, with 8 MiB probes once the gap is narrower
+than a wide one, and carry on scanning there. Every
 probe is judged against the same calibrated budget as the scan; what drilling
 a probe's over-budget chunks would cost is taken from what drilling has cost
 on this drive so far. Separately, a chunk whose drill-down has spent 30 s of

@@ -351,6 +351,8 @@ def demo_store(state, live_pid):
                            *j.get("lat", (0, 0, 0, 0))))
                 if j.get("chunks"):
                     f.write("over %d %d\n" % (j.get("over", 0), j["chunks"]))
+                if j.get("skipped"):
+                    f.write("skipped %d\n" % j["skipped"])
                 if j.get("wlat"):
                     f.write("wlat %.2f\n" % j["wlat"])
                 if j.get("note"):
@@ -375,6 +377,7 @@ def demo_store(state, live_pid):
                              chunks=int(size * pct / 100) >> 20,
                              over=(int(size * pct / 100) >> 20) // 3
                              if i == 2 else 5 * i,
+                             skipped=38 << 30 if i == 2 else 0,
                              lat=(11.0 + 0.4 * i, 12.8 + 0.6 * i, 7.5,
                                   26.7 + 9 * i), wlat=21.4))
         else:
