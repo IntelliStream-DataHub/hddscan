@@ -197,6 +197,48 @@ assert_has "a link named dm-badblocks runs the maps" \
 assert_has "and names itself that way in its advice" \
 	"$("$TMP/dm-badblocks" --help 2>&1)" "dm-badblocks activate-all"
 
+echo "== a map's name is never text for a shell =="
+
+# REGRESSION: the name was read off the drive and pasted into a dmsetup
+# command line run through sh, and activate-all reads every drive at boot,
+# as root -- so a map header carrying "x;cmd" would have run cmd.  A copy
+# whose name this code could never have written is not a copy of a map.
+# Both copies are rewritten with a valid checksum, so only the name is wrong.
+evil=$TMP/evil.img
+truncate -s 64M "$evil"
+$BIN create "$evil" --confirm "$evil" >/dev/null 2>&1
+python3 - "$evil" <<'PY'
+import struct, sys
+path = sys.argv[1]
+def fnv(b):
+    h = 0xcbf29ce484222325
+    for c in b:
+        h = ((h ^ c) * 0x100000001b3) & 0xffffffffffffffff
+    return h
+with open(path, "r+b") as f:
+    f.seek(0, 2)
+    dev = f.tell()
+    f.seek(0)
+    ext = struct.unpack_from("<Q", f.read(4096), 24)[0]
+    for off in (0, (dev // ext - 1) * ext):
+        f.seek(off)
+        hdr = f.read(4096)
+        ns, nr, nd = struct.unpack_from("<III", hdr, 64)
+        n = 4096 + ns * 8 + nr * 16 + nd * 8
+        n = (n + 4095) // 4096 * 4096
+        f.seek(off)
+        b = bytearray(f.read(n))
+        b[96:160] = b"x;touch PWNED".ljust(64, b"\0")
+        b[168:176] = b"\0" * 8
+        struct.pack_into("<Q", b, 168, fnv(bytes(b)))
+        f.seek(off)
+        f.write(b)
+PY
+# status reads the map the way activate and activate-all do; activate itself
+# stops earlier on an image, which needs a loop device
+assert_has "a map whose name a shell would parse is refused" \
+	"$($BIN status "$evil" 2>&1)" "no dm-badblocks map"
+
 echo
 echo "  $PASS passed, $FAIL failed"
 [ "$FAIL" = 0 ]

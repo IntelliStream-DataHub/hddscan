@@ -11603,6 +11603,22 @@ static int dmbb_meta_read_at(int fd, uint64_t off, uint64_t dev, dmbb_map_t *m)
 		free(b);
 		return -1;
 	}
+	/*
+	 * The name came off the drive, and activate-all reads every drive on
+	 * the machine at boot, as root.  A map this code wrote always has a
+	 * name dmbb_name_ok() accepts, so one that does not is not a copy of
+	 * a map at all -- whoever wrote it, it never reaches dmsetup.
+	 */
+	{
+		char nm[DMBB_NAME_MAX_LEN + 1];
+
+		memcpy(nm, b + DMBB_H_NAME, DMBB_NAME_MAX_LEN);
+		nm[DMBB_NAME_MAX_LEN] = 0;
+		if (!dmbb_name_ok(nm)) {
+			free(b);
+			return -1;
+		}
+	}
 	memset(m, 0, sizeof(*m));
 	m->gen = dmbb_get64(b + DMBB_H_GEN);
 	m->ext = ext;
@@ -11775,13 +11791,76 @@ static void dmbb_emit_table(FILE *f, const dmbb_map_t *m, const char *dev)
  * dmsetup
  * ------------------------------------------------------------------ */
 
-static int dmbb_run_cmd(const char *cmd)
-{
-	int st = system(cmd);
+static void dmbb_emit_table(FILE *f, const dmbb_map_t *m, const char *dev);
 
-	if (g_dmbb_verbose)
-		dmbb_msg("  $ %s -> %d\n", cmd, st);
-	return st != -1 && WIFEXITED(st) && WEXITSTATUS(st) == 0 ? 0 : -1;
+/*
+ * Run dmsetup with these arguments, feeding it m's table on stdin when m is
+ * given.  Never through a shell: the map name is read back off the drive,
+ * and a name is an argument here, not text for sh to parse.
+ */
+static int dmsetup_run(const char *const *argv, const dmbb_map_t *m,
+		       const char *dev)
+{
+	int p[2] = { -1, -1 }, st = -1, i;
+	pid_t pid;
+
+	if (g_dmbb_verbose) {
+		dmbb_msg("  $");
+		for (i = 0; argv[i]; i++)
+			dmbb_msg(" %s", argv[i]);
+		dmbb_msg("\n");
+	}
+	if (m && pipe(p) < 0)
+		return -1;
+	fflush(stdout);
+	fflush(stderr);
+	pid = fork();
+	if (pid < 0) {
+		if (m) {
+			close(p[0]);
+			close(p[1]);
+		}
+		return -1;
+	}
+	if (pid == 0) {
+		if (m) {
+			dup2(p[0], STDIN_FILENO);
+			close(p[0]);
+			close(p[1]);
+		}
+		execvp(argv[0], (char *const *)argv);
+		_exit(127);
+	}
+	if (m) {
+		FILE *f;
+
+		close(p[0]);
+		f = fdopen(p[1], "w");
+		if (f) {
+			dmbb_emit_table(f, m, dev);
+			fclose(f);
+		} else {
+			close(p[1]);
+		}
+	}
+	while (waitpid(pid, &st, 0) < 0)
+		if (errno != EINTR)
+			return -1;
+	return WIFEXITED(st) && WEXITSTATUS(st) == 0 ? 0 : -1;
+}
+
+/* dmsetup VERB NAME, for the verbs that take nothing else */
+static int dmsetup_verb(const char *verb, const char *name)
+{
+	const char *argv[4];
+
+	if (!dmbb_name_ok(name))
+		return -1;
+	argv[0] = "dmsetup";
+	argv[1] = verb;
+	argv[2] = name;
+	argv[3] = NULL;
+	return dmsetup_run(argv, NULL, NULL);
 }
 
 static int dmbb_read_line(const char *path, char *out, size_t len)
@@ -11854,24 +11933,26 @@ static int dmbb_active(const char *name)
 /* "create NAME" or "reload NAME", with the table on stdin */
 static int dmbb_load(const char *verb, const dmbb_map_t *m, const char *dev)
 {
-	char cmd[256], uuid[64] = "";
-	FILE *f;
-	int st, i;
+	char uuid[64];
+	const char *argv[6];
+	int i, n = 0;
 
+	if (!dmbb_name_ok(m->name))
+		return -1;
+	argv[n++] = "dmsetup";
+	argv[n++] = verb;
 	if (!strcmp(verb, "create")) {
 		char *u = uuid;
 
-		u += sprintf(u, "--uuid DMBB-");
+		u += sprintf(u, "DMBB-");
 		for (i = 0; i < 16; i++)
 			u += sprintf(u, "%02x", m->uuid[i]);
+		argv[n++] = "--uuid";
+		argv[n++] = uuid;
 	}
-	snprintf(cmd, sizeof(cmd), "dmsetup %s %s %s", verb, uuid, m->name);
-	f = popen(cmd, "w");
-	if (!f)
-		return -1;
-	dmbb_emit_table(f, m, dev);
-	st = pclose(f);
-	return st != -1 && WIFEXITED(st) && WEXITSTATUS(st) == 0 ? 0 : -1;
+	argv[n++] = m->name;
+	argv[n] = NULL;
+	return dmsetup_run(argv, m, dev);
 }
 
 /* ------------------------------------------------------------------ *
@@ -12369,10 +12450,7 @@ static int dmbb_cmd_remap(const dmbb_opts_t *o)
 	dmbb_map_clone(&m, &before);
 
 	if (active) {
-		char cmd[160];
-
-		snprintf(cmd, sizeof(cmd), "dmsetup suspend %s", m.name);
-		if (dmbb_run_cmd(cmd) < 0)
+		if (dmsetup_verb("suspend", m.name) < 0)
 			dmbb_die("could not suspend %s (need root?)", m.name);
 	}
 
@@ -12451,7 +12529,7 @@ static int dmbb_cmd_remap(const dmbb_opts_t *o)
 			fails++;
 		}
 		snprintf(cmd, sizeof(cmd), "dmsetup resume %s", m.name);
-		if (dmbb_run_cmd(cmd) < 0)
+		if (dmsetup_verb("resume", m.name) < 0)
 			dmbb_msg(DMBB_PROG ": could not resume %s; run '%s' by hand\n",
 			    m.name, cmd);
 	}
@@ -12556,12 +12634,9 @@ static int dmbb_cmd_activate_all(void)
 
 static int dmbb_cmd_deactivate(const char *name)
 {
-	char cmd[160];
-
 	if (!dmbb_name_ok(name))
 		dmbb_die("bad device name '%s'", name ? name : "");
-	snprintf(cmd, sizeof(cmd), "dmsetup remove %s", name);
-	return dmbb_run_cmd(cmd) < 0 ? 1 : 0;
+	return dmsetup_verb("remove", name) < 0 ? 1 : 0;
 }
 
 static void dmbb_usage(void)
