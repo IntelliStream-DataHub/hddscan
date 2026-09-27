@@ -716,12 +716,10 @@ def main():
             # carries the tries and errors behind each sector.
             check("the table does not split weak sectors into two columns",
                   "SLOW" not in lines[i], lines[i])
-            # chunks over budget are a different number from weak sectors:
-            # a drive slow across whole regions drills every chunk and
-            # finds almost no sector to count, so WEAK sits still while the
-            # scan crawls, and this is the column that moves
-            check("the table has an OVER column for chunks over budget",
-                  "OVER" in lines[i], lines[i])
+            # what --skip-slow condemned is not in WEAK: it was never
+            # read, so it has no sectors to count
+            check("the table has a SKIP column for what was skipped",
+                  "SKIP" in lines[i], lines[i])
             # the header carries the first row of a record; the second is
             # labelled in place, and is checked against a running drive
             # further down
@@ -1274,7 +1272,7 @@ def main():
             s.close()
             return ls, raw
 
-        # 140 is exactly what one row needs: the OVER column put it up six
+        # 140 is exactly what one row needs: the SKIP column put it up six
         lines, raw = wide(140)
         h, w = state_cols(lines)
         check("a wide terminal puts each drive on one row",

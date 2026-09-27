@@ -571,7 +571,8 @@ assert_has "the checkpoint carries the region" "$(cat "$TMP/skip.ckpt")" \
 	"skip "
 rid=$(ls -t "$HDDSCAN_STATE_DIR/runs" | head -1)
 st=$($HDDSCAN --no-color --status "$rid" 2>&1)
-assert_has "--status has an OVER column" "$st" "OVER"
+assert_has "--status has a SKIP column" "$st" "SKIP"
+assert_has "and it shows how much was skipped" "$st" "1.0G"
 assert_has "--status-json counts chunks over budget" \
 	"$($HDDSCAN --status-json "$rid" 2>&1)" '"chunks_over_budget": '
 
@@ -604,8 +605,9 @@ else
 	    "got ${roff:-?}..${rend:-?}"
 fi
 
-# The other shape, the one a real drive showed with OVER at 4.4% and an ETA
-# of four years: only some chunks over budget, but drilling each costs so
+# The other shape, the one a real drive showed with 4.4% of chunks over
+# budget and an ETA of four years: only some chunks over budget, but
+# drilling each costs so
 # much that the scan crawls.  One chunk in four between 1 and 2 GiB reads
 # slow, so three quarters are never over and only the rate rule can see it:
 # each slow chunk and its drill-down cost 40 s of I/O for 4 MiB covered.
@@ -621,6 +623,21 @@ if [ -n "$roff" ] && [ "$roff" -ge "$G" ] && [ "$roff" -le $((G + 64 * 1048576))
 	ok "and the region found is the one with the damage in it"
 else
 	bad "and the region found is the one with the damage in it" \
+	    "got ${roff:-?}..${rend:-?}"
+fi
+# REGRESSION: probes were eight chunks, and damage in one chunk of sixteen
+# slipped past most of them, so a real drive with 4% of its chunks bad was
+# called clean a gigabyte on and nothing was ever skipped.  The probes that
+# step forward are 64 MiB now.
+out=$(HDDSCAN_SLOW=1G:1G:16M:1M HDDSCAN_SLOW_MS=20000 run --chunk 1M \
+	--chunk-slow-ms 1000 --retries 1 --skip-slow \
+	--json "$TMP/skipsparse2.json" "$f")
+read -r roff rend <<< "$(json_region "$TMP/skipsparse2.json")"
+if [ -n "$roff" ] && [ "$roff" -ge "$G" ] && [ "$rend" -le $((2 * G)) ] &&
+   [ $((rend - roff)) -ge $((G * 3 / 4)) ]; then
+	ok "damage in one chunk of sixteen is still seen a gigabyte on"
+else
+	bad "damage in one chunk of sixteen is still seen a gigabyte on" \
 	    "got ${roff:-?}..${rend:-?}"
 fi
 assert_hasnt "without --skip-slow the rate rule does nothing" \

@@ -169,12 +169,13 @@ that and says so, but the flags are the fix.
 
 A drive can also be slow across whole regions rather than in single sectors:
 every chunk there misses its budget, nearly every sector inside comes back in
-time, and the scan crawls while its WEAK count stands still. The dashboard's
-**OVER** column, the share of chunks over budget, is the number that moves.
-`--skip-slow` (on under repair) stops reading such a region: it probes 1 GiB
-on, and on, until the drive is fast again, bisects back to the edge, and
-carries on there. What it jumped over is condemned unread, and the report says
-so plainly.
+time, and the scan crawls while its WEAK count stands still. Or only a few
+chunks miss it, each so full of weak sectors that retrying them takes minutes.
+`--skip-slow` (on under repair) stops reading a region that is too slow to
+scan either way: it probes 1 GiB on, and on, until the drive is fast again,
+bisects back to the edge, and carries on there. What it jumped over is
+condemned unread, and the report says so plainly. The dashboard's **SKIP**
+column shows how much that is.
 
 ## Putting a damaged drive back to work
 
