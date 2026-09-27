@@ -348,11 +348,21 @@ than a wide one, because a wide probe straddling the edge only says which
 side most of it is on. The first read of
 each probe is thrown away because it carries the seek. The dashboard's `SKIP`
 column shows how much has been condemned so far, because the weak count
-cannot: a skipped region was never read, so it has no sectors to count. A probe is slow if most
-of its chunks are over budget, or if drilling the ones that are would bring it
-under the floor. That cost is estimated from what drilling has cost on this
-drive so far; it is a cost, not a budget, and decides nothing about what counts
-as over. The steps start at 1 GiB and double after each slow probe, up to 64 GiB.
+cannot: a skipped region was never read, so it has no sectors to count. 
+
+A probe tests what it reads the way the scan does. Each chunk over budget is
+drilled by the scan's own drill-down, slow sectors retried, under the same
+10 s cap. The probe is slow if most of its chunks were over budget, or if
+reading and drilling them ran below the floor, judged as soon as that is
+certain. What a probe finds is counted and reported like anything else the
+scan finds, weak and bad sectors alike, including those inside a region it
+then condemns. The scan does not drill a chunk a probe already drilled, so
+nothing is counted twice. That list is kept in the checkpoint, so a resume
+does not count them twice either. An earlier version only estimated the drill
+cost: probes took a second and a half, and looked as if they were not testing
+anything.
+
+The steps start at 1 GiB and double after each slow probe, up to 64 GiB.
 At a fixed gigabyte, a drive damaged to the end took thirteen thousand probes
 to cross; a real one spent minutes at it with nothing on the screen. Doubling
 crosses it in a couple of hundred. The price is that a healthy stretch shorter
