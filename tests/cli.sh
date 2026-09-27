@@ -653,6 +653,26 @@ else
 	bad "damage in one chunk of sixteen is still seen a gigabyte on" \
 	    "got ${roff:-?}..${rend:-?}"
 fi
+# A probe drills what it finds over budget with the scan's own drill-down,
+# so its weak sectors are counted like the scan's -- including ones inside a
+# region it then condemns -- and a chunk a probe drilled is not drilled, and
+# counted, a second time when the scan gets there.
+out=$(HDDSCAN_SLOW=1G:1G:16M:1M HDDSCAN_SLOW_MS=512000 run --chunk 1M \
+	--chunk-slow-ms 1000 --retries 1 --skip-slow \
+	--json "$TMP/skipweak.json" "$f")
+read -r nfind nuniq deep <<< "$(python3 - "$TMP/skipweak.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+o = [f["offset"] for f in d["findings"] if f["status"] == "weak"]
+k = d["slow_regions"][0] if d["slow_regions"] else None
+inside = k and any(k["offset"] + (k["length"] - k["unread"]) < x
+                   < k["offset"] + k["length"] for x in o)
+print(len(o), len(set(o)), 1 if inside else 0)
+PY
+)"
+assert_eq "a probe's weak sectors are counted, even inside what it condemns" \
+	"$deep" "1"
+assert_eq "and no sector is counted twice" "$nuniq" "$nfind"
 assert_hasnt "without --skip-slow the rate rule does nothing" \
 	"$(HDDSCAN_SLOW=1G:1G:4M:1M HDDSCAN_SLOW_MS=20000 run --chunk 1M \
 		--chunk-slow-ms 1000 --retries 1 --end 1100M "$f")" "skipped"

@@ -2840,9 +2840,9 @@ typedef struct {
 	int sw_len, sw_n, sw_head, sw_cnt;
 	uint64_t probe_at;      /* how far skip_ahead() has probed, 0 when not */
 	int probing;            /* skip_ahead() is running */
+	uint64_t *probed;       /* steps a probe drilled, sorted: the scan */
+	int nprobed, probedcap; /* does not drill them a second time */
 	uint64_t probe_off;     /* and the byte it is probing at */
-	uint64_t drill_io_us;   /* I/O the drill-downs have cost, and over */
-	uint64_t drill_chunks;  /* how many chunks: what drilling one costs */
 	skip_t *skips;
 	int nskip, skipcap;
 	uint64_t skip_bytes;    /* condemned and never read */
@@ -4238,9 +4238,16 @@ static int dev_gone(ctx_t *c, ssize_t r, int err, size_t want)
 /* walk a suspicious chunk one block at a time */
 static int skip_cut_due(const ctx_t *c, uint64_t io0);
 static int skip_cut(ctx_t *c, uint64_t off, size_t len, uint64_t from);
+static int probe_cap_hit(uint64_t io0);
 
-static void drill_chunk(ctx_t *c, uint64_t off, size_t len, void *buf,
-			void *scratch)
+/*
+ * probe says a --skip-slow probe is drilling a chunk ahead of the scan:
+ * the same reads, retries and findings -- what it finds is as real as what
+ * the scan finds -- but a probe is not standing on the chunk, so the cap
+ * just stops it rather than condemning the chunk.  Returns the I/O spent.
+ */
+static uint64_t drill_chunk(ctx_t *c, uint64_t off, size_t len, void *buf,
+			    void *scratch, int probe)
 {
 	uint64_t o, io0 = g_io_us;
 
@@ -4251,7 +4258,8 @@ static void drill_chunk(ctx_t *c, uint64_t off, size_t len, void *buf,
 		ssize_t r;
 
 		/* --skip-slow: one chunk may not eat the scan */
-		if (skip_cut_due(c, io0) && skip_cut(c, off, len, o))
+		if (probe ? probe_cap_hit(io0) :
+		    skip_cut_due(c, io0) && skip_cut(c, off, len, o))
 			break;
 
 		/* a drill-down can outlast the latency window many times over,
@@ -4281,7 +4289,7 @@ static void drill_chunk(ctx_t *c, uint64_t off, size_t len, void *buf,
 			continue;
 		}
 		if (dev_gone(c, r, err, bl))
-			return;
+			return g_io_us - io0;
 		c->blocks_drilled++;
 		if (r == (ssize_t)bl) {
 			lat_add(&c->block_lat, us);
@@ -4297,8 +4305,7 @@ static void drill_chunk(ctx_t *c, uint64_t off, size_t len, void *buf,
 			c->hard_errors++;
 		analyze_block(c, o, bl, buf, scratch, us, (r == (ssize_t)bl) ? 0 : (err ? err : EIO));
 	}
-	c->drill_io_us += g_io_us - io0;
-	c->drill_chunks++;
+	return g_io_us - io0;
 }
 
 /* ------------------------------------------------------------------ *
@@ -4714,6 +4721,7 @@ static void progress(ctx_t *c, int final)
  * ------------------------------------------------------------------ */
 
 static skip_t *skip_add(ctx_t *c);
+static void probed_add(ctx_t *c, uint64_t step);
 static void steps_extent(const ctx_t *c, uint64_t a, uint64_t b,
 			 uint64_t *off, uint64_t *len);
 
@@ -4745,6 +4753,9 @@ static void state_save(ctx_t *c)
 	 */
 	if (c->nskip)
 		fprintf(f, "skipped %" PRIu64 "\n", c->skip_bytes);
+	/* chunks a probe drilled, so a resumed scan does not count them twice */
+	for (i = 0; i < c->nprobed; i++)
+		fprintf(f, "probed %" PRIu64 "\n", c->probed[i]);
 	for (i = 0; i < c->nskip; i++)
 		fprintf(f, "skip %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64
 			" %" PRIu64 " %" PRIu64 "\n", c->skips[i].s0,
@@ -4880,6 +4891,8 @@ static int state_load(ctx_t *c)
 				c->bands[bi] = b;
 		} else if (!strncmp(line, "skipped ", 8)) {
 			c->skip_bytes = strtoull(line + 8, NULL, 10);
+		} else if (!strncmp(line, "probed ", 7)) {
+			probed_add(c, strtoull(line + 7, NULL, 10));
 		} else if (!strncmp(line, "skip ", 5)) {
 			skip_t k;
 			int nk;
@@ -5417,10 +5430,12 @@ static void check_temperature(ctx_t *c)
  *
  * Every probe is judged against the same per-offset budget as the scan
  * (invariant 1b).  A region is slow because calibration says it should be
- * quicker there, never because it is slower than its neighbours.  A probe
- * does not drill, so what drilling its over-budget chunks would cost is
- * taken from what drilling has cost on this drive so far -- a cost, not a
- * budget, and it decides nothing about what is over.
+ * quicker there, never because it is slower than its neighbours.  And a
+ * probe tests what it reads the way the scan would: each chunk over budget
+ * is drilled sector by sector, a slow sector retried, under the same cap,
+ * and the probe is judged on what that actually cost.  An estimate made a
+ * probe take a second and a half, and looked like it was not testing
+ * anything; a measurement is what a region gets condemned on.
  *
  * And whatever the window says, one chunk may not eat the scan: a drill-down
  * that has spent 10 s of I/O on one chunk stops, and the whole chunk is
@@ -5625,21 +5640,70 @@ static int skip_note(ctx_t *c, uint64_t step, int over)
 	       c->rate_floor * (double)span;
 }
 
-/*
- * Is the region starting at step s slow?  A short run of chunks read with no
- * drill-down, the first one thrown away because it carries the seek that got
- * us here.  A read the kernel refused for alignment, or the drive refused
- * for its protection information, is no evidence either way (invariant 3);
- * a probe with no evidence is not slow, so the scan reads the place instead
- * of condemning it unseen.
- */
-static int skip_probe(ctx_t *c, uint64_t s, uint64_t n, void *buf)
+static int probe_cap_hit(uint64_t io0)
 {
-	uint64_t i, spent = 0, bytes = 0;
+	return g_io_us - io0 > SKIP_DRILL_CAP_US;
+}
+
+/* a probe drilled this step: its findings are in, so the scan need not */
+static void probed_add(ctx_t *c, uint64_t step)
+{
+	int i;
+
+	if (c->nprobed == c->probedcap) {
+		int cap = c->probedcap ? c->probedcap * 2 : 64;
+		uint64_t *v = realloc(c->probed, (size_t)cap * sizeof(*v));
+
+		if (!v)
+			return;
+		c->probed = v;
+		c->probedcap = cap;
+	}
+	for (i = c->nprobed; i > 0 && c->probed[i - 1] > step; i--)
+		c->probed[i] = c->probed[i - 1];
+	c->probed[i] = step;
+	c->nprobed++;
+}
+
+static int probed_has(const ctx_t *c, uint64_t step)
+{
+	int lo = 0, hi = c->nprobed;
+
+	while (lo < hi) {
+		int mid = lo + (hi - lo) / 2;
+
+		if (c->probed[mid] < step)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return lo < c->nprobed && c->probed[lo] == step;
+}
+
+/*
+ * Is the region starting at step s slow?  A run of n chunks, the first one
+ * thrown away because it carries the seek that got us here, each read and
+ * -- when over budget -- drilled by the scan's own drill-down, so what it
+ * finds is counted and reported exactly as the scan's findings are.  Slow when most
+ * of the chunks were over budget, or when scanning them, drilling included,
+ * ran below the throughput floor.  Judged as soon as that is certain: once
+ * the cost so far would put the whole probe under the floor even if every
+ * chunk left were free, the rest would only make it slower.
+ *
+ * A read the kernel refused for alignment, or the drive refused for its
+ * protection information, is no evidence either way (invariant 3); a probe
+ * with no evidence is not slow, so the scan reads the place instead of
+ * condemning it unseen.
+ */
+static int skip_probe(ctx_t *c, uint64_t s, uint64_t n, void *buf,
+		      void *scratch)
+{
+	uint64_t i, spent = 0, bytes = 0, whole;
 	int over = 0, judged = 0;
 
 	if (s + n > c->nchunks)
 		n = c->nchunks - s;
+	whole = (n > 1 ? n - 1 : n) * (uint64_t)c->chunk;
 	for (i = 0; i < n && !g_stop; i++) {
 		uint64_t pos = c->start + order_index(c, s + i) * (uint64_t)c->chunk;
 		size_t len;
@@ -5671,23 +5735,29 @@ static int skip_probe(ctx_t *c, uint64_t s, uint64_t n, void *buf)
 		judged++;
 		spent += us;
 		bytes += len;
-		if (r != (ssize_t)len || us > chunk_thr_at(c, pos))
-			over++;
+		if (r == (ssize_t)len && us <= chunk_thr_at(c, pos))
+			continue;
+		over++;
+		if (c->rate_floor <= 0)
+			continue;       /* nothing to judge a cost against */
+		{
+			int dw = c->drill_written;
+
+			c->drill_written = 0;   /* a probe writes nothing first */
+			spent += drill_chunk(c, pos, len, buf, scratch, 1);
+			c->drill_written = dw;
+			probed_add(c, s + i);
+		}
+		if ((double)whole * 1e6 < c->rate_floor * (double)spent)
+			return 1;
 	}
 	progress(c, 0);
 	if (!judged)
 		return 0;
 	if (over * 2 > judged)
 		return 1;
-	/*
-	 * Would scanning it run below the floor?  The reads, plus drilling
-	 * each chunk that was over, at what a drill-down has cost here so far.
-	 */
-	if (over && c->rate_floor > 0 && c->drill_chunks) {
-		spent += (uint64_t)over * (c->drill_io_us / c->drill_chunks);
-		return (double)bytes * 1e6 < c->rate_floor * (double)spent;
-	}
-	return 0;
+	return c->rate_floor > 0 &&
+	       (double)bytes * 1e6 < c->rate_floor * (double)spent;
 }
 
 /*
@@ -5695,7 +5765,7 @@ static int skip_probe(ctx_t *c, uint64_t s, uint64_t n, void *buf)
  * region ends, condemn what lies between, and return the step to carry on
  * from -- t + 1 when there turned out to be nothing worth skipping.
  */
-static uint64_t skip_ahead(ctx_t *c, void *buf)
+static uint64_t skip_ahead(ctx_t *c, void *buf, void *scratch)
 {
 	uint64_t t = c->step, L = t, F = 0, p, s0, s1, unread, off;
 	uint64_t pn = skip_probe_len(c, SKIP_PROBE_BYTES);
@@ -5737,7 +5807,7 @@ static uint64_t skip_ahead(ctx_t *c, void *buf)
 			F = L + 1;      /* too close to the end to bother */
 			break;
 		}
-		if (!skip_probe(c, p, wn, buf)) {
+		if (!skip_probe(c, p, wn, buf, scratch)) {
 			F = p;
 		} else if (p + wn >= c->nchunks) {
 			to_end = 1;
@@ -5769,7 +5839,7 @@ static uint64_t skip_ahead(ctx_t *c, void *buf)
 	while (!to_end && F - L > res && !g_stop && !c->dev_gone) {
 		uint64_t m = L + (F - L) / 2;
 
-		if (skip_probe(c, m, F - L > wn ? wn : pn, buf))
+		if (skip_probe(c, m, F - L > wn ? wn : pn, buf, scratch))
 			L = m;
 		else
 			F = m;
@@ -6103,8 +6173,12 @@ static void scan_loop(ctx_t *c, int verify_only_pass)
 			}
 		}
 
-		if (drill)
-			drill_chunk(c, c->pos, len, buf, scratch);
+		/*
+		 * A chunk a probe already drilled has its findings in; drilling
+		 * it again would count every weak sector in it twice.
+		 */
+		if (drill && !probed_has(c, c->step))
+			drill_chunk(c, c->pos, len, buf, scratch, 0);
 		if (c->dev_gone)
 			break;
 
@@ -6121,7 +6195,7 @@ static void scan_loop(ctx_t *c, int verify_only_pass)
 		kmsg_poll(c, 0);
 		rate_window(c);
 		if (c->sw_len && !c->pass && skip_note(c, c->step, over))
-			c->step = skip_ahead(c, buf) - 1;
+			c->step = skip_ahead(c, buf, scratch) - 1;
 		progress(c, 0);
 		if (c->state_path && now_us() - last_state > 15000000ull) {
 			state_save(c);
@@ -8786,6 +8860,7 @@ static int scan_device(device_t *d, const opts_t *o, const char *json_path,
 	v = verdict_of(&c, &why);
 	free(c.find);
 	free(c.skips);
+	free(c.probed);
 	g_ctx = NULL;
 	if (g_stop)
 		return 130;

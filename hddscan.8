@@ -387,9 +387,10 @@ floor for 20 s of I/O over at least three chunks. Then stop reading: probe
 to 64 GiB, until a probe comes back fast, then bisect between the last slow
 probe and that one down to 16 MiB, with 8 MiB probes once the gap is narrower
 than a wide one, and carry on scanning there. Every
-probe is judged against the same calibrated budget as the scan; what drilling
-a probe's over-budget chunks would cost is taken from what drilling has cost
-on this drive so far. Separately, a chunk whose drill-down has spent 10 s of
+probe is judged against the same calibrated budget as the scan, and drills
+its over-budget chunks as the scan would, so the weak and bad sectors it finds
+are counted and reported like any others; the scan does not drill those chunks
+a second time. Separately, a chunk whose drill-down has spent 10 s of
 I/O stops being drilled and is condemned whole. What was jumped over is
 .B condemned without being read:
 the report says so on its Coverage line and under the verdict, draws it as
