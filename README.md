@@ -172,7 +172,7 @@ every chunk there misses its budget, nearly every sector inside comes back in
 time, and the scan crawls while its WEAK count stands still. Or only a few
 chunks miss it, each so full of weak sectors that retrying them takes minutes.
 `--skip-slow` (on under repair) stops reading a region that is too slow to
-scan either way: it probes 1 GiB on, and on, until the drive is fast again,
+scan either way: it probes 1 GiB on, then doubling steps, until the drive is fast again,
 bisects back to the edge, and carries on there. What it jumped over is
 condemned unread, and the report says so plainly. The dashboard's **SKIP**
 column shows how much that is.

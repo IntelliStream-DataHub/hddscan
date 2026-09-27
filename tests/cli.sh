@@ -594,6 +594,19 @@ assert_has "a region slow to the end of the drive is condemned to it" \
 read -r roff rend <<< "$(json_region "$TMP/skipend.json")"
 assert_eq "and the region ends where the drive does" "$rend" $((3 * G))
 
+# REGRESSION: the forward steps were a fixed gigabyte, so a drive damaged
+# from early on to the end took a probe per gigabyte to cross -- thirteen
+# thousand on a 12.7 TiB drive, minutes of it with nothing on the screen.
+# The steps double now; this image is 300 GiB of damage after the first.
+f=$(slowimg skipfar.bin 301G)
+out=$(slowrun 1G:300G --skip-slow --json "$TMP/skipfar.json" "$f")
+read -r roff rend <<< "$(json_region "$TMP/skipfar.json")"
+assert_eq "a drive damaged to the end is condemned to the end in doubling steps" \
+	"$rend" "$((301 * G))"
+assert_has "and says it is probing ahead while it does" "$out" \
+	"probing ahead for where it ends"
+rm -f "$f"
+
 f=$(slowimg skiprev.bin 3G)
 out=$(slowrun 1G:1G --skip-slow --order reverse --json "$TMP/skiprev.json" "$f")
 read -r roff rend <<< "$(json_region "$TMP/skiprev.json")"
@@ -1070,6 +1083,11 @@ tooslow 1
 EOF
 assert_has "a running drive under the floor says too slow" \
 	"$(run --status 20200303-000000)" "too slow"
+# REGRESSION: while --skip-slow probed ahead, nothing said so, and a drive
+# crossing a terabyte of damage looked hung for as long as it took
+echo "probing 1073741824" >> "$d/sdy.job"
+assert_has "a drive whose skip is probing ahead says probing" \
+	"$(run --status 20200303-000000)" "probing"
 kill $sp 2>/dev/null; wait $sp 2>/dev/null
 run --forget 20200303-000000 >/dev/null
 

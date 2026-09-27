@@ -382,8 +382,9 @@ apiece. A region counts as too slow once three quarters of the chunks over
 the last 64 MiB have missed their budget, or once scanning it \(em every
 drill-down, retry and seek included \(em has run below the
 .B \-\-min\-rate
-floor for 20 s of I/O over at least three chunks. Then stop reading: probe 64 MiB 1 GiB further on,
-and again, until a probe comes back fast, then bisect between the last slow
+floor for 20 s of I/O over at least three chunks. Then stop reading: probe
+64 MiB 1 GiB further on, and again, doubling the step after each slow probe up
+to 64 GiB, until a probe comes back fast, then bisect between the last slow
 probe and that one down to 16 MiB, with 8 MiB probes once the gap is narrower
 than a wide one, and carry on scanning there. Every
 probe is judged against the same calibrated budget as the scan; what drilling
@@ -394,6 +395,9 @@ I/O stops being drilled and is condemned whole. What was jumped over is
 the report says so on its Coverage line and under the verdict, draws it as
 .B ~
 on the surface map, and lists each region;
+While it is probing, the drive's state on the dashboard is
+.B probing
+and the line under it says where it has got to.
 .B \-\-hide\-bad
 cuts the regions out with the rest of the damage, and a scan with skips still
 counts as covering the whole drive for it. Any skip makes the verdict at least
