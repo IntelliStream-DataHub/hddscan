@@ -5375,7 +5375,7 @@ static void check_temperature(ctx_t *c)
  * budget, and it decides nothing about what is over.
  *
  * And whatever the window says, one chunk may not eat the scan: a drill-down
- * that has spent 30 s of I/O on one chunk stops, and the whole chunk is
+ * that has spent 10 s of I/O on one chunk stops, and the whole chunk is
  * condemned.  No window can help while a single chunk takes five minutes.
  *
  * Only for an order that walks the drive: sequential or reverse, unsampled.
@@ -5392,9 +5392,17 @@ static void check_temperature(ctx_t *c)
 #define SKIP_WIDE_BYTES (64ull << 20)    /* to find damage: 4% of it, 94% */
 #define SKIP_PROBE_MIN 4
 #define SKIP_PROBE_MAX 512
-#define SKIP_RATE_MIN_CHUNKS 8          /* the rate rule, once it has these */
-#define SKIP_RATE_MIN_US (60ull * 1000000)      /* and a minute of I/O */
-#define SKIP_DRILL_CAP_US (30ull * 1000000)     /* one chunk's drill-down */
+/*
+ * How soon.  Drilling a healthy 1 MiB chunk costs 256 single reads, about
+ * 3.5 s on a drive with a 13.6 ms sector median, so a drill-down past 10 s
+ * of I/O is a chunk the drive is fighting, and three chunks costing 20 s
+ * between them is a scan running at a twentieth of the floor.  Looser than
+ * this, a drive covering 34 KiB/s spent four minutes before anything could
+ * be decided -- and a probe that finds nothing costs a second or two.
+ */
+#define SKIP_RATE_MIN_CHUNKS 3          /* the rate rule, once it has these */
+#define SKIP_RATE_MIN_US (20ull * 1000000)      /* and this much I/O */
+#define SKIP_DRILL_CAP_US (10ull * 1000000)     /* one chunk's drill-down */
 #define MAX_SKIPS 4096
 
 /* the bytes [a, b) covers in the scan order, which only ever walks */
@@ -5537,7 +5545,7 @@ static int skip_cut(ctx_t *c, uint64_t off, size_t len, uint64_t from)
 /*
  * One chunk's verdict into the trailing window; 1 when the region it covers
  * is slow: the window is full and three quarters of it was over budget, or
- * scanning it has run below the throughput floor for a minute of I/O.
+ * scanning it has run below the throughput floor for 20 s of I/O.
  */
 static int skip_note(ctx_t *c, uint64_t step, int over)
 {
@@ -5698,18 +5706,33 @@ static uint64_t skip_ahead(ctx_t *c, void *buf)
 			s0 = c->sw_step[i];
 	if (c->nskip && s0 < c->skips[c->nskip - 1].s1)
 		s0 = c->skips[c->nskip - 1].s1;
-	k = skip_add(c);
-	if (!k)
-		return t + 1;
-	k->s0 = s0;
-	k->k0 = t + 1;
-	k->s1 = s1;
-	steps_extent(c, s0, s1, &k->off, &k->len);
 	steps_extent(c, t + 1, s1, &off, &unread);
-	k->unread = unread;
+	/*
+	 * Right after a stretch already condemned -- a chunk whose drill-down
+	 * was cut short, most often, which is what set this off -- it is the
+	 * same region, and is written down as one.
+	 */
+	if (c->nskip && s0 == c->skips[c->nskip - 1].s1) {
+		uint64_t was;
+
+		k = &c->skips[c->nskip - 1];
+		was = k->len;
+		k->s1 = s1;
+		steps_extent(c, k->s0, s1, &k->off, &k->len);
+		c->skip_cond += k->len - was;
+	} else {
+		k = skip_add(c);
+		if (!k)
+			return t + 1;
+		k->s0 = s0;
+		k->k0 = t + 1;
+		k->s1 = s1;
+		steps_extent(c, s0, s1, &k->off, &k->len);
+		c->skip_cond += k->len;
+	}
+	k->unread += unread;
 	skip_band_add(c, off, unread);
 	c->skip_bytes += unread;
-	c->skip_cond += k->len;
 	memset(c->sw_over, 0, sizeof(c->sw_over));
 	msg(PROG ": %s: %s%s from %s was too slow to scan; skipped %s "
 	    "of it without reading%s (--skip-slow) and carried on %s\n",
@@ -7985,7 +8008,7 @@ static void usage(void)
 "                         under the --min-rate floor -- stop reading: probe\n"
 "                         1 GiB on, and on, until a probe is fast, bisect\n"
 "                         back to the edge, carry on there.  A chunk whose\n"
-"                         drill-down costs over 30 s is condemned whole.\n"
+"                         drill-down costs over 10 s is condemned whole.\n"
 "                         What was jumped over is condemned unread; the\n"
 "                         report says so and --hide-bad cuts it out.\n"
 "                         Sequential or reverse order only.  On under repair\n"

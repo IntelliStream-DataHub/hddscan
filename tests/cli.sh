@@ -646,13 +646,13 @@ assert_hasnt "without --skip-slow the rate rule does nothing" \
 
 # And a chunk so full of weak sectors that drilling it alone would take
 # minutes: every 4 KiB of it reads slow enough to be weak, and retried.
-# The drill-down stops once it has cost 30 s, and the chunk is condemned.
+# The drill-down stops once it has cost 10 s, and the chunk is condemned.
 f=$(slowimg skipcut.bin 64M)
 out=$(HDDSCAN_SLOW=8M:1M HDDSCAN_SLOW_MS=512000 run --chunk 1M \
 	--chunk-slow-ms 1000 --retries 2 --skip-slow \
 	--json "$TMP/skipcut.json" "$f")
 assert_has "a drill-down that costs too much is cut short" "$out" \
-	"drilling the chunk at 8.00 MiB has cost over 30 s"
+	"drilling the chunk at 8.00 MiB has cost over 10 s"
 read -r roff rend <<< "$(json_region "$TMP/skipcut.json")"
 assert_eq "and exactly that chunk is condemned" "$roff $rend" \
 	"8388608 9437184"

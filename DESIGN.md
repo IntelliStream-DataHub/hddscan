@@ -333,8 +333,10 @@ to scan when, over a trailing window of chunks, either:
 - three quarters of the last 64 MiB were over budget, or
 - scanning them ran below the `--min-rate` floor, the same floor that calls a
   whole drive too slow to test. That is measured on I/O time, with every
-  drill-down, retry and cache-busting seek counted, once there are at least 8
-  chunks and a minute of I/O to judge.
+  drill-down, retry and cache-busting seek counted, once there are at least 3
+  chunks and 20 s of I/O to judge. A healthy drive never spends 20 s on three
+  chunks; that is a twentieth of the floor. Looser than this, a drive covering
+  34 KiB/s spent four minutes before anything could be decided.
 
 Then it stops reading. It probes 64 MiB 1 GiB further on, and again, until a
 probe comes back fast, then bisects between the last slow probe and that one
@@ -354,9 +356,11 @@ as over. The steps are fixed rather than doubling, so a healthy island more
 than a gigabyte wide is still found.
 
 And whatever the window says, one chunk may not eat the scan. A drill-down
-that has spent 30 s of I/O on one chunk stops, and the whole chunk is
-condemned: the sectors drilled so far stay in the findings, and the rest is
-recorded as unread. A run of such chunks becomes one region.
+that has spent 10 s of I/O on one chunk, about three times what drilling a
+healthy 1 MiB chunk costs, stops, and the whole chunk is condemned. The
+sectors drilled so far stay in the findings, and the rest is recorded as
+unread. A run of such chunks becomes one region, and so does a cut chunk
+followed by a skipped region.
 
 I/O time rather than wall-clock time is what gets judged, because it counts
 only what the drive did. It is also what `HDDSCAN_SLOW` can make exact for the
