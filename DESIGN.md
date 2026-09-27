@@ -326,13 +326,40 @@ number that moves. It turns red at the same one-in-a-thousand line at which
 the verdict holds it against the drive, so the screen and the report cannot
 disagree about it.
 
-And `--skip-slow` (on under the repair profile) stops reading such a region.
-When three quarters of the chunks in the last 64 MiB have been over budget, it
-probes a few chunks 1 GiB further on, and again, until a probe comes back in
-budget, then bisects between the last slow probe and that one down to 16 MiB
-and carries on scanning from there. The first probe read of each run is thrown
-away because it carries the seek. The steps are fixed rather than doubling, so
-a healthy island more than a gigabyte wide is still found.
+The opposite shape is as bad. Only a few chunks are over budget, but each is
+so full of weak sectors that its retries (twenty apiece, each behind a seek)
+cost minutes. Another real drive spent six and a half minutes on its first
+forty megabytes that way: OVER at 4.4%, a climbing weak count, and an ETA of
+four years.
+
+`--skip-slow` (on under the repair profile) handles both. A region is too slow
+to scan when, over a trailing window of chunks, either:
+
+- three quarters of the last 64 MiB were over budget, or
+- scanning them ran below the `--min-rate` floor, the same floor that calls a
+  whole drive too slow to test. That is measured on I/O time, with every
+  drill-down, retry and cache-busting seek counted, once there are at least 8
+  chunks and a minute of I/O to judge.
+
+Then it stops reading. It probes a few chunks 1 GiB further on, and again,
+until a probe comes back fast, then bisects between the last slow probe and
+that one down to 16 MiB and carries on scanning from there. The first read of
+each probe is thrown away because it carries the seek. A probe is slow if most
+of its chunks are over budget, or if drilling the ones that are would bring it
+under the floor. That cost is estimated from what drilling has cost on this
+drive so far; it is a cost, not a budget, and decides nothing about what counts
+as over. The steps are fixed rather than doubling, so a healthy island more
+than a gigabyte wide is still found.
+
+And whatever the window says, one chunk may not eat the scan. A drill-down
+that has spent 30 s of I/O on one chunk stops, and the whole chunk is
+condemned: the sectors drilled so far stay in the findings, and the rest is
+recorded as unread. A run of such chunks becomes one region.
+
+I/O time rather than wall-clock time is what gets judged, because it counts
+only what the drive did. It is also what `HDDSCAN_SLOW` can make exact for the
+suite, which injects reported latency into a byte range, spread through it as
+`OFF:LEN:EVERY:SPAN` when needed.
 
 What was jumped over is **condemned without being read**. That is the whole
 cost, and the design makes sure it is paid in the open:
