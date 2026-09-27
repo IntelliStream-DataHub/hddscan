@@ -448,6 +448,13 @@ typedef struct {
 	 * sectors to count.
 	 */
 	uint64_t slow, chunks, skipped;
+	/*
+	 * --skip-slow is probing ahead for where a slow region ends, and has
+	 * got to probe_off.  Its reads are not the scan's, and without saying
+	 * so the drive looked hung for as long as it took.
+	 */
+	int probing;
+	uint64_t probe_off;
 	int too_slow;           /* under the throughput floor, see rate_judge() */
 	double lat_med, lat_avg, lat_min, lat_max;
 	double wlat_med;        /* 0 when nothing has been written */
@@ -658,6 +665,8 @@ static void jrec_put(const jrec_t *j)
 		fprintf(f, "over %" PRIu64 " %" PRIu64 "\n", j->slow, j->chunks);
 	if (j->skipped)
 		fprintf(f, "skipped %" PRIu64 "\n", j->skipped);
+	if (j->probing)
+		fprintf(f, "probing %" PRIu64 "\n", j->probe_off);
 	if (j->too_slow)
 		fprintf(f, "tooslow 1\n");
 	if (j->wlat_med > 0)
@@ -727,6 +736,10 @@ static int jrec_get(const char *path, jrec_t *j)
 			sscanf(v, "%" SCNu64 " %" SCNu64, &j->slow, &j->chunks);
 		else if (!strcmp(k, "skipped"))
 			j->skipped = strtoull(v, NULL, 10);
+		else if (!strcmp(k, "probing")) {
+			j->probing = 1;
+			j->probe_off = strtoull(v, NULL, 10);
+		}
 		else if (!strcmp(k, "wlat"))
 			j->wlat_med = atof(v);
 		else if (!strcmp(k, "blat"))
@@ -2825,6 +2838,9 @@ typedef struct {
 	uint64_t sw_io[SKIP_WIN_MAX];   /* g_io_us when that chunk was done */
 	unsigned char sw_over[SKIP_WIN_MAX];
 	int sw_len, sw_n, sw_head, sw_cnt;
+	uint64_t probe_at;      /* how far skip_ahead() has probed, 0 when not */
+	int probing;            /* skip_ahead() is running */
+	uint64_t probe_off;     /* and the byte it is probing at */
 	uint64_t drill_io_us;   /* I/O the drill-downs have cost, and over */
 	uint64_t drill_chunks;  /* how many chunks: what drilling one costs */
 	skip_t *skips;
@@ -4529,7 +4545,8 @@ static void progress(ctx_t *c, int final)
 		rate = avg_rate;
 	rate_judge(c, now);
 	{
-		uint64_t left = c->nchunks > c->step ? c->nchunks - c->step : 0;
+		uint64_t at = c->probe_at > c->step ? c->probe_at : c->step;
+		uint64_t left = c->nchunks > at ? c->nchunks - at : 0;
 
 		if (c->sample > 1)
 			left /= c->sample;
@@ -4537,7 +4554,14 @@ static void progress(ctx_t *c, int final)
 		eta_avg = avg_rate > 0 ?
 			  (double)left * (double)c->chunk / avg_rate : -1;
 	}
-	pct = c->nchunks ? 100.0 * (double)c->step / (double)c->nchunks : 100.0;
+	/*
+	 * While a skip is probing ahead, how far it has got is the progress
+	 * worth showing.  Only for the screen: the checkpoint keeps the step,
+	 * because nothing probed is condemned until the skip has finished.
+	 */
+	pct = c->nchunks ? 100.0 * (double)(c->probe_at > c->step ?
+					    c->probe_at : c->step) /
+			   (double)c->nchunks : 100.0;
 
 	/*
 	 * A scan that will not finish this decade is not a scan.  It happens
@@ -4549,23 +4573,42 @@ static void progress(ctx_t *c, int final)
 	 * only symptom is a percentage that does not move, and by the time
 	 * anyone works out why, days are gone.
 	 */
+	/*
+	 * Only the levers not already pulled: this once told a run that had
+	 * been given '--retries 3 --recovery-time 300' to re-run with exactly
+	 * that.  And not under --skip-slow, which is the lever of last resort
+	 * and is already pulling: what it needs is time to probe, not advice.
+	 */
 	if (!c->stall_warned && el > 900 && eta_avg > 30.0 * 24 * 3600 &&
-	    c->retry_ios > c->chunks_read) {
+	    c->retry_ios > c->chunks_read && !c->skip_slow) {
+		char fix[128] = "";
+		int scsi = c->dev->transport == TR_SCSI;
+
 		c->stall_warned = 1;
+		if (c->retries > 3)
+			snprintf(fix + strlen(fix), sizeof(fix) - strlen(fix),
+				 " --retries 3");
+		if (scsi && (c->rtl_state <= 0 || c->rtl_state > 300))
+			snprintf(fix + strlen(fix), sizeof(fix) - strlen(fix),
+				 " --recovery-time 300");
+		if (scsi && c->rcd_state == 0)
+			snprintf(fix + strlen(fix), sizeof(fix) - strlen(fix),
+				 " --read-cache off");
+		if (c->order != ORD_RANDOM && c->sample <= 1)
+			snprintf(fix + strlen(fix), sizeof(fix) - strlen(fix),
+				 " --skip-slow");
 		msg(PROG ": %s: %sat this rate this scan needs %s%s, and %"
 		    PRIu64 " retry reads\n"
 		    "         against %" PRIu64 " chunks says the time is going "
 		    "into re-reading marginal\n"
 		    "         sectors rather than covering the surface. Stop it "
 		    "and re-run with\n"
-		    "         '--retries 3 --recovery-time 300 --read-cache off' "
-		    "to make the drive\n"
-		    "         give up quickly; sectors it cannot deliver in "
-		    "300 ms will then be\n"
-		    "         reported as unreadable, which is the honest "
-		    "answer for them.\n",
+		    "         '%s' so the drive gives up quickly and\n"
+		    "         regions it cannot deliver are condemned rather "
+		    "than ground through.\n",
 		    c->dev->name, c_yel(), human_time(eta_avg, b3, sizeof(b3)),
-		    c_off(), c->retry_ios, c->chunks_read);
+		    c_off(), c->retry_ios, c->chunks_read,
+		    fix[0] ? fix + 1 : "--skip-slow");
 	}
 	/*
 	 * The other way a scan stops covering the surface: nearly every chunk
@@ -4617,6 +4660,8 @@ static void progress(ctx_t *c, int final)
 		g_job.slow = c->chunks_slow;
 		g_job.chunks = c->chunks_read;
 		g_job.skipped = c->skip_bytes;
+		g_job.probing = c->probing;
+		g_job.probe_off = c->probe_off;
 		g_job.too_slow = c->too_slow;
 		g_job.bytes = c->bytes_done;
 		g_job.lat_med = med;
@@ -4647,6 +4692,9 @@ static void progress(ctx_t *c, int final)
 		if (!lw[0] && c->chunks_read)
 			snprintf(lw, sizeof(lw), "  no read finished in the "
 				 "last %ds", LATWIN_SECS);
+		if (c->probing)
+			snprintf(lw, sizeof(lw), "  skip: probing ahead at %s",
+				 human_size(c->probe_off, b3, sizeof(b3)));
 	}
 	fprintf(stderr, "\r%s  %5.1f%%  %s/s%s  bad:%" PRIu64 " weak:%" PRIu64
 		"%s  elapsed %s  eta %s   ",
@@ -5386,7 +5434,8 @@ static void check_temperature(ctx_t *c)
 #define SKIP_WIN_MIN 32
 #define SKIP_OVER_NUM 3                 /* ... of which three quarters over */
 #define SKIP_OVER_DEN 4
-#define SKIP_JUMP (1ull << 30)
+#define SKIP_JUMP (1ull << 30)          /* the first step, doubling ... */
+#define SKIP_JUMP_MAX (64ull << 30)     /* ... to this */
 #define SKIP_RES (16ull << 20)
 #define SKIP_PROBE_BYTES (8ull << 20)    /* to find an edge */
 #define SKIP_WIDE_BYTES (64ull << 20)    /* to find damage: 4% of it, 94% */
@@ -5602,8 +5651,17 @@ static int skip_probe(ctx_t *c, uint64_t s, uint64_t n, void *buf)
 			continue;
 		len = (size_t)(c->end - pos < (uint64_t)c->chunk ?
 			       c->end - pos : (uint64_t)c->chunk);
+		c->probe_off = pos;
 		r = timed_pread(c->fd, buf, len, pos, &us, &err);
 		c->skip_probes++;
+		/*
+		 * A probe is reading the drive, and the screen should say so:
+		 * left out of the window, a skip crossing a terabyte of damage
+		 * looked for minutes like a read that never came back.
+		 */
+		if (r == (ssize_t)len)
+			latwin_add(&c->latwin, us);
+		progress(c, 0);
 		if (r < 0 && (err == EINVAL || err == EILSEQ))
 			continue;
 		if (dev_gone(c, r, err, len))
@@ -5643,6 +5701,7 @@ static uint64_t skip_ahead(ctx_t *c, void *buf)
 	uint64_t pn = skip_probe_len(c, SKIP_PROBE_BYTES);
 	uint64_t wn = skip_probe_len(c, SKIP_WIDE_BYTES);
 	uint64_t jump = SKIP_JUMP / (uint64_t)c->chunk;
+	uint64_t jmax = SKIP_JUMP_MAX / (uint64_t)c->chunk;
 	uint64_t res = SKIP_RES / (uint64_t)c->chunk;
 	int to_end = 0, i;
 	skip_t *k;
@@ -5651,19 +5710,26 @@ static uint64_t skip_ahead(ctx_t *c, void *buf)
 	c->sw_n = c->sw_cnt = c->sw_head = 0;
 	if (c->nskip >= MAX_SKIPS)
 		return t + 1;
+	c->probing = 1;
 	if (jump < 1)
 		jump = 1;
 	if (res < pn)
 		res = pn;
 	/*
-	 * Forward a gigabyte at a time until a probe comes back fast.  These
-	 * probes are wide: damage in one chunk of twenty-five slips past an
-	 * eight-chunk probe more often than not, and the drive would be called
-	 * clean a gigabyte on when it is not.
+	 * Forward until a probe comes back fast: a gigabyte, then twice that
+	 * each time a probe is still slow, up to 64 GiB.  At a fixed gigabyte a
+	 * drive damaged to the end took thirteen thousand probes to cross --
+	 * hours of it, with nothing on the screen; doubling crosses it in a
+	 * couple of hundred.  The price is that a healthy stretch shorter than
+	 * the step, between two slow probes, is condemned with them.
+	 *
+	 * These probes are wide: damage in one chunk of twenty-five slips past
+	 * an eight-chunk probe more often than not, and the drive would be
+	 * called clean a gigabyte on when it is not.
 	 */
 	while (!F && !to_end) {
 		if (g_stop || c->dev_gone)
-			return t + 1;
+			break;
 		p = L + jump;
 		if (p + wn > c->nchunks)
 			p = c->nchunks > wn ? c->nchunks - wn : 0;
@@ -5671,12 +5737,28 @@ static uint64_t skip_ahead(ctx_t *c, void *buf)
 			F = L + 1;      /* too close to the end to bother */
 			break;
 		}
-		if (!skip_probe(c, p, wn, buf))
+		if (!skip_probe(c, p, wn, buf)) {
 			F = p;
-		else if (p + wn >= c->nchunks)
+		} else if (p + wn >= c->nchunks) {
 			to_end = 1;
-		else
+		} else {
+			if (L == t) {
+				uint64_t o0, l0;
+
+				steps_extent(c, t, t + 1, &o0, &l0);
+				msg(PROG ": %s: still slow %s on from %s; probing "
+				    "ahead for where it ends (--skip-slow)\n",
+				    c->dev->name,
+				    human_size(jump * (uint64_t)c->chunk, b1,
+					       sizeof(b1)),
+				    human_size(o0, b2, sizeof(b2)));
+			}
 			L = p;
+			/* only what is known slow: the screen never goes back */
+			c->probe_at = L;
+			if (jump < jmax)
+				jump = jump * 2 > jmax ? jmax : jump * 2;
+		}
 	}
 	/*
 	 * And back: halve the gap until the edge is known to 16 MiB.  Wide
@@ -5692,6 +5774,9 @@ static uint64_t skip_ahead(ctx_t *c, void *buf)
 		else
 			F = m;
 	}
+	c->probe_at = 0;
+	c->probing = 0;
+	progress(c, 0);
 	if (g_stop || c->dev_gone)
 		return t + 1;
 	s1 = to_end ? c->nchunks : L == t ? t + 1 : L + 1;
@@ -8006,11 +8091,11 @@ static void usage(void)
 "                         over the last 64 MiB missed their budget, or the\n"
 "                         scan there, drill-downs and retries included, ran\n"
 "                         under the --min-rate floor -- stop reading: probe\n"
-"                         1 GiB on, and on, until a probe is fast, bisect\n"
-"                         back to the edge, carry on there.  A chunk whose\n"
-"                         drill-down costs over 10 s is condemned whole.\n"
-"                         What was jumped over is condemned unread; the\n"
-"                         report says so and --hide-bad cuts it out.\n"
+"                         1 GiB on, doubling to 64 GiB, until one is fast,\n"
+"                         bisect back to the edge, carry on there.  A chunk\n"
+"                         whose drill-down costs over 10 s is condemned\n"
+"                         whole.  What was jumped over is condemned unread;\n"
+"                         the report says so and --hide-bad cuts it out.\n"
 "                         Sequential or reverse order only.  On under repair\n"
 "  --no-skip-slow         read every region, however slow, under repair too\n"
 "  --rewrite-weak         rewrite readable-but-slow sectors in place to make\n"
@@ -8851,6 +8936,8 @@ static const char *jrec_word(const jrec_t *j, int format)
 		return "queued";
 	if (format)
 		return "formatting";
+	if (j->probing)
+		return "probing";
 	return j->too_slow ? "too slow" : "scanning";
 }
 
@@ -9355,6 +9442,15 @@ static int tui_drive_tail(const jrec_t *x, int pw, int ident, int room,
 	char b[32];
 	int used;
 
+	if (x->state == JS_RUNNING && x->probing) {
+		used = tui_put(draw, "  %*s ", pw, "");
+		tui_put(draw, "%s", c_yel());
+		used += tui_put(draw, "skip: probing ahead at %s for where the "
+				"slow region ends",
+				human_size(x->probe_off, b, sizeof(b)));
+		tui_put(draw, "%s", striped ? c_plain() : c_off());
+		return used;
+	}
 	if (x->state == JS_RUNNING && (x->lat_max > 0 || x->blat_max > 0)) {
 		static const char *const lbl[4] = {
 			" med ", "  avg ", "  min ", "  max "

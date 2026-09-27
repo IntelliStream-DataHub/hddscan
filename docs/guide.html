@@ -507,7 +507,7 @@ mode: <a href="#opt-mode"><code>--mode</code></a> read on predeploy saves nothin
 <dt id="opt-second-pass"><code>--second-pass</code></dt>
 <dd>after <a href="#opt-mode"><code>--mode</code></a> write, re-read the whole device and re-verify the pattern (catches slow data decay)</dd>
 <dt id="opt-skip-slow"><code>--skip-slow</code></dt>
-<dd>when a region is too slow to scan -- most chunks over the last 64 MiB missed their budget, or the scan there, drill-downs and retries included, ran under the <a href="#opt-min-rate"><code>--min-rate</code></a> floor -- stop reading: probe 1 GiB on, and on, until a probe is fast, bisect back to the edge, carry on there.  A chunk whose drill-down costs over 10 s is condemned whole. What was jumped over is condemned unread; the report says so and <a href="#opt-hide-bad"><code>--hide-bad</code></a> cuts it out. Sequential or reverse order only.  On under repair</dd>
+<dd>when a region is too slow to scan -- most chunks over the last 64 MiB missed their budget, or the scan there, drill-downs and retries included, ran under the <a href="#opt-min-rate"><code>--min-rate</code></a> floor -- stop reading: probe 1 GiB on, doubling to 64 GiB, until one is fast, bisect back to the edge, carry on there.  A chunk whose drill-down costs over 10 s is condemned whole.  What was jumped over is condemned unread; the report says so and <a href="#opt-hide-bad"><code>--hide-bad</code></a> cuts it out. Sequential or reverse order only.  On under repair</dd>
 <dt id="opt-no-skip-slow"><code>--no-skip-slow</code></dt>
 <dd>read every region, however slow, under repair too</dd>
 <dt id="opt-rewrite-weak"><code>--rewrite-weak</code></dt>

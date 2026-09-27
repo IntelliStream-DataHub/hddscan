@@ -352,8 +352,18 @@ cannot: a skipped region was never read, so it has no sectors to count. A probe 
 of its chunks are over budget, or if drilling the ones that are would bring it
 under the floor. That cost is estimated from what drilling has cost on this
 drive so far; it is a cost, not a budget, and decides nothing about what counts
-as over. The steps are fixed rather than doubling, so a healthy island more
-than a gigabyte wide is still found.
+as over. The steps start at 1 GiB and double after each slow probe, up to 64 GiB.
+At a fixed gigabyte, a drive damaged to the end took thirteen thousand probes
+to cross; a real one spent minutes at it with nothing on the screen. Doubling
+crosses it in a couple of hundred. The price is that a healthy stretch shorter
+than the step, lying between two slow probes, is condemned with them.
+
+While a skip is probing, the drive's STATE says `probing` and the line under
+it says where ("skip: probing ahead at 1.00 TiB for where the slow region
+ends"); so does the status line of a single-drive scan. The percentage follows
+the last point known to be slow. Before this, a skip crossing a terabyte of
+damage looked like a read that never came back. The checkpoint keeps the scan's real position, because
+nothing is condemned until the skip has finished.
 
 And whatever the window says, one chunk may not eat the scan. A drill-down
 that has spent 10 s of I/O on one chunk, about three times what drilling a

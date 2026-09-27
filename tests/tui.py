@@ -1309,6 +1309,33 @@ def main():
               any(re.search(r"sector med\s+12\.4", l) for l in lines),
               "\n".join(lines))
 
+        # REGRESSION: while --skip-slow probed ahead for where a slow region
+        # ended, the row said no read had finished, and the drive looked
+        # hung for as long as the probing took.
+        with open(os.path.join(run, "sdc.job"), "a") as f:
+            f.write("probing 1073741824\n")
+        s = Session(["--attach", "20200606-070809", "--no-color"],
+                    rows=30, cols=80)
+        s.wait(lambda: s.on_screen("probing ahead"), 5.0)
+        lines = s.screen.lines()
+        check("a drive whose skip is probing ahead says where",
+              any("skip: probing ahead at 1.00 GiB" in l for l in lines),
+              "\n".join(lines))
+        check("and its state says probing",
+              any(l.lstrip().startswith("sdc ") and "probing" in l
+                  for l in lines), "\n".join(lines))
+        w80 = drawn_widths(s.raw)
+        check("the probing row fits an 80-column terminal",
+              w80 and max(w80) <= 80, "widest row drawn: %d" % max(w80 or [0]))
+        s.send(b"q", 0.4)
+        s.close()
+        # the colour checks below read sdc's latency row
+        jf = os.path.join(run, "sdc.job")
+        with open(jf) as f:
+            keep = [l for l in f if not l.startswith("probing ")]
+        with open(jf, "w") as f:
+            f.writelines(keep)
+
         # The same screen in colour: a figure over 50 ms is yellow, over
         # 100 ms red, and a bad or weak count is red or yellow once it is
         # not zero.  Colour is separate bytes, so the padding before a
