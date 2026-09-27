@@ -549,7 +549,7 @@ assert_has "and the verdict box says the region was not tested" "$out" \
 	"Not covered:"
 assert_has "the surface map marks the region" "$out" "~~~~"
 assert_has "and its legend says what the mark means" "$out" \
-	"'~' slow as a whole"
+	"'~' too slow to scan"
 assert_has "the report lists the region" "$out" \
 	"Slow regions, condemned by --skip-slow"
 read -r roff rend <<< "$(json_region "$TMP/skip.json")"
@@ -603,6 +603,53 @@ else
 	bad "a reverse scan finds the same region from its other end" \
 	    "got ${roff:-?}..${rend:-?}"
 fi
+
+# The other shape, the one a real drive showed with OVER at 4.4% and an ETA
+# of four years: only some chunks over budget, but drilling each costs so
+# much that the scan crawls.  One chunk in four between 1 and 2 GiB reads
+# slow, so three quarters are never over and only the rate rule can see it:
+# each slow chunk and its drill-down cost 40 s of I/O for 4 MiB covered.
+f=$(slowimg skipsparse.bin 3G)
+out=$(HDDSCAN_SLOW=1G:1G:4M:1M HDDSCAN_SLOW_MS=20000 run --chunk 1M \
+	--chunk-slow-ms 1000 --retries 1 --skip-slow \
+	--json "$TMP/skipsparse.json" "$f")
+assert_has "a region scanning under the floor is skipped though most chunks are in budget" \
+	"$out" "too slow to scan; skipped"
+read -r roff rend <<< "$(json_region "$TMP/skipsparse.json")"
+if [ -n "$roff" ] && [ "$roff" -ge "$G" ] && [ "$roff" -le $((G + 64 * 1048576)) ] &&
+   [ "$rend" -le $((2 * G)) ] && [ "$rend" -ge $((2 * G - 40 * 1048576)) ]; then
+	ok "and the region found is the one with the damage in it"
+else
+	bad "and the region found is the one with the damage in it" \
+	    "got ${roff:-?}..${rend:-?}"
+fi
+assert_hasnt "without --skip-slow the rate rule does nothing" \
+	"$(HDDSCAN_SLOW=1G:1G:4M:1M HDDSCAN_SLOW_MS=20000 run --chunk 1M \
+		--chunk-slow-ms 1000 --retries 1 --end 1100M "$f")" "skipped"
+
+# And a chunk so full of weak sectors that drilling it alone would take
+# minutes: every 4 KiB of it reads slow enough to be weak, and retried.
+# The drill-down stops once it has cost 30 s, and the chunk is condemned.
+f=$(slowimg skipcut.bin 64M)
+out=$(HDDSCAN_SLOW=8M:1M HDDSCAN_SLOW_MS=512000 run --chunk 1M \
+	--chunk-slow-ms 1000 --retries 2 --skip-slow \
+	--json "$TMP/skipcut.json" "$f")
+assert_has "a drill-down that costs too much is cut short" "$out" \
+	"drilling the chunk at 8.00 MiB has cost over 30 s"
+read -r roff rend <<< "$(json_region "$TMP/skipcut.json")"
+assert_eq "and exactly that chunk is condemned" "$roff $rend" \
+	"8388608 9437184"
+w=$(awk '/sectors weak/{print $3}' <<< "$out")
+if [ -n "$w" ] && [ "$w" -ge 1 ] && [ "$w" -lt 32 ]; then
+	ok "so only the sectors drilled before the cut are counted"
+else
+	bad "so only the sectors drilled before the cut are counted" "weak ${w:-?}"
+fi
+assert_has "and the report says the rest of it was never read" "$out" \
+	"every sector was read or condemned"
+assert_has "without --skip-slow the whole chunk is drilled" \
+	"$(HDDSCAN_SLOW=8M:1M HDDSCAN_SLOW_MS=512000 run --chunk 1M \
+		--chunk-slow-ms 1000 --retries 0 "$f")" "sectors weak                       256"
 
 # A resumed scan has to know what it skipped before, or it would call the
 # drive fully read.  Resumed at the step just past the region, from the

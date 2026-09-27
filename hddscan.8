@@ -374,13 +374,20 @@ After
 re-read the whole device and re-verify the pattern, catching slow data decay.
 .TP
 .B \-\-skip\-slow
-For a drive that is slow across whole regions rather than in single sectors,
-where drilling into every chunk finds little and takes weeks. Once three
-quarters of the chunks over the last 64 MiB have missed their budget, stop
-reading: probe a few chunks 1 GiB further on, and again, until a probe comes
-back in budget, then bisect between the last slow probe and that one down to
-16 MiB and carry on scanning there. Every probe is judged against the same
-calibrated budget as the scan. What was jumped over is
+For a region too slow to scan, in either of the shapes that make a scan take
+weeks: slow across whole chunks, where drilling into every one finds little,
+or a few chunks so full of weak sectors that their retries cost minutes
+apiece. A region counts as too slow once three quarters of the chunks over
+the last 64 MiB have missed their budget, or once scanning it \(em every
+drill-down, retry and seek included \(em has run below the
+.B \-\-min\-rate
+floor for a minute of I/O. Then stop reading: probe a few chunks 1 GiB further
+on, and again, until a probe comes back fast, then bisect between the last
+slow probe and that one down to 16 MiB and carry on scanning there. Every
+probe is judged against the same calibrated budget as the scan; what drilling
+a probe's over-budget chunks would cost is taken from what drilling has cost
+on this drive so far. Separately, a chunk whose drill-down has spent 30 s of
+I/O stops being drilled and is condemned whole. What was jumped over is
 .B condemned without being read:
 the report says so on its Coverage line and under the verdict, draws it as
 .B ~

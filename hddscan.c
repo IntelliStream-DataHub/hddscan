@@ -2663,12 +2663,15 @@ typedef struct {
  * A stretch --skip-slow condemned, in steps of the scan order: [s0, s1) is
  * condemned, and [k0, s1) of that was jumped over without being read -- the
  * part before k0 is the run of slow chunks that set the skip off, which was
- * scanned in full.  off and len are the same condemned stretch in bytes, for
- * everything downstream that knows nothing of steps.
+ * scanned.  off and len are the same condemned stretch in bytes, for
+ * everything downstream that knows nothing of steps, and unread is how much
+ * of it was never read: the steps from k0, and for a chunk whose drill-down
+ * was cut short, the rest of that chunk.
  */
 typedef struct {
 	uint64_t s0, k0, s1;
 	uint64_t off, len;
+	uint64_t unread;
 } skip_t;
 
 #define SKIP_WIN_MAX 1024
@@ -2820,8 +2823,11 @@ typedef struct {
 
 	/* the trailing window --skip-slow judges, and what it condemned */
 	uint64_t sw_step[SKIP_WIN_MAX];
+	uint64_t sw_io[SKIP_WIN_MAX];   /* g_io_us when that chunk was done */
 	unsigned char sw_over[SKIP_WIN_MAX];
 	int sw_len, sw_n, sw_head, sw_cnt;
+	uint64_t drill_io_us;   /* I/O the drill-downs have cost, and over */
+	uint64_t drill_chunks;  /* how many chunks: what drilling one costs */
 	skip_t *skips;
 	int nskip, skipcap;
 	uint64_t skip_bytes;    /* condemned and never read */
@@ -3704,6 +3710,7 @@ static void *alloc_aligned(size_t len)
 #define SLOW_INJ_MAX 8
 static struct {
 	uint64_t off, len;
+	uint64_t every, span;   /* only [span] bytes of every [every], or 0 */
 } g_slow_inj[SLOW_INJ_MAX];
 static int g_slow_n = -1;
 static double g_slow_ms;
@@ -3722,29 +3729,70 @@ static uint64_t slow_injected(uint64_t off, size_t len)
 		g_slow_ms = m ? atof(m) : 200.0;
 		if (e && strlen(e) < sizeof(buf)) {
 			snprintf(buf, sizeof(buf), "%s", e);
+			/*
+			 * OFF:LEN, or OFF:LEN:EVERY:SPAN for damage spread
+			 * through the range: SPAN bytes slow in every EVERY.
+			 */
 			for (tok = strtok_r(buf, ",", &save);
 			     tok && g_slow_n < SLOW_INJ_MAX;
 			     tok = strtok_r(NULL, ",", &save)) {
-				char *colon = strchr(tok, ':');
+				char *f[4], *save2 = NULL, *p;
+				uint64_t v[4] = { 0, 0, 0, 0 };
+				int nf = 0, k, okf = 1;
 
-				if (!colon)
+				for (p = strtok_r(tok, ":", &save2); p;
+				     p = strtok_r(NULL, ":", &save2)) {
+					if (nf == 4) {
+						nf = 5;
+						break;
+					}
+					f[nf++] = p;
+				}
+				if (nf != 2 && nf != 4)
 					continue;
-				*colon = 0;
-				if (parse_size(tok, &g_slow_inj[g_slow_n].off) ||
-				    parse_size(colon + 1,
-					       &g_slow_inj[g_slow_n].len))
+				for (k = 0; k < nf; k++)
+					if (parse_size(f[k], &v[k]))
+						okf = 0;
+				if (!okf || (nf == 4 && !v[2]))
 					continue;
+				g_slow_inj[g_slow_n].off = v[0];
+				g_slow_inj[g_slow_n].len = v[1];
+				g_slow_inj[g_slow_n].every = v[2];
+				g_slow_inj[g_slow_n].span = v[3];
 				g_slow_n++;
 			}
 		}
 	}
-	for (i = 0; i < g_slow_n; i++)
-		if (off < g_slow_inj[i].off + g_slow_inj[i].len &&
-		    off + len > g_slow_inj[i].off)
-			extra = (uint64_t)(g_slow_ms * 1000.0 *
-					   (double)len / (1024.0 * 1024.0));
+	for (i = 0; i < g_slow_n; i++) {
+		uint64_t lo = g_slow_inj[i].off, hi = lo + g_slow_inj[i].len;
+		uint64_t a = off > lo ? off : lo, b = off + len < hi ? off + len : hi;
+
+		if (a >= b)
+			continue;
+		if (g_slow_inj[i].every) {
+			uint64_t ev = g_slow_inj[i].every, x;
+			int hit = 0;
+
+			/* does [a, b) touch a slow span?  Check each period */
+			for (x = (a - lo) / ev * ev + lo; x < b && !hit; x += ev)
+				hit = x + g_slow_inj[i].span > a;
+			if (!hit)
+				continue;
+		}
+		extra = (uint64_t)(g_slow_ms * 1000.0 *
+				   (double)len / (1024.0 * 1024.0));
+	}
 	return extra;
 }
+
+/*
+ * Every microsecond the drive spent on a request of ours, as timed.  A worker
+ * is one process with one request in flight (invariant 5), so this is the
+ * I/O time of the scan -- drill-downs, retries and cache-busting seeks
+ * included -- and what --skip-slow judges how fast a region is scanning by.
+ * Measured rather than wall clock so that it counts only what the drive did.
+ */
+static uint64_t g_io_us;
 
 static ssize_t timed_pread(int fd, void *buf, size_t len, uint64_t off,
 			   uint64_t *us, int *err)
@@ -3756,6 +3804,7 @@ static ssize_t timed_pread(int fd, void *buf, size_t len, uint64_t off,
 	*err = (r < 0) ? errno : 0;
 	if (g_slow_n)
 		*us += slow_injected(off, len);
+	g_io_us += *us;
 	return r;
 }
 
@@ -3767,6 +3816,7 @@ static ssize_t timed_pwrite(int fd, const void *buf, size_t len, uint64_t off,
 
 	*us = now_us() - t0;
 	*err = (r < 0) ? errno : 0;
+	g_io_us += *us;
 	return r;
 }
 
@@ -4171,16 +4221,23 @@ static int dev_gone(ctx_t *c, ssize_t r, int err, size_t want)
 }
 
 /* walk a suspicious chunk one block at a time */
+static int skip_cut_due(const ctx_t *c, uint64_t io0);
+static int skip_cut(ctx_t *c, uint64_t off, size_t len, uint64_t from);
+
 static void drill_chunk(ctx_t *c, uint64_t off, size_t len, void *buf,
 			void *scratch)
 {
-	uint64_t o;
+	uint64_t o, io0 = g_io_us;
 
 	for (o = off; o < off + len && !g_stop_hard; o += c->block) {
 		size_t bl = (size_t)((off + len - o) < c->block ? (off + len - o) : c->block);
 		uint64_t us;
 		int err;
 		ssize_t r;
+
+		/* --skip-slow: one chunk may not eat the scan */
+		if (skip_cut_due(c, io0) && skip_cut(c, off, len, o))
+			break;
 
 		/* a drill-down can outlast the latency window many times over,
 		 * so whoever is watching hears from it as it goes rather than
@@ -4225,6 +4282,8 @@ static void drill_chunk(ctx_t *c, uint64_t off, size_t len, void *buf,
 			c->hard_errors++;
 		analyze_block(c, o, bl, buf, scratch, us, (r == (ssize_t)bl) ? 0 : (err ? err : EIO));
 	}
+	c->drill_io_us += g_io_us - io0;
+	c->drill_chunks++;
 }
 
 /* ------------------------------------------------------------------ *
@@ -4608,6 +4667,8 @@ static void progress(ctx_t *c, int final)
  * ------------------------------------------------------------------ */
 
 static skip_t *skip_add(ctx_t *c);
+static void steps_extent(const ctx_t *c, uint64_t a, uint64_t b,
+			 uint64_t *off, uint64_t *len);
 
 static void state_save(ctx_t *c)
 {
@@ -4639,8 +4700,9 @@ static void state_save(ctx_t *c)
 		fprintf(f, "skipped %" PRIu64 "\n", c->skip_bytes);
 	for (i = 0; i < c->nskip; i++)
 		fprintf(f, "skip %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64
-			" %" PRIu64 "\n", c->skips[i].s0, c->skips[i].k0,
-			c->skips[i].s1, c->skips[i].off, c->skips[i].len);
+			" %" PRIu64 " %" PRIu64 "\n", c->skips[i].s0,
+			c->skips[i].k0, c->skips[i].s1, c->skips[i].off,
+			c->skips[i].len, c->skips[i].unread);
 	fprintf(f, "counters %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64
 		" %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 "\n",
 		c->chunks_read, c->chunks_slow, c->chunks_err, c->blocks_drilled,
@@ -4773,10 +4835,18 @@ static int state_load(ctx_t *c)
 			c->skip_bytes = strtoull(line + 8, NULL, 10);
 		} else if (!strncmp(line, "skip ", 5)) {
 			skip_t k;
+			int nk;
 
-			if (sscanf(line + 5, "%" SCNu64 " %" SCNu64 " %" SCNu64
-				   " %" SCNu64 " %" SCNu64, &k.s0, &k.k0, &k.s1,
-				   &k.off, &k.len) == 5) {
+			memset(&k, 0, sizeof(k));
+			nk = sscanf(line + 5, "%" SCNu64 " %" SCNu64 " %" SCNu64
+				    " %" SCNu64 " %" SCNu64 " %" SCNu64, &k.s0,
+				    &k.k0, &k.s1, &k.off, &k.len, &k.unread);
+			if (nk == 5) {  /* before the unread count was kept */
+				uint64_t o;
+
+				steps_extent(c, k.k0, k.s1, &o, &k.unread);
+			}
+			if (nk >= 5) {
 				skip_t *x = skip_add(c);
 
 				if (x) {
@@ -5270,7 +5340,7 @@ static void check_temperature(ctx_t *c)
 }
 
 /* ------------------------------------------------------------------ *
- * --skip-slow: stepping over a region that is slow as a whole
+ * --skip-slow: stepping over a region too slow to scan
  *
  * A drive whose trouble is spread over a region -- every chunk over budget,
  * hardly a sector inside one that is slow on its own -- is the worst case
@@ -5279,11 +5349,20 @@ static void check_temperature(ctx_t *c)
  * the scan crawls through the region at a few hundred KiB a second and finds
  * almost nothing to count.  Hundreds of gigabytes of that is weeks.
  *
- * So once most of a trailing window of chunks has been over budget, stop
+ * The other worst case is the opposite shape: only a few chunks over budget,
+ * but each so full of weak sectors -- twenty retries apiece, each behind a
+ * seek -- that one chunk costs minutes.  A real drive spent six and a half
+ * minutes on its first forty megabytes that way, OVER at 4.4% and climbing
+ * weak count and all, with an ETA of four years.
+ *
+ * So a region is slow when either of two things holds over a trailing
+ * window of chunks: most of them were over budget, or scanning them -- every
+ * drill-down, retry and seek included -- ran below the throughput floor,
+ * the same floor that calls a whole drive too slow to test.  Then stop
  * reading the region and find where it ends instead: probe a short run of
- * chunks 1 GiB further on, and again, until a probe comes back in budget;
- * then bisect between the last slow probe and that one down to 16 MiB, and
- * resume the ordinary scan there.  What was jumped over is condemned: it is
+ * chunks 1 GiB further on, and again, until a probe comes back fast; then
+ * bisect between the last slow probe and that one down to 16 MiB, and resume
+ * the ordinary scan there.  What was jumped over is condemned: it is
  * written down as a slow region, --hide-bad cuts it out with the rest of the
  * damage, and the report says -- on its Coverage line and under the verdict
  * -- that it was never read.  Condemning is the safe direction to be wrong
@@ -5291,7 +5370,14 @@ static void check_temperature(ctx_t *c)
  *
  * Every probe is judged against the same per-offset budget as the scan
  * (invariant 1b).  A region is slow because calibration says it should be
- * quicker there, never because it is slower than its neighbours.
+ * quicker there, never because it is slower than its neighbours.  A probe
+ * does not drill, so what drilling its over-budget chunks would cost is
+ * taken from what drilling has cost on this drive so far -- a cost, not a
+ * budget, and it decides nothing about what is over.
+ *
+ * And whatever the window says, one chunk may not eat the scan: a drill-down
+ * that has spent 30 s of I/O on one chunk stops, and the whole chunk is
+ * condemned.  No window can help while a single chunk takes five minutes.
  *
  * Only for an order that walks the drive: sequential or reverse, unsampled.
  * A random order has no "further on", and a sampled scan has not read
@@ -5306,6 +5392,9 @@ static void check_temperature(ctx_t *c)
 #define SKIP_PROBE_BYTES (8ull << 20)
 #define SKIP_PROBE_MIN 4
 #define SKIP_PROBE_MAX 64
+#define SKIP_RATE_MIN_CHUNKS 8          /* the rate rule, once it has these */
+#define SKIP_RATE_MIN_US (60ull * 1000000)      /* and a minute of I/O */
+#define SKIP_DRILL_CAP_US (30ull * 1000000)     /* one chunk's drill-down */
 #define MAX_SKIPS 4096
 
 /* the bytes [a, b) covers in the scan order, which only ever walks */
@@ -5356,13 +5445,19 @@ static uint64_t skip_probe_len(const ctx_t *c)
 	return n;
 }
 
-/* the step a condemned stretch sends a scan standing at step on to, or 0 */
+/*
+ * The step a condemned stretch sends a scan standing at step on to, or 0.
+ * The first pass skips what it never read; a pass after it skips everything
+ * condemned, since there is nothing left to learn about it -- and a chunk
+ * whose drill-down was cut short would only be cut short again.
+ */
 static uint64_t skip_at(const ctx_t *c, uint64_t step)
 {
 	int i;
 
 	for (i = 0; i < c->nskip; i++)
-		if (step >= c->skips[i].k0 && step < c->skips[i].s1)
+		if (step >= (c->pass ? c->skips[i].s0 : c->skips[i].k0) &&
+		    step < c->skips[i].s1)
 			return c->skips[i].s1;
 	return 0;
 }
@@ -5397,12 +5492,58 @@ static skip_t *skip_add(ctx_t *c)
 	return &c->skips[c->nskip++];
 }
 
+static int skip_cut_due(const ctx_t *c, uint64_t io0)
+{
+	return c->skip_slow && !c->pass && g_io_us - io0 > SKIP_DRILL_CAP_US;
+}
+
 /*
- * One chunk's verdict into the trailing window; 1 when the window is full
- * and at least three quarters of it was over budget.
+ * Stop drilling the chunk [off, off + len) at from and condemn all of it:
+ * what was drilled already is in the findings, and the rest was not read.
+ * A run of such chunks is one region, not one line per chunk.  0 when there
+ * is no room left to write it down, and the drill-down carries on.
+ */
+static int skip_cut(ctx_t *c, uint64_t off, size_t len, uint64_t from)
+{
+	skip_t *k = c->nskip ? &c->skips[c->nskip - 1] : NULL;
+	uint64_t unread = off + len - from;
+	char b1[32];
+
+	if (k && k->s1 == c->step && k->off + k->len == off) {
+		k->len += len;
+	} else if (k && k->s1 == c->step && off + len == k->off) {
+		k->off = off;           /* reverse order walks down the drive */
+		k->len += len;
+	} else {
+		if (c->nskip >= MAX_SKIPS || !(k = skip_add(c)))
+			return 0;
+		k->s0 = c->step;
+		k->k0 = c->step + 1;
+		k->off = off;
+		k->len = len;
+		msg(PROG ": %s: %sdrilling the chunk at %s has cost over %llu s; "
+		    "condemned it and moved on%s (--skip-slow)\n", c->dev->name,
+		    c_yel(), human_size(off, b1, sizeof(b1)),
+		    (unsigned long long)(SKIP_DRILL_CAP_US / 1000000), c_off());
+	}
+	k->s1 = c->step + 1;
+	k->unread += unread;
+	skip_band_add(c, from, unread);
+	c->skip_bytes += unread;
+	c->skip_cond += len;
+	return 1;
+}
+
+/*
+ * One chunk's verdict into the trailing window; 1 when the region it covers
+ * is slow: the window is full and three quarters of it was over budget, or
+ * scanning it has run below the throughput floor for a minute of I/O.
  */
 static int skip_note(ctx_t *c, uint64_t step, int over)
 {
+	int oldest;
+	uint64_t span;
+
 	if (!c->sw_len)
 		return 0;
 	if (c->sw_n == c->sw_len)
@@ -5410,11 +5551,21 @@ static int skip_note(ctx_t *c, uint64_t step, int over)
 	else
 		c->sw_n++;
 	c->sw_step[c->sw_head] = step;
+	c->sw_io[c->sw_head] = g_io_us;
 	c->sw_over[c->sw_head] = (unsigned char)(over != 0);
 	c->sw_cnt += over != 0;
 	c->sw_head = (c->sw_head + 1) % c->sw_len;
-	return c->sw_n == c->sw_len &&
-	       c->sw_cnt * SKIP_OVER_DEN >= c->sw_len * SKIP_OVER_NUM;
+	if (c->sw_n == c->sw_len &&
+	    c->sw_cnt * SKIP_OVER_DEN >= c->sw_len * SKIP_OVER_NUM)
+		return 1;
+	if (c->rate_floor <= 0 || c->sw_n < SKIP_RATE_MIN_CHUNKS)
+		return 0;
+	/* the oldest entry's own cost is before its mark, so it is not counted */
+	oldest = (c->sw_head + c->sw_len - c->sw_n) % c->sw_len;
+	span = g_io_us - c->sw_io[oldest];
+	return span >= SKIP_RATE_MIN_US &&
+	       (double)(c->sw_n - 1) * (double)c->chunk * 1e6 <
+	       c->rate_floor * (double)span;
 }
 
 /*
@@ -5427,7 +5578,7 @@ static int skip_note(ctx_t *c, uint64_t step, int over)
  */
 static int skip_probe(ctx_t *c, uint64_t s, void *buf)
 {
-	uint64_t n = skip_probe_len(c), i;
+	uint64_t n = skip_probe_len(c), i, spent = 0, bytes = 0;
 	int over = 0, judged = 0;
 
 	if (s + n > c->nchunks)
@@ -5452,11 +5603,25 @@ static int skip_probe(ctx_t *c, uint64_t s, void *buf)
 		if (i == 0 && n > 1)
 			continue;
 		judged++;
+		spent += us;
+		bytes += len;
 		if (r != (ssize_t)len || us > chunk_thr_at(c, pos))
 			over++;
 	}
 	progress(c, 0);
-	return judged && over * 2 > judged;
+	if (!judged)
+		return 0;
+	if (over * 2 > judged)
+		return 1;
+	/*
+	 * Would scanning it run below the floor?  The reads, plus drilling
+	 * each chunk that was over, at what a drill-down has cost here so far.
+	 */
+	if (over && c->rate_floor > 0 && c->drill_chunks) {
+		spent += (uint64_t)over * (c->drill_io_us / c->drill_chunks);
+		return (double)bytes * 1e6 < c->rate_floor * (double)spent;
+	}
+	return 0;
 }
 
 /*
@@ -5530,11 +5695,12 @@ static uint64_t skip_ahead(ctx_t *c, void *buf)
 	k->s1 = s1;
 	steps_extent(c, s0, s1, &k->off, &k->len);
 	steps_extent(c, t + 1, s1, &off, &unread);
+	k->unread = unread;
 	skip_band_add(c, off, unread);
 	c->skip_bytes += unread;
 	c->skip_cond += k->len;
 	memset(c->sw_over, 0, sizeof(c->sw_over));
-	msg(PROG ": %s: %s%s from %s read over budget as a whole; skipped %s "
+	msg(PROG ": %s: %s%s from %s was too slow to scan; skipped %s "
 	    "of it without reading%s (--skip-slow) and carried on %s\n",
 	    c->dev->name, c_yel(), human_size(k->len, b1, sizeof(b1)),
 	    human_size(k->off, b2, sizeof(b2)),
@@ -6054,7 +6220,7 @@ static void print_map(ctx_t *c)
 	out("\n    legend: '.:-=+*#@' fastest to slowest average read, "
 	    "'!' weak sectors, 'X' bad sectors, '_' not scanned\n");
 	if (c->nskip)
-		out("            '~' slow as a whole, skipped unread and "
+		out("            '~' too slow to scan, skipped unread and "
 		    "condemned (--skip-slow)\n");
 	{
 		slowbands_t sb;
@@ -6268,10 +6434,11 @@ static int verdict_of(ctx_t *c, const char **why)
 	if (c->nskip) {
 		char b1[32], b2[32];
 
-		snprintf(buf, sizeof(buf), "%d region%s of the surface (%s) read "
-			 "over budget as a whole; %s of %s was skipped without "
-			 "being read", c->nskip, c->nskip == 1 ? "" : "s",
+		snprintf(buf, sizeof(buf), "%d region%s of the surface (%s) %s "
+			 "too slow to scan; %s of %s was skipped without being "
+			 "read", c->nskip, c->nskip == 1 ? "" : "s",
 			 human_size(c->skip_cond, b1, sizeof(b1)),
+			 c->nskip == 1 ? "was" : "were",
 			 human_size(c->skip_bytes, b2, sizeof(b2)),
 			 c->nskip == 1 ? "it" : "them");
 		*why = buf;
@@ -6930,13 +7097,11 @@ no_modes:	;
 		    "size", "not read");
 		for (i = 0; i < c->nskip && i < 50; i++) {
 			const skip_t *k = &c->skips[i];
-			uint64_t o, unread;
 
-			steps_extent(c, k->k0, k->s1, &o, &unread);
 			out("    %s%-18" PRIu64 " %-18" PRIu64 "%s %12s %12s\n",
 			    c_yel(), k->off, k->off + k->len, c_off(),
 			    human_size(k->len, b1, sizeof(b1)),
-			    human_size(unread, b2, sizeof(b2)));
+			    human_size(k->unread, b2, sizeof(b2)));
 		}
 		if (c->nskip > 50)
 			out("    ... and %d more (the checkpoint and --json list "
@@ -7174,12 +7339,10 @@ static void write_json(ctx_t *c, const char *path)
 	fprintf(f, "  \"slow_regions\": [\n");
 	for (i = 0; i < c->nskip; i++) {
 		const skip_t *k = &c->skips[i];
-		uint64_t o, unread;
 
-		steps_extent(c, k->k0, k->s1, &o, &unread);
 		fprintf(f, "    {\"offset\": %" PRIu64 ", \"length\": %" PRIu64
-			", \"unread\": %" PRIu64 "}%s\n", k->off, k->len, unread,
-			i + 1 < c->nskip ? "," : "");
+			", \"unread\": %" PRIu64 "}%s\n", k->off, k->len,
+			k->unread, i + 1 < c->nskip ? "," : "");
 	}
 	fprintf(f, "  ],\n");
 	fprintf(f, "  \"findings\": [\n");
@@ -7340,9 +7503,10 @@ static int badblocks_replay(const char *src, const char *out, uint64_t bs,
 		} else if (!strncmp(line, "skip ", 5)) {
 			skip_t k, *x;
 
+			memset(&k, 0, sizeof(k));
 			if (sscanf(line + 5, "%" SCNu64 " %" SCNu64 " %" SCNu64
-				   " %" SCNu64 " %" SCNu64, &k.s0, &k.k0, &k.s1,
-				   &k.off, &k.len) != 5)
+				   " %" SCNu64 " %" SCNu64 " %" SCNu64, &k.s0,
+				   &k.k0, &k.s1, &k.off, &k.len, &k.unread) < 5)
 				continue;
 			x = skip_add(&c);
 			if (!x)
@@ -7566,7 +7730,7 @@ typedef struct {
 	int rewrite_weak;
 	int force_remap;
 	int second_pass;
-	int skip_slow;          /* condemn a region slow as a whole, unread */
+	int skip_slow;          /* condemn a region too slow to scan, unread */
 	int repair;             /* the whole repair sequence in one flag */
 	const char *profile;    /* which profile produced these defaults */
 	int retries;
@@ -7656,7 +7820,7 @@ typedef struct {
 	int bms;                /* turn the background scan on, saved */
 	int bms_interval;       /* its interval in hours, 0 keep */
 	/*
-	 * Skip regions that are slow as a whole: only for repair, which is
+	 * Skip regions too slow to scan: only for repair, which is
 	 * already a drive being salvaged.  Everywhere else a report has to
 	 * keep meaning every sector was tested.
 	 */
@@ -7804,11 +7968,15 @@ static void usage(void)
 "                         DRAM is not a repair you verified\n"
 "  --second-pass          after --mode write, re-read the whole device and\n"
 "                         re-verify the pattern (catches slow data decay)\n"
-"  --skip-slow            when most chunks over the last 64 MiB missed their\n"
-"                         budget, stop reading: probe 1 GiB on, and on, until\n"
-"                         a probe is fast, bisect back to the edge, carry on\n"
-"                         there.  What was jumped over is condemned unread;\n"
-"                         the report says so and --hide-bad cuts it out.\n"
+"  --skip-slow            when a region is too slow to scan -- most chunks\n"
+"                         over the last 64 MiB missed their budget, or the\n"
+"                         scan there, drill-downs and retries included, ran\n"
+"                         under the --min-rate floor -- stop reading: probe\n"
+"                         1 GiB on, and on, until a probe is fast, bisect\n"
+"                         back to the edge, carry on there.  A chunk whose\n"
+"                         drill-down costs over 30 s is condemned whole.\n"
+"                         What was jumped over is condemned unread; the\n"
+"                         report says so and --hide-bad cuts it out.\n"
 "                         Sequential or reverse order only.  On under repair\n"
 "  --no-skip-slow         read every region, however slow, under repair too\n"
 "  --rewrite-weak         rewrite readable-but-slow sectors in place to make\n"
@@ -10408,7 +10576,7 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 	  NULL, 0, 0, 0, &chunk_sel },
 	{ NULL, 0, "Scan order", "sequential is fastest; random defeats drive prefetch",
 	  0, 3, { "sequential", "reverse", "random" }, NULL, 0, 0, 0, &order_sel },
-	{ NULL, 0, "Skip slow regions", "jump a region slow as a whole; it is condemned",
+	{ NULL, 0, "Skip slow regions", "jump regions too slow to scan; they are condemned",
 	  0, 2, { "no", "yes" }, NULL, 0, 0, 0, &skip_sel },
 	{ NULL, 0, "Retries per sector", "re-reads before judging a suspect sector",
 	  1, 0, { 0 }, &retries, 0, 1000, 5, NULL },
