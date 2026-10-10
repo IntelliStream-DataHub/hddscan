@@ -1424,6 +1424,7 @@ typedef struct {
 	char unsafe_why[1024];
 	int is_root_disk;
 	int no_access;          /* could not even open it: almost always "not root" */
+	int no_capacity;        /* attached with no capacity: needs a format */
 } device_t;
 
 /*
@@ -1611,13 +1612,30 @@ static int probe_device(const char *name, device_t *d)
 	snprintf(d->name, sizeof(d->name), "%s", name);
 	snprintf(d->path, sizeof(d->path), "/dev/%s", name);
 
-	sz = sysfs_ll("/sys/block/%s/size", name);
-	if (sz <= 0)
-		return -1;
-	d->size = (uint64_t)sz * 512ull;
-
 	d->rotational = (int)sysfs_ll("/sys/block/%s/queue/rotational", name);
 	d->removable = (int)sysfs_ll("/sys/block/%s/removable", name);
+	/*
+	 * A SCSI disk the kernel attaches with no capacity is nearly always
+	 * one that needs a low level format: sd refuses a sector size it
+	 * cannot use (520 or 528 bytes, out of an array), a protection type
+	 * it does not support, or a medium whose format is corrupt, and
+	 * leaves the disk there at zero bytes.  Those are exactly the drives
+	 * --format exists for, so they stay in the list, marked, and only a
+	 * format will take them.  An empty removable slot is a different
+	 * thing and is left out, as is anything that is not a SCSI disk.
+	 */
+	sz = sysfs_ll("/sys/block/%s/size", name);
+	if (sz <= 0) {
+		struct stat st;
+		char sd[PATH_MAX];
+
+		snprintf(sd, sizeof(sd), "/sys/block/%s/device/scsi_disk", name);
+		if (d->removable || stat(sd, &st) < 0 || !S_ISDIR(st.st_mode))
+			return -1;
+		d->no_capacity = 1;
+		sz = 0;
+	}
+	d->size = (uint64_t)sz * 512ull;
 	d->readonly = (int)sysfs_ll("/sys/block/%s/ro", name);
 	d->logical_bs = (int)sysfs_ll("/sys/block/%s/queue/logical_block_size", name);
 	d->physical_bs = (int)sysfs_ll("/sys/block/%s/queue/physical_block_size", name);
@@ -8400,7 +8418,8 @@ static void list_devices(int no_smart)
 		safety_check(d);
 		if (!no_smart && !smart_read(d, &s) && !d->serial[0] && s.serial[0])
 			snprintf(d->serial, sizeof(d->serial), "%s", s.serial);
-		testable = d->rotational && transport_is_local(d->transport) && !d->unsafe;
+		testable = d->rotational && transport_is_local(d->transport) &&
+			   !d->unsafe && !d->no_capacity;
 		printf("%-8s %-10s %-24.24s %-18.18s %-9s %-12s %s%s%s\n",
 		       d->name, human_size(d->size, b, sizeof(b)),
 		       d->model[0] ? d->model : "?",
@@ -8408,10 +8427,16 @@ static void list_devices(int no_smart)
 		       d->zoned ? "HDD-SMR" : d->rotational ? "HDD" : "SSD/flash",
 		       transport_name(d->transport),
 		       d->unsafe ? c_red() : testable ? c_grn() : c_yel(),
-		       d->unsafe ? "IN USE" : d->no_access ? "need root" :
+		       d->unsafe ? "IN USE" : d->no_capacity ? "needs format" :
+		       d->no_access ? "need root" :
 		       testable ? "ready" : "skipped",
 		       c_off());
-		if (d->unsafe)
+		if (d->no_capacity && !d->unsafe)
+			printf("         the kernel gives it no capacity (sector "
+			       "size, protection type or format\n"
+			       "         it cannot use); --format is the only "
+			       "mode that will take it\n");
+		else if (d->unsafe)
 			printf("         %s\n", d->unsafe_why);
 		else if (d->no_access)
 			printf("         cannot open %s; re-run as root to see whether "
@@ -10658,7 +10683,7 @@ static void tui_devices(device_t *devs, int ndev, int *pick, int cur, int top,
 
 		if (top + i >= ndev)
 			break;
-		usable = !d->unsafe && d->rotational &&
+		usable = !d->unsafe && d->rotational && !d->no_capacity &&
 			 (d->is_file || transport_is_local(d->transport));
 		printf("  %s%s [%c] %-8.8s %-7.7s %-10s %-20.20s %-9s %s%s\n",
 		       (top + i == cur) ? "\033[7m" : "",
@@ -10667,6 +10692,7 @@ static void tui_devices(device_t *devs, int ndev, int *pick, int cur, int top,
 		       d->model[0] ? d->model : "?",
 		       d->zoned ? "HDD-SMR" : d->rotational ? "HDD" : "SSD",
 		       d->unsafe ? "IN USE" :
+		       d->no_capacity ? "needs format" :
 		       (!d->is_file && !transport_is_local(d->transport)) ?
 		       transport_name(d->transport) :
 		       usable ? "ready" : "not a HDD",
@@ -10752,6 +10778,7 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 	long long retries = o->retries, segment_mb = (long long)(o->segment >> 20);
 	long long parallel = o->max_parallel, sample = (long long)o->sample;
 	int cur = 0, sec = 0, arm = 0, i, rows, cols, dtop = 0;
+	int needfmt = -1;       /* a picked drive only a format can take */
 	int ftop = 0, fshow = 0, dshow = 0, depline = 0, nscroll = 0;
 	int nlive = store_live_count();
 	field_t f[] = {
@@ -11102,7 +11129,11 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 		 */
 		if (bms_sel || persist_sel || fix_sel)
 			printf("   %ssaves drive settings%s", c_yel(), c_off());
-		if (arm)
+		if (needfmt >= 0)
+			printf("\n\n  %s%s needs a low level format first: set "
+			       "Mode to format%s\n", c_red(),
+			       disp_name(&devs[needfmt]), c_off());
+		else if (arm)
 			printf("\n\n  %spress y to start a %s on %d drive%s%s, "
 			       "other keys cancel%s\n",
 			       c_red(), mode_c[mode_sel], nsel,
@@ -11123,6 +11154,7 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 		k = tui_key(200);
 		if (k < 0)
 			continue;
+		needfmt = -1;
 		if (arm) {
 			/* the second key of a two-key start; anything that is
 			 * not a yes puts the form back the way it was */
@@ -11159,6 +11191,7 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 			continue;
 		}
 #define USABLE(x) (!devs[x].unsafe && devs[x].rotational && \
+		   (!devs[x].no_capacity || mode_sel == nmode + 1) && \
 		   (devs[x].is_file || transport_is_local(devs[x].transport)))
 		if (k == 'a') {
 			for (i = 0; i < ndev; i++)
@@ -11183,6 +11216,17 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 		}
 		if (k == 's' || k == 'S') {
 			if (!nsel)
+				continue;
+			/*
+			 * A drive with no capacity has nothing to scan; only a
+			 * format (or settings, which are mode pages) can take
+			 * it.  Say so here rather than after the form is gone.
+			 */
+			if (mode_sel != nmode + 1 && mode_sel != nmode + 2)
+				for (i = 0; i < ndev && needfmt < 0; i++)
+					if (pick[i] && devs[i].no_capacity)
+						needfmt = i;
+			if (needfmt >= 0)
 				continue;
 			/* a writing mode is one keystroke from destroying a
 			 * drive now that the form is the default entry point,
@@ -15203,6 +15247,12 @@ tui_again:
 		for (i = 0; i < n; i++) {
 			if (!all[i].rotational && !o.include_ssd)
 				continue;
+			if (all[i].no_capacity && !o.format && !o.apply_only) {
+				msg(PROG ": skipping %s: it has no capacity and "
+				    "needs a low level format (--format)\n",
+				    all[i].name);
+				continue;
+			}
 			if (!transport_is_local(all[i].transport) && !o.include_remote) {
 				msg(PROG ": skipping %s: %s disk, not a locally "
 				    "attached drive (--include-remote to test it)\n",
@@ -15389,6 +15439,12 @@ rescan_go:
 	for (i = 0; i < ntargets; i++) {
 		device_t *d = &targets[i];
 
+		if (d->no_capacity)
+			die("%s has no capacity: the kernel will not use its "
+			    "sector size, protection type\n"
+			    "       or format, so there is nothing to scan. "
+			    "A low level format (--format) is\n"
+			    "       what it needs", d->path);
 		safety_check(d);
 		if (d->unsafe) {
 			if (!o.force)
