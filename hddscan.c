@@ -13641,6 +13641,69 @@ static int fmt_pct(const char *s, double *pct)
 }
 
 /*
+ * The drive's own answer to how far its format has got: REQUEST SENSE
+ * carries a progress indication while FORMAT UNIT runs, which is what
+ * sg_requests --progress prints.  This is asked rather than trusted to
+ * sg_format, whose output only ever says what it last chose to print.
+ * Asking does not disturb the format; it is a status query, not a command.
+ */
+#define FMT_ASK_S	30
+
+static int fmt_ask_drive(const char *name, double *pct)
+{
+	char cmd[160], line[256];
+	FILE *f;
+	int got = 0;
+
+	if (!name_ok(name) || !tool_present("sg_requests"))
+		return 0;
+	snprintf(cmd, sizeof(cmd), "sg_requests --progress /dev/%s 2>/dev/null",
+		 name);
+	f = popen(cmd, "re");
+	if (!f)
+		return 0;
+	while (fgets(line, sizeof(line), f))
+		if (strstr(line, "rogress") && fmt_pct(line, pct))
+			got = 1;
+	pclose(f);
+	return got;
+}
+
+/*
+ * A pseudo-terminal for sg_format to write to: fd[0] the master this side
+ * reads, fd[1] the slave the child gets.  Output post-processing is turned
+ * off so a line arrives as sg_format wrote it rather than with \r\n.
+ */
+static int fmt_pty(int fd[2])
+{
+	struct termios t;
+	char *name;
+	int m, sl;
+
+	m = posix_openpt(O_RDWR | O_NOCTTY);
+	if (m < 0)
+		return -1;
+	if (grantpt(m) < 0 || unlockpt(m) < 0 || !(name = ptsname(m))) {
+		close(m);
+		return -1;
+	}
+	sl = open(name, O_RDWR | O_NOCTTY);
+	if (sl < 0) {
+		close(m);
+		return -1;
+	}
+	if (tcgetattr(sl, &t) == 0) {
+		t.c_oflag &= ~(tcflag_t)OPOST;
+		t.c_lflag &= ~(tcflag_t)(ECHO | ICANON | ISIG);
+		tcsetattr(sl, TCSANOW, &t);
+	}
+	fcntl(m, F_SETFD, FD_CLOEXEC);
+	fd[0] = m;
+	fd[1] = sl;
+	return 0;
+}
+
+/*
  * One drive's format, watched from start to finish by a process of its own.
  * It streams sg_format's output into a log beside the reports and keeps the
  * drive's job record up to date, which is the only reason a shelf of thirty
@@ -13651,7 +13714,8 @@ static void format_child(const run_t *r, const device_t *d, const opts_t *o,
 {
 	char cmd[512], buf[512];
 	size_t len = 0;
-	int pfd[2], st = 0;
+	int pfd[2], st = 0, told = 0;
+	time_t asked;
 	pid_t pid;
 	FILE *lf;
 
@@ -13673,43 +13737,94 @@ static void format_child(const run_t *r, const device_t *d, const opts_t *o,
 		fprintf(lf, "# %s\n# %s\n", d->path, cmd);
 		fflush(lf);
 	}
-	if (pipe(pfd) < 0)
+	/*
+	 * sg_format prints its "Format in progress, N% done" line with printf
+	 * and never flushes, so into a pipe it is block buffered: a line every
+	 * poll interval fills 4 KB only after a hundred or so of them, and a
+	 * format looked in on hours later still said "FORMAT UNIT issued" while
+	 * the drive itself reported 38% done.  On a terminal stdio flushes per
+	 * line, so it gets one.  A pipe remains the fallback, which is no worse
+	 * than before.
+	 */
+	if (fmt_pty(pfd) < 0 && pipe(pfd) < 0)
 		_exit(2);
 	pid = fork();
 	if (pid < 0)
 		_exit(2);
 	if (!pid) {
 		close(pfd[0]);
+		if (isatty(pfd[1])) {
+			int sl;
+
+			/* The slave becomes the controlling terminal only
+			 * once it is reopened after setsid(). */
+			setsid();
+			sl = open(ttyname(pfd[1]), O_RDWR);
+			if (sl >= 0)
+				close(sl);
+		}
+		dup2(pfd[1], STDIN_FILENO);
 		dup2(pfd[1], STDOUT_FILENO);
 		dup2(pfd[1], STDERR_FILENO);
-		close(pfd[1]);
+		if (pfd[1] > STDERR_FILENO)
+			close(pfd[1]);
 		execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
 		_exit(127);
 	}
 	close(pfd[1]);
 
+	/* First asked once sg_format has had time to issue the command. */
+	asked = time(NULL) - FMT_ASK_S + 10;
 	for (;;) {
-		ssize_t got = read(pfd[0], buf + len, sizeof(buf) - len - 1);
+		struct pollfd pf = { .fd = pfd[0], .events = POLLIN };
+		time_t now;
+		ssize_t got;
+		int pr;
 
-		if (got <= 0) {
-			if (got < 0 && errno == EINTR) {
-				/*
-				 * A stop reaches the watcher, not the platter.
-				 * FORMAT UNIT runs inside the drive and cannot
-				 * be called back, so say so instead of
-				 * implying the drive is idle again.
-				 */
-				if (g_stop) {
-					kill(pid, SIGINT);
-					snprintf(g_job.note, sizeof(g_job.note),
-						 "stopped watching; the drive "
-						 "is probably still formatting");
-					job_flush(JS_RUNNING);
-				}
-				continue;
-			}
-			break;
+		/*
+		 * A stop reaches the watcher, not the platter.  FORMAT UNIT
+		 * runs inside the drive and cannot be called back, so say so
+		 * instead of implying the drive is idle again.
+		 */
+		if (g_stop && !told) {
+			kill(pid, SIGINT);
+			told = 1;
+			snprintf(g_job.note, sizeof(g_job.note),
+				 "stopped watching; the drive is probably "
+				 "still formatting");
+			job_flush(JS_RUNNING);
 		}
+		pr = poll(&pf, 1, 1000);
+		now = time(NULL);
+		if (now - asked >= FMT_ASK_S) {
+			double pct;
+
+			asked = now;
+			if (fmt_ask_drive(d->name, &pct)) {
+				g_job.pct = pct;
+				/* Better than a note that never changes, but
+				 * never over something sg_format said. */
+				if (!strcmp(g_job.note, "FORMAT UNIT issued") ||
+				    !strncmp(g_job.note, "the drive reports ",
+					     18))
+					snprintf(g_job.note,
+						 sizeof(g_job.note),
+						 "the drive reports %.2f%% "
+						 "done", pct);
+				job_flush(JS_RUNNING);
+			}
+		}
+		if (pr < 0 && errno == EINTR)
+			continue;
+		if (pr < 0)
+			break;
+		if (!pr)
+			continue;
+		got = read(pfd[0], buf + len, sizeof(buf) - len - 1);
+		if (got < 0 && errno == EINTR)
+			continue;
+		if (got <= 0)
+			break;
 		len += (size_t)got;
 		buf[len] = 0;
 		for (;;) {

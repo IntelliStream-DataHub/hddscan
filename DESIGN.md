@@ -1314,7 +1314,15 @@ testable without ever killing anything.
 What is *not* tested: the format dashboard's feed. `format_child()` parses
 `sg_format`'s output, and `--format` refuses a file at the `is a file` gate, so
 that path only ever runs against a real SCSI drive. It is verified by
-inspection, like everything else behind `--format`.
+inspection, like everything else behind `--format`. `sg_format` is run on a
+pseudo-terminal rather than a pipe because it never flushes stdout: into a
+pipe its progress line sat in a 4 KB buffer for the better part of a format,
+and the dashboard showed nothing while `sg_requests --progress` on the same
+drive said 38% done. The watcher also asks the drive itself every 30 seconds
+with `sg_requests --progress`, so the figure comes from the drive even when
+`sg_format` says nothing. The pty was checked against a stand-in that prints the same line without
+flushing, and the parser against `sg_requests`' own line; neither has run
+against a drive that is actually formatting.
 
 On real hardware, on a SAS drive: the `sdparm` look-ahead path, and protection
 information being detected and reported as a coverage gap rather than as media
