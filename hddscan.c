@@ -8356,11 +8356,14 @@ static void usage(void)
 "                         /dev/mapper/bb-<serial>: the same drive with the\n"
 "                         damage cut out, for any filesystem (see 'dm' below).\n"
 "                         Whatever is on the drive becomes unreachable, so it\n"
-"                         needs --confirm like a write\n"
+"                         needs --confirm like a write.  Given a bb- device\n"
+"                         it made, it adds that device's scan to the map\n"
+"                         already on the drive (a remap, which keeps the data)\n"
+"                         instead of putting a second map on top\n"
 "  --rescan               with --hide-bad, then write and verify every sector\n"
 "                         of the new device: proves what is left is sound and\n"
 "                         that data written through the map reads back.  The\n"
-"                         form always does this after hiding\n"
+"                         form asks before doing this after hiding\n"
 "  --prometheus FILE      write metrics for node_exporter's textfile collector\n"
 "  --journal FILE         crash journal for --mode verify: the original bytes\n"
 "                         are fsynced here before the pattern is written, so a\n"
@@ -8918,8 +8921,13 @@ static int resolve_target(const char *arg, device_t *d)
 {
 	struct stat st;
 	const char *name = arg;
+	char real[PATH_MAX];
 
 	memset(d, 0, sizeof(*d));
+	/* /dev/mapper/bb-* is a link to the dm-N that /sys/block knows */
+	if (!strncmp(arg, "/dev/mapper/", 12) && realpath(arg, real) &&
+	    !strncmp(real, "/dev/dm-", 8) && strlen(real) < 64)
+		return probe_device(real + 5, d);
 	if (!strncmp(arg, "/dev/", 5))
 		name = arg + 5;
 
@@ -9355,7 +9363,13 @@ static int tui_key(int timeout_ms)
 	/* escape sequence: read the rest if it is there */
 	if (poll(&pfd, 1, 20) <= 0)
 		return 27;
-	if (read(STDIN_FILENO, &c, 1) != 1 || c != '[')
+	/*
+	 * A terminal in application cursor mode sends ESC O H for Home, not
+	 * ESC [ H.  Stopping at the O left the H behind as a keypress of its
+	 * own, and on the summary H is the key that arms hiding a drive's
+	 * damage -- so the second byte is read whichever introducer it is.
+	 */
+	if (read(STDIN_FILENO, &c, 1) != 1 || (c != '[' && c != 'O'))
 		return 27;
 	if (read(STDIN_FILENO, &c, 1) != 1)
 		return 27;
@@ -10037,6 +10051,8 @@ static int ckpt_whole(const char *path, uint64_t size);
 typedef char mapname_t[DMBB_NAME_MAX_LEN + 1];
 static int hide_bad(device_t *t, int n, const opts_t *o, mapname_t *made);
 static void hide_name(const device_t *d, char *name, size_t len);
+static int hide_under(const device_t *d, char *under, size_t ulen,
+		      char *name, size_t nlen);
 /* a device the summary just made, for the form to test next: --rescan */
 static mapname_t g_rescan;
 static char g_rescan_over[64];
@@ -10072,7 +10088,7 @@ static int summary_can_hide(const run_t *r, const jrec_t *x)
 static int summary_hide(const jrec_t *x)
 {
 	pid_t pid;
-	int st = 0, rc = -1;
+	int st = 0, rc = -1, k = -1;
 
 	tui_clear();
 	printf("\033[?25h\n  Hiding the damage on %s\n", jrec_name(x));
@@ -10101,33 +10117,50 @@ static int summary_hide(const jrec_t *x)
 		rc = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
 	}
 	/*
-	 * An image stops at writing the map; a drive gets a device, and the
-	 * form tests that next, as --rescan does on the command line.
+	 * An image stops at writing the map; a drive gets a device, which
+	 * can be tested next as --rescan does on the command line -- but only
+	 * when asked.  The test writes every sector of the device, and this
+	 * summary may be one reopened long after a filesystem went onto it.
 	 */
 	g_rescan[0] = 0;
 	if (rc == 0) {
 		device_t d;
-		char name[sizeof(g_rescan)], dev[PATH_MAX];
+		char name[sizeof(g_rescan)], dev[PATH_MAX], under[PATH_MAX];
+		const char *over;
 		struct stat sb;
 
 		if (resolve_target(x->path, &d) == 0) {
-			hide_name(&d, name, sizeof(name));
+			over = d.name;
+			if (hide_under(&d, under, sizeof(under), name,
+				       sizeof(name)) == 1)
+				over = under + 5;
+			else
+				hide_name(&d, name, sizeof(name));
 			snprintf(dev, sizeof(dev), "/dev/mapper/%s", name);
 			if (!d.is_file && !stat(dev, &sb)) {
 				snprintf(g_rescan, sizeof(g_rescan), "%s", name);
 				snprintf(g_rescan_over, sizeof(g_rescan_over),
-					 "%s", d.name);
+					 "%.63s", over);
 			}
 		}
 	}
-	printf("\n  %s%s%s\n\n  press any key to %s",
-	       rc == 0 ? c_grn() : c_red(),
+	printf("\n  %s%s%s\n\n", rc == 0 ? c_grn() : c_red(),
 	       rc == 0 ? "done" : "nothing was changed by the step that failed",
-	       c_off(), g_rescan[0] ? "write and verify every sector of what "
-	       "is left" : "return to the summary");
+	       c_off());
+	if (g_rescan[0])
+		printf("  %spress y to write and verify every sector of "
+		       "/dev/mapper/%s now;\n  that overwrites everything on "
+		       "it.%s  Any other key returns to the summary", c_red(),
+		       g_rescan, c_off());
+	else
+		printf("  press any key to return to the summary");
 	fflush(stdout);
-	while (tui_key(1000) < 0 && !g_stop)
+	/* a key pressed while the map was being written is not an answer */
+	tcflush(STDIN_FILENO, TCIFLUSH);
+	while ((k = tui_key(1000)) < 0 && !g_stop)
 		;
+	if (k != 'y' && k != 'Y')
+		g_rescan[0] = 0;
 	printf("\033[?25l");
 	tui_clear();
 	return rc;
@@ -10242,7 +10275,11 @@ static int tui_summary(const run_t *r, const jrec_t *j, int n, int nruns)
 			tui_eol();
 		}
 		tui_at(rows, 1);
-		if (arm) {
+		if (arm == 2) {
+			printf("  %spress y to add the damage on %s to its map; "
+			       "what is on it is kept%s", c_yel(),
+			       jrec_name(&j[sel]), c_off());
+		} else if (arm) {
 			printf("  %spress y to hide the damage on %s; whatever is "
 			       "on it becomes unreachable%s", c_red(),
 			       jrec_name(&j[sel]), c_off());
@@ -10304,8 +10341,19 @@ static int tui_summary(const run_t *r, const jrec_t *j, int n, int nruns)
 			continue;
 		}
 		if (k == 'h' || k == 'H') {
-			if (anyhide && can[sel])
+			if (anyhide && can[sel]) {
+				device_t d;
+				char u[PATH_MAX], nm[DMBB_NAME_MAX_LEN + 1];
+
 				arm = 1;
+				if (!resolve_target(j[sel].path, &d) &&
+				    hide_under(&d, u, sizeof(u), nm,
+					       sizeof(nm)) == 1)
+					arm = 2;
+				/* only a key pressed after the question
+				 * answers it */
+				tcflush(STDIN_FILENO, TCIFLUSH);
+			}
 			continue;
 		}
 		if (k == K_RIGHT || k == K_PGDN || k == '>' || k == '.' ||
@@ -13289,10 +13337,64 @@ static void hide_name(const device_t *d, char *name, size_t len)
 		snprintf(name, len, "bb-%.60s", d->name);
 }
 
+/* a yes/no question on a cooked terminal; anything but y is no */
+static int tty_yes(const char *q)
+{
+	char line[16];
+
+	printf("%s", q);
+	fflush(stdout);
+	tcflush(STDIN_FILENO, TCIFLUSH);
+	if (!fgets(line, sizeof(line), stdin))
+		return 0;
+	return line[0] == 'y' || line[0] == 'Y';
+}
+
 /*
- * made, when given, gets the name of each device actually activated, and
- * an empty string for every drive that did not get one -- an image, a dry
- * run, a refusal.  --rescan tests exactly those and nothing else.
+ * Is d a device --hide-bad made?  Then hiding what a scan of it found is a
+ * remap of the map already on the drive underneath, never a second map on
+ * top of it: a map over a map spends another pair of metadata extents and
+ * another set of spares, needs two tables loaded in the right order at boot,
+ * and leaves every later remap guessing which layer it belongs to.  Returns
+ * 1 with the drive underneath and the map's name, 0 for anything else, and
+ * -1 for one of ours whose drive cannot be told -- which must stop the hide
+ * rather than fall through to a create.
+ */
+static int hide_under(const device_t *d, char *under, size_t ulen,
+		      char *name, size_t nlen)
+{
+	char p[PATH_MAX], uuid[128];
+	DIR *dir;
+	struct dirent *e;
+	int n = 0;
+
+	if (d->is_file || strncmp(d->name, "dm-", 3))
+		return 0;
+	snprintf(p, sizeof(p), "/sys/block/%s/dm/uuid", d->name);
+	if (dmbb_read_line(p, uuid, sizeof(uuid)) < 0 ||
+	    strncmp(uuid, "DMBB-", 5))
+		return 0;
+	snprintf(p, sizeof(p), "/sys/block/%s/dm/name", d->name);
+	if (dmbb_read_line(p, name, nlen) < 0 || !dmbb_name_ok(name))
+		return -1;
+	snprintf(p, sizeof(p), "/sys/block/%s/slaves", d->name);
+	if (!(dir = opendir(p)))
+		return -1;
+	while ((e = readdir(dir))) {
+		if (e->d_name[0] == '.')
+			continue;
+		snprintf(under, ulen, "/dev/%s", e->d_name);
+		n++;
+	}
+	closedir(dir);
+	return n == 1 ? 1 : -1;
+}
+
+/*
+ * made, when given, gets the name of each device actually activated or
+ * remapped, and an empty string for every drive that did not get one -- an
+ * image, a dry run, a refusal.  --rescan tests exactly those and nothing
+ * else.
  */
 static int hide_bad(device_t *t, int n, const opts_t *o, mapname_t *made)
 {
@@ -13304,11 +13406,21 @@ static int hide_bad(device_t *t, int n, const opts_t *o, mapname_t *made)
 		device_t *d = &t[i];
 		char ckpt[STORE_MAX + 128], list[STORE_MAX + 128];
 		char runid[48], name[DMBB_NAME_MAX_LEN + 1];
+		char under[PATH_MAX];
 		dmbb_opts_t dop;
 		int ok = o->tui || (o->confirm &&
 			 (!strcmp(o->confirm, d->name) ||
 			  (d->serial[0] && !strcmp(o->confirm, d->serial))));
+		int over = hide_under(d, under, sizeof(under), name,
+				      sizeof(name));
 
+		if (over < 0) {
+			msg(PROG ": %s is a dm-badblocks device, but the map "
+			    "or the drive under it cannot be read from sysfs; "
+			    "not putting a second map over it\n", d->name);
+			worst = 2;
+			continue;
+		}
 		safety_check(d);
 		if (d->unsafe && !o->force)
 			die("%s: %s\n       refusing to put a device over a "
@@ -13331,9 +13443,41 @@ static int hide_bad(device_t *t, int n, const opts_t *o, mapname_t *made)
 			 (int)(strlen(ckpt) - 5), ckpt);
 		if (badblocks_replay(ckpt, list, 4096, 0, 1))
 			return 2;
-		hide_name(d, name, sizeof(name));
 
 		memset(&dop, 0, sizeof(dop));
+		if (over) {
+			/*
+			 * The scan read the virtual device, so its list is
+			 * in the virtual device's own offsets: --logical.
+			 * A remap copies each extent before moving it, so
+			 * unlike a create it keeps what is on the device.
+			 */
+			dop.dev = under;
+			dop.bad = list;
+			dop.bs = 4096;
+			dop.logical = 1;
+			out("\n  %s: /dev/mapper/%s already hides %s's damage; "
+			    "adding what run %s found to that map\n", d->name,
+			    name, under, runid);
+			if (o->dry_run) {
+				out("  dry run: would remap it on %s%s\n",
+				    under, o->rescan ? ", then write and verify "
+				    "every sector of the device" : "");
+				continue;
+			}
+			if (dmbb_cmd_remap(&dop) != 0) {
+				worst = 2;
+				continue;
+			}
+			if (made)
+				snprintf(made[i], sizeof(made[i]), "%s", name);
+			out("\n  /dev/mapper/%s now steps around this damage "
+			    "too; it is still the one map on %s\n", name,
+			    under);
+			continue;
+		}
+		hide_name(d, name, sizeof(name));
+
 		dop.dev = d->path;
 		dop.bad = list;
 		dop.bs = 4096;
@@ -15427,20 +15571,37 @@ tui_again:
 
 		if (!made)
 			die("out of memory");
-		/* the form has no field for it: there, it always follows */
-		if (o.tui)
-			o.rescan = 1;
 		st = hide_bad(targets, ntargets, &o, made);
+		/*
+		 * The form has no field for --rescan, so it asks once the
+		 * devices exist.  It used to follow unasked: confirming the
+		 * hide is not confirming a pass that writes every sector of
+		 * what the hide made.
+		 */
+		if (o.tui && !o.dry_run) {
+			for (i = 0; i < ntargets && !made[i][0]; i++)
+				;
+			if (i < ntargets)
+				o.rescan = tty_yes("\n  Write and verify every "
+						   "sector of what is left now? "
+						   "That overwrites everything "
+						   "on it. [y/N] ");
+		}
 		if (!o.rescan || o.dry_run) {
 			free(made);
 			return st;
 		}
 		for (i = 0; i < ntargets; i++) {
 			device_t d;
+			char u[PATH_MAX], nm[DMBB_NAME_MAX_LEN + 1];
+			const char *ov = targets[i].name;
 
 			if (!made[i][0])
 				continue;
-			if (rescan_target(made[i], targets[i].name, &d) < 0) {
+			if (hide_under(&targets[i], u, sizeof(u), nm,
+				       sizeof(nm)) == 1)
+				ov = u + 5;
+			if (rescan_target(made[i], ov, &d) < 0) {
 				st = 2;
 				continue;
 			}

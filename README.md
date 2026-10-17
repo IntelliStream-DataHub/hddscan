@@ -99,9 +99,10 @@ later is moved to spares held back for it (`hddscan dm remap`), and
 `contrib/dm-badblocks.service` sets the devices up again at boot. The form
 offers it as **Mode → hide bad**, and the summary a scan ends on offers it as
 `h` for any drive the scan found damage on: pick the drive with ↑/↓, press `h`,
-confirm with `y`. From the form either way, a write-and-verify pass over the
-new device follows, which is what `--rescan` does on the command line. See
-`DESIGN.md` for how the map works.
+confirm with `y`. Either way it then asks whether to run a write-and-verify
+pass over the new device, which is what `--rescan` does on the command line.
+If that pass finds more damage, hiding it again adds it to the same map rather
+than stacking a second one on top. See `DESIGN.md` for how the map works.
 
 ## Runs keep going without you
 

@@ -702,6 +702,11 @@ since its name can change between boots. When the damage includes regions
 .B \-\-skip\-slow
 condemned, the map uses extents as coarse as it needs, up to 64 MiB, to hold
 them.
+Given a device it made itself,
+.IR /dev/mapper/bb\-<serial> ,
+whose own scan found more damage, it never puts a second map on top: the new
+damage is added to the map already on the drive underneath as a remap, which
+copies each affected extent to a spare and keeps what is on the device.
 .TP
 .B \-\-rescan
 With
@@ -714,8 +719,9 @@ back from where it should. The device is empty, and
 .B \-\-confirm
 for
 .B \-\-hide\-bad
-covers it; no drive setting is changed. The interactive form always does this
-after hiding a drive's damage. An image file gets its map written but no
+covers it; no drive setting is changed. The interactive form asks before
+doing this after hiding a drive's damage, and does nothing unless the answer
+is yes. An image file gets its map written but no
 device, so there is nothing to rescan.
 .TP
 .BI \-\-badblocks\-blocksize " N"
