@@ -785,6 +785,15 @@ def main():
         s.send(b"n", 0.3)
         check("any other key backs out",
               s.wait(lambda: s.on_screen("h hide bad blocks")))
+        # REGRESSION: Home in application cursor mode is ESC O H, and the
+        # parser stopped at the O and left the H as a key of its own -- the
+        # key that arms hiding the damage.  Sent with an h behind it: had
+        # the stray H armed the question, the h would answer it and cancel.
+        s.send(b"\x1bOHh", 0.3)
+        check("ESC O H is Home, not an h that arms the hide",
+              s.wait(lambda: s.on_screen("press y to hide the damage")))
+        s.send(b"n", 0.3)
+        s.wait(lambda: s.on_screen("h hide bad blocks"))
         before = subprocess.run([HDDSCAN, "dm", "status", hurt],
                                 capture_output=True, text=True)
         check("and has written nothing",

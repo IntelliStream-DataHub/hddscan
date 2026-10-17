@@ -627,9 +627,9 @@ mode: <a href="#opt-mode"><code>--mode</code></a> read on predeploy saves nothin
 <dt id="opt-badblocks-from"><code>--badblocks-from FILE</code></dt>
 <dd>build that list from a scan that has already finished, reading its checkpoint (<a href="#opt-state"><code>--state</code></a>, or the one a parallel run keeps per drive) or its <a href="#opt-csv"><code>--csv</code></a>. Touches no drive, so the block size and offset can be chosen once the partition exists</dd>
 <dt id="opt-hide-bad"><code>--hide-bad</code></dt>
-<dd>write a map of the damage the last finished whole-drive scan found onto the drive, and activate /dev/mapper/bb-&lt;serial&gt;: the same drive with the damage cut out, for any filesystem (see &#x27;dm&#x27; below). Whatever is on the drive becomes unreachable, so it needs <a href="#opt-confirm"><code>--confirm</code></a> like a write</dd>
+<dd>write a map of the damage the last finished whole-drive scan found onto the drive, and activate /dev/mapper/bb-&lt;serial&gt;: the same drive with the damage cut out, for any filesystem (see &#x27;dm&#x27; below). Whatever is on the drive becomes unreachable, so it needs <a href="#opt-confirm"><code>--confirm</code></a> like a write.  Given a bb- device it made, it adds that device&#x27;s scan to the map already on the drive (a remap, which keeps the data) instead of putting a second map on top</dd>
 <dt id="opt-rescan"><code>--rescan</code></dt>
-<dd>with <a href="#opt-hide-bad"><code>--hide-bad</code></a>, then write and verify every sector of the new device: proves what is left is sound and that data written through the map reads back.  The form always does this after hiding</dd>
+<dd>with <a href="#opt-hide-bad"><code>--hide-bad</code></a>, then write and verify every sector of the new device: proves what is left is sound and that data written through the map reads back.  The form asks before doing this after hiding</dd>
 <dt id="opt-prometheus"><code>--prometheus FILE</code></dt>
 <dd>write metrics for node_exporter&#x27;s textfile collector</dd>
 <dt id="opt-journal"><code>--journal FILE</code></dt>

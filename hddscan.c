@@ -1424,6 +1424,7 @@ typedef struct {
 	char unsafe_why[1024];
 	int is_root_disk;
 	int no_access;          /* could not even open it: almost always "not root" */
+	int no_capacity;        /* attached with no capacity: needs a format */
 } device_t;
 
 /*
@@ -1611,13 +1612,30 @@ static int probe_device(const char *name, device_t *d)
 	snprintf(d->name, sizeof(d->name), "%s", name);
 	snprintf(d->path, sizeof(d->path), "/dev/%s", name);
 
-	sz = sysfs_ll("/sys/block/%s/size", name);
-	if (sz <= 0)
-		return -1;
-	d->size = (uint64_t)sz * 512ull;
-
 	d->rotational = (int)sysfs_ll("/sys/block/%s/queue/rotational", name);
 	d->removable = (int)sysfs_ll("/sys/block/%s/removable", name);
+	/*
+	 * A SCSI disk the kernel attaches with no capacity is nearly always
+	 * one that needs a low level format: sd refuses a sector size it
+	 * cannot use (520 or 528 bytes, out of an array), a protection type
+	 * it does not support, or a medium whose format is corrupt, and
+	 * leaves the disk there at zero bytes.  Those are exactly the drives
+	 * --format exists for, so they stay in the list, marked, and only a
+	 * format will take them.  An empty removable slot is a different
+	 * thing and is left out, as is anything that is not a SCSI disk.
+	 */
+	sz = sysfs_ll("/sys/block/%s/size", name);
+	if (sz <= 0) {
+		struct stat st;
+		char sd[PATH_MAX];
+
+		snprintf(sd, sizeof(sd), "/sys/block/%s/device/scsi_disk", name);
+		if (d->removable || stat(sd, &st) < 0 || !S_ISDIR(st.st_mode))
+			return -1;
+		d->no_capacity = 1;
+		sz = 0;
+	}
+	d->size = (uint64_t)sz * 512ull;
 	d->readonly = (int)sysfs_ll("/sys/block/%s/ro", name);
 	d->logical_bs = (int)sysfs_ll("/sys/block/%s/queue/logical_block_size", name);
 	d->physical_bs = (int)sysfs_ll("/sys/block/%s/queue/physical_block_size", name);
@@ -8338,11 +8356,14 @@ static void usage(void)
 "                         /dev/mapper/bb-<serial>: the same drive with the\n"
 "                         damage cut out, for any filesystem (see 'dm' below).\n"
 "                         Whatever is on the drive becomes unreachable, so it\n"
-"                         needs --confirm like a write\n"
+"                         needs --confirm like a write.  Given a bb- device\n"
+"                         it made, it adds that device's scan to the map\n"
+"                         already on the drive (a remap, which keeps the data)\n"
+"                         instead of putting a second map on top\n"
 "  --rescan               with --hide-bad, then write and verify every sector\n"
 "                         of the new device: proves what is left is sound and\n"
 "                         that data written through the map reads back.  The\n"
-"                         form always does this after hiding\n"
+"                         form asks before doing this after hiding\n"
 "  --prometheus FILE      write metrics for node_exporter's textfile collector\n"
 "  --journal FILE         crash journal for --mode verify: the original bytes\n"
 "                         are fsynced here before the pattern is written, so a\n"
@@ -8400,7 +8421,8 @@ static void list_devices(int no_smart)
 		safety_check(d);
 		if (!no_smart && !smart_read(d, &s) && !d->serial[0] && s.serial[0])
 			snprintf(d->serial, sizeof(d->serial), "%s", s.serial);
-		testable = d->rotational && transport_is_local(d->transport) && !d->unsafe;
+		testable = d->rotational && transport_is_local(d->transport) &&
+			   !d->unsafe && !d->no_capacity;
 		printf("%-8s %-10s %-24.24s %-18.18s %-9s %-12s %s%s%s\n",
 		       d->name, human_size(d->size, b, sizeof(b)),
 		       d->model[0] ? d->model : "?",
@@ -8408,10 +8430,16 @@ static void list_devices(int no_smart)
 		       d->zoned ? "HDD-SMR" : d->rotational ? "HDD" : "SSD/flash",
 		       transport_name(d->transport),
 		       d->unsafe ? c_red() : testable ? c_grn() : c_yel(),
-		       d->unsafe ? "IN USE" : d->no_access ? "need root" :
+		       d->unsafe ? "IN USE" : d->no_capacity ? "needs format" :
+		       d->no_access ? "need root" :
 		       testable ? "ready" : "skipped",
 		       c_off());
-		if (d->unsafe)
+		if (d->no_capacity && !d->unsafe)
+			printf("         the kernel gives it no capacity (sector "
+			       "size, protection type or format\n"
+			       "         it cannot use); --format is the only "
+			       "mode that will take it\n");
+		else if (d->unsafe)
 			printf("         %s\n", d->unsafe_why);
 		else if (d->no_access)
 			printf("         cannot open %s; re-run as root to see whether "
@@ -8893,8 +8921,13 @@ static int resolve_target(const char *arg, device_t *d)
 {
 	struct stat st;
 	const char *name = arg;
+	char real[PATH_MAX];
 
 	memset(d, 0, sizeof(*d));
+	/* /dev/mapper/bb-* is a link to the dm-N that /sys/block knows */
+	if (!strncmp(arg, "/dev/mapper/", 12) && realpath(arg, real) &&
+	    !strncmp(real, "/dev/dm-", 8) && strlen(real) < 64)
+		return probe_device(real + 5, d);
 	if (!strncmp(arg, "/dev/", 5))
 		name = arg + 5;
 
@@ -9330,7 +9363,13 @@ static int tui_key(int timeout_ms)
 	/* escape sequence: read the rest if it is there */
 	if (poll(&pfd, 1, 20) <= 0)
 		return 27;
-	if (read(STDIN_FILENO, &c, 1) != 1 || c != '[')
+	/*
+	 * A terminal in application cursor mode sends ESC O H for Home, not
+	 * ESC [ H.  Stopping at the O left the H behind as a keypress of its
+	 * own, and on the summary H is the key that arms hiding a drive's
+	 * damage -- so the second byte is read whichever introducer it is.
+	 */
+	if (read(STDIN_FILENO, &c, 1) != 1 || (c != '[' && c != 'O'))
 		return 27;
 	if (read(STDIN_FILENO, &c, 1) != 1)
 		return 27;
@@ -10012,6 +10051,8 @@ static int ckpt_whole(const char *path, uint64_t size);
 typedef char mapname_t[DMBB_NAME_MAX_LEN + 1];
 static int hide_bad(device_t *t, int n, const opts_t *o, mapname_t *made);
 static void hide_name(const device_t *d, char *name, size_t len);
+static int hide_under(const device_t *d, char *under, size_t ulen,
+		      char *name, size_t nlen);
 /* a device the summary just made, for the form to test next: --rescan */
 static mapname_t g_rescan;
 static char g_rescan_over[64];
@@ -10047,7 +10088,7 @@ static int summary_can_hide(const run_t *r, const jrec_t *x)
 static int summary_hide(const jrec_t *x)
 {
 	pid_t pid;
-	int st = 0, rc = -1;
+	int st = 0, rc = -1, k = -1;
 
 	tui_clear();
 	printf("\033[?25h\n  Hiding the damage on %s\n", jrec_name(x));
@@ -10076,33 +10117,50 @@ static int summary_hide(const jrec_t *x)
 		rc = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
 	}
 	/*
-	 * An image stops at writing the map; a drive gets a device, and the
-	 * form tests that next, as --rescan does on the command line.
+	 * An image stops at writing the map; a drive gets a device, which
+	 * can be tested next as --rescan does on the command line -- but only
+	 * when asked.  The test writes every sector of the device, and this
+	 * summary may be one reopened long after a filesystem went onto it.
 	 */
 	g_rescan[0] = 0;
 	if (rc == 0) {
 		device_t d;
-		char name[sizeof(g_rescan)], dev[PATH_MAX];
+		char name[sizeof(g_rescan)], dev[PATH_MAX], under[PATH_MAX];
+		const char *over;
 		struct stat sb;
 
 		if (resolve_target(x->path, &d) == 0) {
-			hide_name(&d, name, sizeof(name));
+			over = d.name;
+			if (hide_under(&d, under, sizeof(under), name,
+				       sizeof(name)) == 1)
+				over = under + 5;
+			else
+				hide_name(&d, name, sizeof(name));
 			snprintf(dev, sizeof(dev), "/dev/mapper/%s", name);
 			if (!d.is_file && !stat(dev, &sb)) {
 				snprintf(g_rescan, sizeof(g_rescan), "%s", name);
 				snprintf(g_rescan_over, sizeof(g_rescan_over),
-					 "%s", d.name);
+					 "%.63s", over);
 			}
 		}
 	}
-	printf("\n  %s%s%s\n\n  press any key to %s",
-	       rc == 0 ? c_grn() : c_red(),
+	printf("\n  %s%s%s\n\n", rc == 0 ? c_grn() : c_red(),
 	       rc == 0 ? "done" : "nothing was changed by the step that failed",
-	       c_off(), g_rescan[0] ? "write and verify every sector of what "
-	       "is left" : "return to the summary");
+	       c_off());
+	if (g_rescan[0])
+		printf("  %spress y to write and verify every sector of "
+		       "/dev/mapper/%s now;\n  that overwrites everything on "
+		       "it.%s  Any other key returns to the summary", c_red(),
+		       g_rescan, c_off());
+	else
+		printf("  press any key to return to the summary");
 	fflush(stdout);
-	while (tui_key(1000) < 0 && !g_stop)
+	/* a key pressed while the map was being written is not an answer */
+	tcflush(STDIN_FILENO, TCIFLUSH);
+	while ((k = tui_key(1000)) < 0 && !g_stop)
 		;
+	if (k != 'y' && k != 'Y')
+		g_rescan[0] = 0;
 	printf("\033[?25l");
 	tui_clear();
 	return rc;
@@ -10217,7 +10275,11 @@ static int tui_summary(const run_t *r, const jrec_t *j, int n, int nruns)
 			tui_eol();
 		}
 		tui_at(rows, 1);
-		if (arm) {
+		if (arm == 2) {
+			printf("  %spress y to add the damage on %s to its map; "
+			       "what is on it is kept%s", c_yel(),
+			       jrec_name(&j[sel]), c_off());
+		} else if (arm) {
 			printf("  %spress y to hide the damage on %s; whatever is "
 			       "on it becomes unreachable%s", c_red(),
 			       jrec_name(&j[sel]), c_off());
@@ -10279,8 +10341,19 @@ static int tui_summary(const run_t *r, const jrec_t *j, int n, int nruns)
 			continue;
 		}
 		if (k == 'h' || k == 'H') {
-			if (anyhide && can[sel])
+			if (anyhide && can[sel]) {
+				device_t d;
+				char u[PATH_MAX], nm[DMBB_NAME_MAX_LEN + 1];
+
 				arm = 1;
+				if (!resolve_target(j[sel].path, &d) &&
+				    hide_under(&d, u, sizeof(u), nm,
+					       sizeof(nm)) == 1)
+					arm = 2;
+				/* only a key pressed after the question
+				 * answers it */
+				tcflush(STDIN_FILENO, TCIFLUSH);
+			}
 			continue;
 		}
 		if (k == K_RIGHT || k == K_PGDN || k == '>' || k == '.' ||
@@ -10658,7 +10731,7 @@ static void tui_devices(device_t *devs, int ndev, int *pick, int cur, int top,
 
 		if (top + i >= ndev)
 			break;
-		usable = !d->unsafe && d->rotational &&
+		usable = !d->unsafe && d->rotational && !d->no_capacity &&
 			 (d->is_file || transport_is_local(d->transport));
 		printf("  %s%s [%c] %-8.8s %-7.7s %-10s %-20.20s %-9s %s%s\n",
 		       (top + i == cur) ? "\033[7m" : "",
@@ -10667,6 +10740,7 @@ static void tui_devices(device_t *devs, int ndev, int *pick, int cur, int top,
 		       d->model[0] ? d->model : "?",
 		       d->zoned ? "HDD-SMR" : d->rotational ? "HDD" : "SSD",
 		       d->unsafe ? "IN USE" :
+		       d->no_capacity ? "needs format" :
 		       (!d->is_file && !transport_is_local(d->transport)) ?
 		       transport_name(d->transport) :
 		       usable ? "ready" : "not a HDD",
@@ -10752,6 +10826,7 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 	long long retries = o->retries, segment_mb = (long long)(o->segment >> 20);
 	long long parallel = o->max_parallel, sample = (long long)o->sample;
 	int cur = 0, sec = 0, arm = 0, i, rows, cols, dtop = 0;
+	int needfmt = -1;       /* a picked drive only a format can take */
 	int ftop = 0, fshow = 0, dshow = 0, depline = 0, nscroll = 0;
 	int nlive = store_live_count();
 	field_t f[] = {
@@ -11102,7 +11177,11 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 		 */
 		if (bms_sel || persist_sel || fix_sel)
 			printf("   %ssaves drive settings%s", c_yel(), c_off());
-		if (arm)
+		if (needfmt >= 0)
+			printf("\n\n  %s%s needs a low level format first: set "
+			       "Mode to format%s\n", c_red(),
+			       disp_name(&devs[needfmt]), c_off());
+		else if (arm)
 			printf("\n\n  %spress y to start a %s on %d drive%s%s, "
 			       "other keys cancel%s\n",
 			       c_red(), mode_c[mode_sel], nsel,
@@ -11123,6 +11202,7 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 		k = tui_key(200);
 		if (k < 0)
 			continue;
+		needfmt = -1;
 		if (arm) {
 			/* the second key of a two-key start; anything that is
 			 * not a yes puts the form back the way it was */
@@ -11159,6 +11239,7 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 			continue;
 		}
 #define USABLE(x) (!devs[x].unsafe && devs[x].rotational && \
+		   (!devs[x].no_capacity || mode_sel == nmode + 1) && \
 		   (devs[x].is_file || transport_is_local(devs[x].transport)))
 		if (k == 'a') {
 			for (i = 0; i < ndev; i++)
@@ -11183,6 +11264,17 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 		}
 		if (k == 's' || k == 'S') {
 			if (!nsel)
+				continue;
+			/*
+			 * A drive with no capacity has nothing to scan; only a
+			 * format (or settings, which are mode pages) can take
+			 * it.  Say so here rather than after the form is gone.
+			 */
+			if (mode_sel != nmode + 1 && mode_sel != nmode + 2)
+				for (i = 0; i < ndev && needfmt < 0; i++)
+					if (pick[i] && devs[i].no_capacity)
+						needfmt = i;
+			if (needfmt >= 0)
 				continue;
 			/* a writing mode is one keystroke from destroying a
 			 * drive now that the form is the default entry point,
@@ -13245,10 +13337,64 @@ static void hide_name(const device_t *d, char *name, size_t len)
 		snprintf(name, len, "bb-%.60s", d->name);
 }
 
+/* a yes/no question on a cooked terminal; anything but y is no */
+static int tty_yes(const char *q)
+{
+	char line[16];
+
+	printf("%s", q);
+	fflush(stdout);
+	tcflush(STDIN_FILENO, TCIFLUSH);
+	if (!fgets(line, sizeof(line), stdin))
+		return 0;
+	return line[0] == 'y' || line[0] == 'Y';
+}
+
 /*
- * made, when given, gets the name of each device actually activated, and
- * an empty string for every drive that did not get one -- an image, a dry
- * run, a refusal.  --rescan tests exactly those and nothing else.
+ * Is d a device --hide-bad made?  Then hiding what a scan of it found is a
+ * remap of the map already on the drive underneath, never a second map on
+ * top of it: a map over a map spends another pair of metadata extents and
+ * another set of spares, needs two tables loaded in the right order at boot,
+ * and leaves every later remap guessing which layer it belongs to.  Returns
+ * 1 with the drive underneath and the map's name, 0 for anything else, and
+ * -1 for one of ours whose drive cannot be told -- which must stop the hide
+ * rather than fall through to a create.
+ */
+static int hide_under(const device_t *d, char *under, size_t ulen,
+		      char *name, size_t nlen)
+{
+	char p[PATH_MAX], uuid[128];
+	DIR *dir;
+	struct dirent *e;
+	int n = 0;
+
+	if (d->is_file || strncmp(d->name, "dm-", 3))
+		return 0;
+	snprintf(p, sizeof(p), "/sys/block/%s/dm/uuid", d->name);
+	if (dmbb_read_line(p, uuid, sizeof(uuid)) < 0 ||
+	    strncmp(uuid, "DMBB-", 5))
+		return 0;
+	snprintf(p, sizeof(p), "/sys/block/%s/dm/name", d->name);
+	if (dmbb_read_line(p, name, nlen) < 0 || !dmbb_name_ok(name))
+		return -1;
+	snprintf(p, sizeof(p), "/sys/block/%s/slaves", d->name);
+	if (!(dir = opendir(p)))
+		return -1;
+	while ((e = readdir(dir))) {
+		if (e->d_name[0] == '.')
+			continue;
+		snprintf(under, ulen, "/dev/%s", e->d_name);
+		n++;
+	}
+	closedir(dir);
+	return n == 1 ? 1 : -1;
+}
+
+/*
+ * made, when given, gets the name of each device actually activated or
+ * remapped, and an empty string for every drive that did not get one -- an
+ * image, a dry run, a refusal.  --rescan tests exactly those and nothing
+ * else.
  */
 static int hide_bad(device_t *t, int n, const opts_t *o, mapname_t *made)
 {
@@ -13260,11 +13406,21 @@ static int hide_bad(device_t *t, int n, const opts_t *o, mapname_t *made)
 		device_t *d = &t[i];
 		char ckpt[STORE_MAX + 128], list[STORE_MAX + 128];
 		char runid[48], name[DMBB_NAME_MAX_LEN + 1];
+		char under[PATH_MAX];
 		dmbb_opts_t dop;
 		int ok = o->tui || (o->confirm &&
 			 (!strcmp(o->confirm, d->name) ||
 			  (d->serial[0] && !strcmp(o->confirm, d->serial))));
+		int over = hide_under(d, under, sizeof(under), name,
+				      sizeof(name));
 
+		if (over < 0) {
+			msg(PROG ": %s is a dm-badblocks device, but the map "
+			    "or the drive under it cannot be read from sysfs; "
+			    "not putting a second map over it\n", d->name);
+			worst = 2;
+			continue;
+		}
 		safety_check(d);
 		if (d->unsafe && !o->force)
 			die("%s: %s\n       refusing to put a device over a "
@@ -13287,9 +13443,41 @@ static int hide_bad(device_t *t, int n, const opts_t *o, mapname_t *made)
 			 (int)(strlen(ckpt) - 5), ckpt);
 		if (badblocks_replay(ckpt, list, 4096, 0, 1))
 			return 2;
-		hide_name(d, name, sizeof(name));
 
 		memset(&dop, 0, sizeof(dop));
+		if (over) {
+			/*
+			 * The scan read the virtual device, so its list is
+			 * in the virtual device's own offsets: --logical.
+			 * A remap copies each extent before moving it, so
+			 * unlike a create it keeps what is on the device.
+			 */
+			dop.dev = under;
+			dop.bad = list;
+			dop.bs = 4096;
+			dop.logical = 1;
+			out("\n  %s: /dev/mapper/%s already hides %s's damage; "
+			    "adding what run %s found to that map\n", d->name,
+			    name, under, runid);
+			if (o->dry_run) {
+				out("  dry run: would remap it on %s%s\n",
+				    under, o->rescan ? ", then write and verify "
+				    "every sector of the device" : "");
+				continue;
+			}
+			if (dmbb_cmd_remap(&dop) != 0) {
+				worst = 2;
+				continue;
+			}
+			if (made)
+				snprintf(made[i], sizeof(made[i]), "%s", name);
+			out("\n  /dev/mapper/%s now steps around this damage "
+			    "too; it is still the one map on %s\n", name,
+			    under);
+			continue;
+		}
+		hide_name(d, name, sizeof(name));
+
 		dop.dev = d->path;
 		dop.bad = list;
 		dop.bs = 4096;
@@ -13597,6 +13785,69 @@ static int fmt_pct(const char *s, double *pct)
 }
 
 /*
+ * The drive's own answer to how far its format has got: REQUEST SENSE
+ * carries a progress indication while FORMAT UNIT runs, which is what
+ * sg_requests --progress prints.  This is asked rather than trusted to
+ * sg_format, whose output only ever says what it last chose to print.
+ * Asking does not disturb the format; it is a status query, not a command.
+ */
+#define FMT_ASK_S	30
+
+static int fmt_ask_drive(const char *name, double *pct)
+{
+	char cmd[160], line[256];
+	FILE *f;
+	int got = 0;
+
+	if (!name_ok(name) || !tool_present("sg_requests"))
+		return 0;
+	snprintf(cmd, sizeof(cmd), "sg_requests --progress /dev/%s 2>/dev/null",
+		 name);
+	f = popen(cmd, "re");
+	if (!f)
+		return 0;
+	while (fgets(line, sizeof(line), f))
+		if (strstr(line, "rogress") && fmt_pct(line, pct))
+			got = 1;
+	pclose(f);
+	return got;
+}
+
+/*
+ * A pseudo-terminal for sg_format to write to: fd[0] the master this side
+ * reads, fd[1] the slave the child gets.  Output post-processing is turned
+ * off so a line arrives as sg_format wrote it rather than with \r\n.
+ */
+static int fmt_pty(int fd[2])
+{
+	struct termios t;
+	char *name;
+	int m, sl;
+
+	m = posix_openpt(O_RDWR | O_NOCTTY);
+	if (m < 0)
+		return -1;
+	if (grantpt(m) < 0 || unlockpt(m) < 0 || !(name = ptsname(m))) {
+		close(m);
+		return -1;
+	}
+	sl = open(name, O_RDWR | O_NOCTTY);
+	if (sl < 0) {
+		close(m);
+		return -1;
+	}
+	if (tcgetattr(sl, &t) == 0) {
+		t.c_oflag &= ~(tcflag_t)OPOST;
+		t.c_lflag &= ~(tcflag_t)(ECHO | ICANON | ISIG);
+		tcsetattr(sl, TCSANOW, &t);
+	}
+	fcntl(m, F_SETFD, FD_CLOEXEC);
+	fd[0] = m;
+	fd[1] = sl;
+	return 0;
+}
+
+/*
  * One drive's format, watched from start to finish by a process of its own.
  * It streams sg_format's output into a log beside the reports and keeps the
  * drive's job record up to date, which is the only reason a shelf of thirty
@@ -13607,7 +13858,8 @@ static void format_child(const run_t *r, const device_t *d, const opts_t *o,
 {
 	char cmd[512], buf[512];
 	size_t len = 0;
-	int pfd[2], st = 0;
+	int pfd[2], st = 0, told = 0;
+	time_t asked;
 	pid_t pid;
 	FILE *lf;
 
@@ -13629,43 +13881,94 @@ static void format_child(const run_t *r, const device_t *d, const opts_t *o,
 		fprintf(lf, "# %s\n# %s\n", d->path, cmd);
 		fflush(lf);
 	}
-	if (pipe(pfd) < 0)
+	/*
+	 * sg_format prints its "Format in progress, N% done" line with printf
+	 * and never flushes, so into a pipe it is block buffered: a line every
+	 * poll interval fills 4 KB only after a hundred or so of them, and a
+	 * format looked in on hours later still said "FORMAT UNIT issued" while
+	 * the drive itself reported 38% done.  On a terminal stdio flushes per
+	 * line, so it gets one.  A pipe remains the fallback, which is no worse
+	 * than before.
+	 */
+	if (fmt_pty(pfd) < 0 && pipe(pfd) < 0)
 		_exit(2);
 	pid = fork();
 	if (pid < 0)
 		_exit(2);
 	if (!pid) {
 		close(pfd[0]);
+		if (isatty(pfd[1])) {
+			int sl;
+
+			/* The slave becomes the controlling terminal only
+			 * once it is reopened after setsid(). */
+			setsid();
+			sl = open(ttyname(pfd[1]), O_RDWR);
+			if (sl >= 0)
+				close(sl);
+		}
+		dup2(pfd[1], STDIN_FILENO);
 		dup2(pfd[1], STDOUT_FILENO);
 		dup2(pfd[1], STDERR_FILENO);
-		close(pfd[1]);
+		if (pfd[1] > STDERR_FILENO)
+			close(pfd[1]);
 		execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
 		_exit(127);
 	}
 	close(pfd[1]);
 
+	/* First asked once sg_format has had time to issue the command. */
+	asked = time(NULL) - FMT_ASK_S + 10;
 	for (;;) {
-		ssize_t got = read(pfd[0], buf + len, sizeof(buf) - len - 1);
+		struct pollfd pf = { .fd = pfd[0], .events = POLLIN };
+		time_t now;
+		ssize_t got;
+		int pr;
 
-		if (got <= 0) {
-			if (got < 0 && errno == EINTR) {
-				/*
-				 * A stop reaches the watcher, not the platter.
-				 * FORMAT UNIT runs inside the drive and cannot
-				 * be called back, so say so instead of
-				 * implying the drive is idle again.
-				 */
-				if (g_stop) {
-					kill(pid, SIGINT);
-					snprintf(g_job.note, sizeof(g_job.note),
-						 "stopped watching; the drive "
-						 "is probably still formatting");
-					job_flush(JS_RUNNING);
-				}
-				continue;
-			}
-			break;
+		/*
+		 * A stop reaches the watcher, not the platter.  FORMAT UNIT
+		 * runs inside the drive and cannot be called back, so say so
+		 * instead of implying the drive is idle again.
+		 */
+		if (g_stop && !told) {
+			kill(pid, SIGINT);
+			told = 1;
+			snprintf(g_job.note, sizeof(g_job.note),
+				 "stopped watching; the drive is probably "
+				 "still formatting");
+			job_flush(JS_RUNNING);
 		}
+		pr = poll(&pf, 1, 1000);
+		now = time(NULL);
+		if (now - asked >= FMT_ASK_S) {
+			double pct;
+
+			asked = now;
+			if (fmt_ask_drive(d->name, &pct)) {
+				g_job.pct = pct;
+				/* Better than a note that never changes, but
+				 * never over something sg_format said. */
+				if (!strcmp(g_job.note, "FORMAT UNIT issued") ||
+				    !strncmp(g_job.note, "the drive reports ",
+					     18))
+					snprintf(g_job.note,
+						 sizeof(g_job.note),
+						 "the drive reports %.2f%% "
+						 "done", pct);
+				job_flush(JS_RUNNING);
+			}
+		}
+		if (pr < 0 && errno == EINTR)
+			continue;
+		if (pr < 0)
+			break;
+		if (!pr)
+			continue;
+		got = read(pfd[0], buf + len, sizeof(buf) - len - 1);
+		if (got < 0 && errno == EINTR)
+			continue;
+		if (got <= 0)
+			break;
 		len += (size_t)got;
 		buf[len] = 0;
 		for (;;) {
@@ -15203,6 +15506,12 @@ tui_again:
 		for (i = 0; i < n; i++) {
 			if (!all[i].rotational && !o.include_ssd)
 				continue;
+			if (all[i].no_capacity && !o.format && !o.apply_only) {
+				msg(PROG ": skipping %s: it has no capacity and "
+				    "needs a low level format (--format)\n",
+				    all[i].name);
+				continue;
+			}
 			if (!transport_is_local(all[i].transport) && !o.include_remote) {
 				msg(PROG ": skipping %s: %s disk, not a locally "
 				    "attached drive (--include-remote to test it)\n",
@@ -15262,20 +15571,37 @@ tui_again:
 
 		if (!made)
 			die("out of memory");
-		/* the form has no field for it: there, it always follows */
-		if (o.tui)
-			o.rescan = 1;
 		st = hide_bad(targets, ntargets, &o, made);
+		/*
+		 * The form has no field for --rescan, so it asks once the
+		 * devices exist.  It used to follow unasked: confirming the
+		 * hide is not confirming a pass that writes every sector of
+		 * what the hide made.
+		 */
+		if (o.tui && !o.dry_run) {
+			for (i = 0; i < ntargets && !made[i][0]; i++)
+				;
+			if (i < ntargets)
+				o.rescan = tty_yes("\n  Write and verify every "
+						   "sector of what is left now? "
+						   "That overwrites everything "
+						   "on it. [y/N] ");
+		}
 		if (!o.rescan || o.dry_run) {
 			free(made);
 			return st;
 		}
 		for (i = 0; i < ntargets; i++) {
 			device_t d;
+			char u[PATH_MAX], nm[DMBB_NAME_MAX_LEN + 1];
+			const char *ov = targets[i].name;
 
 			if (!made[i][0])
 				continue;
-			if (rescan_target(made[i], targets[i].name, &d) < 0) {
+			if (hide_under(&targets[i], u, sizeof(u), nm,
+				       sizeof(nm)) == 1)
+				ov = u + 5;
+			if (rescan_target(made[i], ov, &d) < 0) {
 				st = 2;
 				continue;
 			}
@@ -15389,6 +15715,12 @@ rescan_go:
 	for (i = 0; i < ntargets; i++) {
 		device_t *d = &targets[i];
 
+		if (d->no_capacity)
+			die("%s has no capacity: the kernel will not use its "
+			    "sector size, protection type\n"
+			    "       or format, so there is nothing to scan. "
+			    "A low level format (--format) is\n"
+			    "       what it needs", d->path);
 		safety_check(d);
 		if (d->unsafe) {
 			if (!o.force)

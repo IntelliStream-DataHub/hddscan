@@ -416,7 +416,8 @@ region as one `FIRST-LAST` line rather than a hundred million single blocks.
 That syntax is the map's alone: a list for `mke2fs` still names every block,
 and says it is the wrong tool for regions that size.
 
-`--hide-bad --rescan` (automatic from the form) then tests what is left. It
+`--hide-bad --rescan` (offered, never assumed, from the form and the summary)
+then tests what is left. It
 runs a predeploy pass over `/dev/mapper/bb-*`: every sector written through the
 map and read back through it. That proves the surviving surface is sound and
 that the map puts every byte back where it will be found. No drive setting is
@@ -878,6 +879,16 @@ found damage, then `y`. The work runs in a child process, because the map
 code exits on a refusal, and a refusal should cost that one attempt, not the
 summary of a run that took days.
 
+Hiding the damage on a device `--hide-bad` made -- the rescan of
+`/dev/mapper/bb-*` found more -- is a remap of the map already on the drive
+underneath, with the scan's list in the virtual device's own offsets
+(`remap --logical`). It used to be a `create` on the mapped device, which put
+a second map over the first: another pair of metadata extents and spares
+carved out of what was left, two tables to load in order at boot, and no way
+to say which layer a later remap belonged to. A dm device is recognised as
+ours by its `DMBB-` uuid in sysfs, and one whose drive cannot be read from
+there is refused rather than falling through to a `create`.
+
 The drive is divided into extents, 1 MiB by default:
 
 | extent | holds |
@@ -1314,7 +1325,15 @@ testable without ever killing anything.
 What is *not* tested: the format dashboard's feed. `format_child()` parses
 `sg_format`'s output, and `--format` refuses a file at the `is a file` gate, so
 that path only ever runs against a real SCSI drive. It is verified by
-inspection, like everything else behind `--format`.
+inspection, like everything else behind `--format`. `sg_format` is run on a
+pseudo-terminal rather than a pipe because it never flushes stdout: into a
+pipe its progress line sat in a 4 KB buffer for the better part of a format,
+and the dashboard showed nothing while `sg_requests --progress` on the same
+drive said 38% done. The watcher also asks the drive itself every 30 seconds
+with `sg_requests --progress`, so the figure comes from the drive even when
+`sg_format` says nothing. The pty was checked against a stand-in that prints the same line without
+flushing, and the parser against `sg_requests`' own line; neither has run
+against a drive that is actually formatting.
 
 On real hardware, on a SAS drive: the `sdparm` look-ahead path, and protection
 information being detected and reported as a coverage gap rather than as media
