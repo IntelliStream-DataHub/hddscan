@@ -347,8 +347,21 @@ it is not. The bisection switches to 8 MiB probes once the gap is narrower
 than a wide one, because a wide probe straddling the edge only says which
 side most of it is on. The first read of
 each probe is thrown away because it carries the seek. The dashboard's `SKIP`
-column shows how much has been condemned so far, because the weak count
-cannot: a skipped region was never read, so it has no sectors to count. 
+column shows how much has been condemned so far.
+
+A condemned region is **counted weak, every sector of it**. It once was not,
+on the grounds that a skipped region has no sectors to count, and a real
+16 TB drive showed what that looked like: over 2 TiB at its inner edge
+reading under 10 MB/s, chunks past 200 ms, every stretch of it condemned, and
+a WEAK count that never moved, because each 4 KiB inside came back in budget
+when read on its own. A region that reads that slowly as a whole is weak
+sectors at a larger scale, whatever its sectors do alone. The region counts
+only the blocks not already counted inside it (the weak, bad or corrupt
+sectors a drill-down or a probe found before it was condemned), so nothing is
+counted twice and a bad sector stays bad. The checkpoint keeps the drilled
+count, and the region's share is counted again from the skip list on resume.
+The report breaks it out on the line under `sectors weak`, and the JSON as
+`sectors_weak_in_slow_regions`. SKIP is still how much was never read.
 
 A probe tests what it reads the way the scan does. Each chunk over budget is
 drilled by the scan's own drill-down, slow sectors retried, under the same
@@ -451,6 +464,18 @@ is scanning — a budget that adapted to what it was reading would quietly raise
 itself over a bad region and normalise away the exact thing the scan exists to
 find. The gradient is physics, measured once, and smooth. And it never bends a
 threshold you gave by hand: `--chunk-slow-ms 25` means 25 ms everywhere.
+
+Measured once is not the same as trusted blindly, though. An anchor can land
+on slow media, and taken as it stands it raises the budget over that very
+damage, and over everything outward of it. A real 16 TB drive calibrated to
+"61.81 ms per chunk at the outer edge, 23.67 ms at the inner": its first
+anchor sat on a slow patch, and the outer 1.6 TiB got a budget of 185 ms.
+Physics says which reading is wrong, because an outer track is never slower
+than one inside it. So each anchor expects no more than the quickest anchor
+inward of it. Lowering an anchor only ever tightens the budget, which is the
+safe direction. The scan says so when an anchor came in a quarter or more over
+the anchor inside it. The innermost anchor has nothing further in to be checked
+against.
 
 The multiple is three by default (`--auto-factor`). A chunk that takes three
 times what a read at that position should cost has something inside it worth

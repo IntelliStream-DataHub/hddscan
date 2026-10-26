@@ -2696,12 +2696,14 @@ typedef struct {
  * scanned.  off and len are the same condemned stretch in bytes, for
  * everything downstream that knows nothing of steps, and unread is how much
  * of it was never read: the steps from k0, and for a chunk whose drill-down
- * was cut short, the rest of that chunk.
+ * was cut short, the rest of that chunk.  weak is how many blocks of it the
+ * weak count takes in (skip_recount()); it is derived, never stored.
  */
 typedef struct {
 	uint64_t s0, k0, s1;
 	uint64_t off, len;
 	uint64_t unread;
+	uint64_t weak;
 } skip_t;
 
 #define SKIP_WIN_MAX 1024
@@ -2865,6 +2867,7 @@ typedef struct {
 	int nskip, skipcap;
 	uint64_t skip_bytes;    /* condemned and never read */
 	uint64_t skip_cond;     /* condemned in all, read or not */
+	uint64_t skip_weak;     /* blocks of it counted weak: weak_total() */
 	uint64_t skip_probes;   /* reads spent finding the edges */
 
 	finding_t *find;
@@ -2960,6 +2963,20 @@ typedef struct {
 } ctx_t;
 
 static ctx_t *g_ctx;    /* for the signal handler / atexit cleanup */
+
+/*
+ * The weak count everything shows: the sectors drilled and found weak, and
+ * every block of a region --skip-slow condemned for reading too slowly as a
+ * whole.  A region at a few MB/s, every chunk of it far over budget, is weak
+ * sectors at a larger scale -- a real drive showed 2 TiB of it with a WEAK
+ * count that never moved, because each 4 KiB inside came back in budget when
+ * read on its own.  blocks_weak stays the drilled count alone: it is what
+ * the checkpoint keeps, and the regions are counted again from the skip list.
+ */
+static uint64_t weak_total(const ctx_t *c)
+{
+	return c->blocks_weak + c->skip_weak;
+}
 
 /* ------------------------------------------------------------------ *
  * kernel per-device timeout handling
@@ -4681,7 +4698,7 @@ static void progress(ctx_t *c, int final)
 		g_job.rate = rate;
 		g_job.eta = eta;
 		g_job.bad = c->blocks_bad + c->blocks_corrupt;
-		g_job.weak = c->blocks_weak;
+		g_job.weak = weak_total(c);
 		g_job.slow = c->chunks_slow;
 		g_job.chunks = c->chunks_read;
 		g_job.skipped = c->skip_bytes;
@@ -4726,7 +4743,7 @@ static void progress(ctx_t *c, int final)
 		c->dev->name, pct,
 		human_size((uint64_t)rate, b1, sizeof(b1)),
 		c->too_slow ? " TOO SLOW" : "",
-		c->blocks_bad, c->blocks_weak, lw,
+		c->blocks_bad, weak_total(c), lw,
 		human_time(el, b2, sizeof(b2)),
 		human_time(eta, b3, sizeof(b3)));
 	if (final)
@@ -4739,6 +4756,7 @@ static void progress(ctx_t *c, int final)
  * ------------------------------------------------------------------ */
 
 static skip_t *skip_add(ctx_t *c);
+static void skip_recount(ctx_t *c, skip_t *k);
 static void probed_add(ctx_t *c, uint64_t step);
 static void steps_extent(const ctx_t *c, uint64_t a, uint64_t b,
 			 uint64_t *off, uint64_t *len);
@@ -4972,6 +4990,9 @@ static int state_load(ctx_t *c)
 		}
 	}
 	fclose(f);
+	/* the findings come after the regions, so only now can they be counted */
+	for (i = 0; i < c->nskip; i++)
+		skip_recount(c, &c->skips[i]);
 	return 0;
 }
 
@@ -5582,6 +5603,30 @@ static skip_t *skip_add(ctx_t *c)
 	return &c->skips[c->nskip++];
 }
 
+/*
+ * How many blocks of the condemned stretch k the weak count takes in: all of
+ * it, less what is already counted inside it -- the weak, bad or corrupt
+ * sectors a drill-down or a probe found before it was condemned -- so no
+ * sector is counted twice and a bad one stays bad.  Called whenever k grows,
+ * and once for every region a checkpoint brings back.
+ */
+static void skip_recount(ctx_t *c, skip_t *k)
+{
+	uint64_t n = (k->len + c->block - 1) / c->block, had = 0;
+	int i;
+
+	for (i = 0; i < c->nfind; i++) {
+		const finding_t *f = &c->find[i];
+
+		if (f->status != ST_OK && f->offset >= k->off &&
+		    f->offset < k->off + k->len)
+			had++;
+	}
+	c->skip_weak -= k->weak;
+	k->weak = n > had ? n - had : 0;
+	c->skip_weak += k->weak;
+}
+
 static int skip_cut_due(const ctx_t *c, uint64_t io0)
 {
 	return c->skip_slow && !c->pass && g_io_us - io0 > SKIP_DRILL_CAP_US;
@@ -5621,6 +5666,7 @@ static int skip_cut(ctx_t *c, uint64_t off, size_t len, uint64_t from)
 	skip_band_add(c, from, unread);
 	c->skip_bytes += unread;
 	c->skip_cond += len;
+	skip_recount(c, k);
 	return 1;
 }
 
@@ -5906,6 +5952,7 @@ static uint64_t skip_ahead(ctx_t *c, void *buf, void *scratch)
 	k->unread += unread;
 	skip_band_add(c, off, unread);
 	c->skip_bytes += unread;
+	skip_recount(c, k);
 	memset(c->sw_over, 0, sizeof(c->sw_over));
 	msg(PROG ": %s: %s%s from %s was too slow to scan; skipped %s "
 	    "of it without reading%s (--skip-slow) and carried on %s\n",
@@ -6646,10 +6693,11 @@ static int verdict_of(ctx_t *c, const char **why)
 		char b1[32], b2[32];
 
 		snprintf(buf, sizeof(buf), "%d region%s of the surface (%s) %s "
-			 "too slow to scan; %s of %s was skipped without being "
-			 "read", c->nskip, c->nskip == 1 ? "" : "s",
+			 "too slow to scan, %" PRIu64 " weak sectors; %s of %s "
+			 "was skipped without being read", c->nskip,
+			 c->nskip == 1 ? "" : "s",
 			 human_size(c->skip_cond, b1, sizeof(b1)),
-			 c->nskip == 1 ? "was" : "were",
+			 c->nskip == 1 ? "was" : "were", c->skip_weak,
 			 human_size(c->skip_bytes, b2, sizeof(b2)),
 			 c->nskip == 1 ? "it" : "them");
 		*why = buf;
@@ -7105,8 +7153,11 @@ static void report(ctx_t *c)
 	out("\n");
 	out("    %ssectors weak              %s%12" PRIu64 "  (over budget, or "
 	    "read only on a retry)\n",
-	    c->blocks_weak ? c_yel() : "", c->blocks_weak ? c_off() : "",
-	    c->blocks_weak);
+	    weak_total(c) ? c_yel() : "", weak_total(c) ? c_off() : "",
+	    weak_total(c));
+	if (c->skip_weak)
+		out("      %-24s%12" PRIu64 "  (slow regions condemned whole "
+		    "by --skip-slow)\n", "of them in", c->skip_weak);
 	out("    %ssectors unreadable        %s%12" PRIu64 "  (every attempt failed)\n",
 	    c->blocks_bad ? c_red() : "", c->blocks_bad ? c_off() : "",
 	    c->blocks_bad);
@@ -7392,9 +7443,10 @@ no_modes:	;
 		    human_size(c->skip_bytes, b1, sizeof(b1)), c->nskip,
 		    c->nskip == 1 ? "" : "s");
 		out(" The scan found where each one starts and ends and condemned "
-		    "it whole;\n nothing above says anything about the sectors "
-		    "inside. --hide-bad cuts\n them out with the rest of the "
-		    "damage.\n");
+		    "it whole,\n so every sector in it is counted weak above: "
+		    "the region read too\n slowly as a whole, whether or not a "
+		    "sector in it was slow on its own.\n --hide-bad cuts them "
+		    "out with the rest of the damage.\n");
 	}
 	if (v == 2 && c->blocks_unrepaired)
 		out(" Do not trust this drive with data. Copy anything valuable off it now,\n"
@@ -7505,7 +7557,9 @@ static void write_json(ctx_t *c, const char *path)
 		fprintf(f, "    \"slow_bands\": %d,\n", sb.n);
 	}
 	fprintf(f, "    \"sectors_drilled\": %" PRIu64 ",\n", c->blocks_drilled);
-	fprintf(f, "    \"sectors_weak\": %" PRIu64 ",\n", c->blocks_weak);
+	fprintf(f, "    \"sectors_weak\": %" PRIu64 ",\n", weak_total(c));
+	fprintf(f, "    \"sectors_weak_in_slow_regions\": %" PRIu64 ",\n",
+		c->skip_weak);
 	fprintf(f, "    \"sectors_bad\": %" PRIu64 ",\n", c->blocks_bad);
 	fprintf(f, "    \"sectors_unrepaired\": %" PRIu64 ",\n", c->blocks_unrepaired);
 	fprintf(f, "    \"sectors_corrupt\": %" PRIu64 ",\n", c->blocks_corrupt);
@@ -7552,8 +7606,9 @@ static void write_json(ctx_t *c, const char *path)
 		const skip_t *k = &c->skips[i];
 
 		fprintf(f, "    {\"offset\": %" PRIu64 ", \"length\": %" PRIu64
-			", \"unread\": %" PRIu64 "}%s\n", k->off, k->len,
-			k->unread, i + 1 < c->nskip ? "," : "");
+			", \"unread\": %" PRIu64 ", \"weak\": %" PRIu64 "}%s\n",
+			k->off, k->len, k->unread, k->weak,
+			i + 1 < c->nskip ? "," : "");
 	}
 	fprintf(f, "  ],\n");
 	fprintf(f, "  \"findings\": [\n");
@@ -7780,7 +7835,8 @@ static void write_prometheus(ctx_t *c, const char *path)
 	{ "hddscan_sectors_bad", "Sectors unreadable on every attempt", "gauge",
 	  (double)c->blocks_bad },
 	{ "hddscan_sectors_weak", "Sectors over the latency budget or readable "
-	  "only after a retry", "gauge", (double)c->blocks_weak },
+	  "only after a retry, slow regions included", "gauge",
+	  (double)weak_total(c) },
 	{ "hddscan_writes_slow", "Chunk writes over the latency budget",
 	  "gauge", (double)c->writes_slow },
 	{ "hddscan_sectors_corrupt", "Sectors returning data that did not match",
@@ -8493,6 +8549,7 @@ static int scan_device(device_t *d, const opts_t *o, const char *json_path,
 	ctx_t c;
 	char b1[32], b2[32];
 	uint64_t median = 0;
+	uint64_t slow_off = 0, slow_was = 0, slow_now = 0;
 	calib_t cal;
 	const char *why;
 	int v;
@@ -8725,6 +8782,29 @@ static int scan_device(device_t *d, const opts_t *o, const char *json_path,
 			c.grad_off[k] = cal.anchor_off[k];
 			c.grad_us[k] = cal.anchor_us[k];
 		}
+		/*
+		 * An outer track holds more sectors per revolution than any
+		 * track inside it, so it is never the slower one.  An anchor
+		 * that read slower than one further in landed on the media,
+		 * not the geometry -- a real drive's first anchor read 2.6x
+		 * its last -- and taken as it stands it raises the budget over
+		 * exactly that damage, and everything outward of it
+		 * (invariant 1b).  So each anchor expects no more than the
+		 * quickest one inward of it: lowering only tightens.  The last
+		 * has nothing inward to be checked against.
+		 */
+		for (k = cal.nanchor - 2; k >= 0; k--) {
+			if (c.grad_us[k] <= c.grad_us[k + 1])
+				continue;
+			if (!slow_now || (double)cal.anchor_us[k] /
+			    (double)c.grad_us[k + 1] >
+			    (double)slow_was / (double)slow_now) {
+				slow_off = cal.anchor_off[k];
+				slow_was = cal.anchor_us[k];
+				slow_now = c.grad_us[k + 1];
+			}
+			c.grad_us[k] = c.grad_us[k + 1];
+		}
 		c.grad_n = cal.nanchor;
 		c.grad_mid = cal.seq_us;
 		c.grad_typ = median;
@@ -8749,6 +8829,15 @@ static int scan_device(device_t *d, const opts_t *o, const char *json_path,
 			    "same margin applies everywhere\n",
 			    (double)expected_at(&c, c.grad_off[0]) / 1000.0,
 			    (double)expected_at(&c, c.grad_off[c.grad_n - 1]) / 1000.0);
+		/* noise between two healthy anchors is not worth a word */
+		if (slow_now && slow_was >= slow_now + slow_now / 4)
+			out("  %scalibration at %s read %.2f ms, slower than the "
+			    "tracks\n  inside it (%.2f ms): that is the media, "
+			    "not the platter, so what\n  is expected there is "
+			    "taken from further in%s\n", c_yel(),
+			    human_size(slow_off, b1, sizeof(b1)),
+			    (double)slow_was / 1000.0, (double)slow_now / 1000.0,
+			    c_off());
 	} else {
 		/*
 		 * Calibration read nothing it could time -- on a PI-formatted
@@ -9463,9 +9552,9 @@ static int tui_count(uint64_t v, int width, const char *col, int striped)
 
 /*
  * SKIP: how much of the drive --skip-slow has condemned without reading it.
- * The weak count cannot say this -- a skipped region was never read, so it
- * has no sectors to count -- and a scan whose percentage jumps a gigabyte at
- * a time should say where that gigabyte went.  Short units, so the column
+ * The weak count takes a condemned region in whole (weak_total()), but cannot
+ * say how much of it was never read -- and a scan whose percentage jumps a
+ * gigabyte at a time should say where that gigabyte went.  Short units, so the column
  * stays as narrow as a count: 960M, 1.0G, 12T.  Yellow, because any skip
  * makes the verdict at least SUSPECT.
  */
