@@ -118,7 +118,9 @@ tracks of a healthy drive can take more than 50 ms.
 counts sectors that failed every attempt;
 .B WEAK
 counts sectors that were over the latency budget, or came back only on a
-retry. Both are counted in sectors of
+retry, and every sector of a region
+.B \-\-skip\-slow
+condemned for reading too slowly as a whole. Both are counted in sectors of
 .BR \-\-block
 bytes, and once either is not zero it is coloured, red and yellow. The end of
 scan report breaks the same sectors down by how many tries and how many errors
@@ -127,9 +129,8 @@ each one took.
 .B SKIP
 is how much of the drive
 .B \-\-skip\-slow
-has condemned without reading, in short units: 960M, 1.0G, 12T. A skipped
-region was never read, so it has no sectors to count and WEAK does not include
-it. Yellow once anything is skipped, since any skip makes the verdict at least
+has condemned without reading, in short units: 960M, 1.0G, 12T. WEAK already
+counts the region's sectors; SKIP says how much of it was never read. Yellow once anything is skipped, since any skip makes the verdict at least
 SUSPECT. How many chunk reads missed their budget is in the report and in
 .BR \-\-status\-json .
 .SS Thresholds

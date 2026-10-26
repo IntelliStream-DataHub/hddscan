@@ -119,7 +119,7 @@ instead of doing anything: an error, never data loss.</p></div>
 <div class="table-wrap"><table>
 	<thead><tr><th>Sector</th><th>Meaning</th></tr></thead>
 	<tbody>
-		<tr><td><b>weak</b></td><td>Over its latency budget, or readable only on a retry. The drive is still returning the data, by grinding for it.</td></tr>
+		<tr><td><b>weak</b></td><td>Over its latency budget, or readable only on a retry. The drive is still returning the data, by grinding for it. Every sector of a region <code>--skip-slow</code> condemned for reading too slowly as a whole counts as weak too.</td></tr>
 		<tr><td><b>unreadable</b></td><td>Every attempt failed.</td></tr>
 		<tr><td><b>corrupt</b></td><td>It read back, but not what was written: silent corruption, found by the write and check modes.</td></tr>
 	</tbody>

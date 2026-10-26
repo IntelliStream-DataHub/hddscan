@@ -315,6 +315,26 @@ assert_has "an explicit --chunk-slow-ms stays flat" \
 	"$(run --chunk-slow-ms 25 "$f")" "chunk 25.0 ms, sector 25.0 ms"
 assert_hasnt "an explicit --sector-slow-ms stays flat" \
 	"$(run --sector-slow-ms 30 "$f")" "following the drive's own gradient"
+# REGRESSION: an outer anchor that landed on slow media was taken as the
+# platter's geometry, so the budget there followed the damage up.  A real
+# 16 TB drive printed "61.81 ms per chunk at the outer edge, 23.67 ms at the
+# inner", and an image slow under its first anchor was called HEALTHY with
+# a 33 s budget over the slow stretch.  An outer track is never the slower
+# one, so the anchor expects what the tracks further in do, and the slow
+# chunks are over budget.  The floor is low enough for that to show.
+f=$TMP/anchor.bin; truncate -s 900M "$f"
+out=$(HDDSCAN_SLOW=100M:16M HDDSCAN_SLOW_MS=50 run --floor-ms 5 --chunk 1M "$f")
+assert_has "an anchor slower than the tracks inside it is called the media" \
+	"$out" "calibration at 100.00 MiB read"
+n=$(awk '/chunks over budget/{print $4}' <<< "$out")
+if [ -n "$n" ] && [ "$n" -ge 16 ]; then
+	ok "and the slow chunks under it are over budget, not inside it"
+else
+	bad "and the slow chunks under it are over budget, not inside it" \
+	    "chunks over budget ${n:-?}"
+fi
+assert_hasnt "so the drive is not called healthy" "$out" "VERDICT: HEALTHY"
+rm -f "$f"
 FLOOR="--floor-ms 1000"
 
 echo "== arguments that must be refused =="
@@ -575,6 +595,25 @@ assert_has "--status has a SKIP column" "$st" "SKIP"
 assert_has "and it shows how much was skipped" "$st" "1.0G"
 assert_has "--status-json counts chunks over budget" \
 	"$($HDDSCAN --status-json "$rid" 2>&1)" '"chunks_over_budget": '
+# A region condemned for reading too slowly as a whole is weak sectors at a
+# larger scale: a real drive showed 2 TiB of it at under 10 MB/s with a WEAK
+# count that never moved, because each 4 KiB inside read in budget alone.
+# Every block of the region counts, and the report, the JSON, the verdict
+# and the run's record all say the same number.
+read -r want got <<< "$(python3 - "$TMP/skip.json" <<'PY2'
+import json, sys
+d = json.load(open(sys.argv[1]))
+b = d["block_bytes"]
+print(sum((k["length"] + b - 1) // b for k in d["slow_regions"]),
+      d["counters"]["sectors_weak_in_slow_regions"])
+PY2
+)"
+assert_eq "every block of a condemned region is counted weak" "$got" "$want"
+w=$(awk '/sectors weak/{print $3}' <<< "$out")
+assert_eq "and the report's weak count includes them" "$w" "$want"
+assert_has "the verdict counts them too" "$out" ", $want weak sectors;"
+assert_has "the run's record carries the same weak count" \
+	"$($HDDSCAN --status-json "$rid" 2>/dev/null)" "\"weak\": $want"
 
 out=$(slowrun 1G:1G "$f")
 assert_hasnt "without --skip-slow nothing is skipped" "$out" "skipped"
@@ -673,6 +712,24 @@ PY
 assert_eq "a probe's weak sectors are counted, even inside what it condemns" \
 	"$deep" "1"
 assert_eq "and no sector is counted twice" "$nuniq" "$nfind"
+# a weak sector a probe found inside a region it then condemned is counted
+# once: the region takes in only the blocks not already counted in it
+read -r total want <<< "$(python3 - "$TMP/skipweak.json" <<'PY2'
+import json, sys
+d = json.load(open(sys.argv[1]))
+s = d["counters"]
+b = d["block_bytes"]
+found = [f["offset"] for f in d["findings"] if f["status"] != "ok"]
+reg = 0
+for k in d["slow_regions"]:
+    inside = sum(1 for x in found if k["offset"] <= x < k["offset"] + k["length"])
+    reg += (k["length"] + b - 1) // b - inside
+weak = sum(1 for f in d["findings"] if f["status"] == "weak")
+print(s["sectors_weak"], weak + reg)
+PY2
+)"
+assert_eq "a region does not count a sector a probe already counted" \
+	"$total" "$want"
 assert_hasnt "without --skip-slow the rate rule does nothing" \
 	"$(HDDSCAN_SLOW=1G:1G:4M:1M HDDSCAN_SLOW_MS=20000 run --chunk 1M \
 		--chunk-slow-ms 1000 --retries 1 --end 1100M "$f")" "skipped"
@@ -689,12 +746,11 @@ assert_has "a drill-down that costs too much is cut short" "$out" \
 read -r roff rend <<< "$(json_region "$TMP/skipcut.json")"
 assert_eq "and exactly that chunk is condemned" "$roff $rend" \
 	"8388608 9437184"
-w=$(awk '/sectors weak/{print $3}' <<< "$out")
-if [ -n "$w" ] && [ "$w" -ge 1 ] && [ "$w" -lt 32 ]; then
-	ok "so only the sectors drilled before the cut are counted"
-else
-	bad "so only the sectors drilled before the cut are counted" "weak ${w:-?}"
-fi
+# the sectors drilled before the cut are weak findings, and the rest of the
+# chunk is counted weak with the region: all 256, none of them twice -- the
+# same number drilling the whole chunk without --skip-slow arrives at below
+assert_eq "a condemned chunk counts every sector of it weak, once" \
+	"$(awk '/sectors weak/{print $3}' <<< "$out")" "256"
 assert_has "and the report says the rest of it was never read" "$out" \
 	"every sector was read or condemned"
 assert_has "without --skip-slow the whole chunk is drilled" \
@@ -709,6 +765,8 @@ out=$(HDDSCAN_SLOW=1G:1G HDDSCAN_SLOW_MS=5000 run --chunk 1M \
 	--chunk-slow-ms 1000 --skip-slow --state "$TMP/skip.ckpt" --resume "$f")
 assert_has "a resumed scan keeps the regions it skipped before" "$out" \
 	"Slow regions, condemned by --skip-slow"
+assert_has "and counts them weak again, from the checkpoint" "$out" \
+	"slow regions condemned whole"
 # and one resumed inside the region jumps it rather than reading it.  The
 # region still reads slow and --skip-slow is off, so every chunk of it read
 # would be one more over budget.  The only slow chunks it may read are the
