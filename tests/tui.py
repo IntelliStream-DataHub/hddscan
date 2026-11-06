@@ -116,7 +116,7 @@ class Screen:
 
 
 class Session:
-    def __init__(self, args, rows=ROWS, cols=COLS):
+    def __init__(self, args, rows=ROWS, cols=COLS, open=None):
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
             os.execv(HDDSCAN, [HDDSCAN] + args)
@@ -126,6 +126,18 @@ class Session:
         self.raw = bytearray()
         self.alive = True
         self.pump(0.6)
+        if open:
+            self.open_form(open)
+
+    def open_form(self, action="scan"):
+        """Take the form from the drive picker to one action's options:
+        enter on the drives that are already ticked, then the action's number.
+        The drives have to be picked before this is called."""
+        self.wait(lambda: self.on_screen("choose drives"), 6.0)
+        self.send(b"\n", 0.3)
+        self.wait(lambda: self.on_screen("choose an action"), 3.0)
+        self.send({"scan": b"1", "settings": b"2", "format": b"3"}[action], 0.3)
+        return self.wait(lambda: self.on_screen("(3 of 3)"), 3.0)
 
     def pump(self, seconds):
         end = time.time() + seconds
@@ -255,29 +267,147 @@ def main():
 
         s = Session([])
         check("a bare invocation on a terminal opens the picker",
-              s.wait(lambda: s.on_screen("configure a run")),
+              s.wait(lambda: s.on_screen("choose drives")),
               "\n".join(s.screen.lines()[:4]))
         check("the drive list is shown",
               s.wait(lambda: s.on_screen("Drives")))
         s.send(b"q"); s.close()
 
-        # REGRESSION: drives and settings used to be separate sections that
-        # Tab switched between; down had to cross the boundary by itself.
-        s = Session(["-i", a])
-        crossed = s.goto("Mode")
-        check("down arrow crosses from the drive list into the settings",
-              crossed, "never reached the Mode field with the down arrow")
+        print("== the form is three screens: drives, an action, its options ==")
+
+        name_a = os.path.basename(a)
+        s = Session(["-i", "--no-color", "--outdir", tmp, a])
+        s.wait(lambda: s.on_screen("choose drives"))
+        check("the picker comes first and shows none of the options",
+              not s.on_screen("Chunk size") and not s.on_screen("Sector size")
+              and not s.on_screen("Write cache"),
+              "\n".join(l for l in s.screen.lines() if l.strip()))
+        s.send(b"n", 0.3)
+        s.send(b"\n", 0.3)
+        check("enter with nothing picked stays on the picker and says why",
+              s.wait(lambda: s.on_screen("pick at least one drive"))
+              and s.on_screen("choose drives"),
+              "\n".join(l for l in s.screen.lines() if l.strip()))
+        s.ensure_selected(name_a)
+        s.send(b"\n", 0.3)
+        check("enter with a drive picked reaches the action menu",
+              s.wait(lambda: s.on_screen("choose an action")),
+              "\n".join(l for l in s.screen.lines() if l.strip()))
+        check("the menu offers a scan, settings and a low level format",
+              all(s.on_screen(t) for t in ("Scan", "Settings",
+                                           "Low level format")),
+              "\n".join(l for l in s.screen.lines() if l.strip()))
+        check("the menu names the drives that will be acted on",
+              s.on_screen("1 drive selected") and s.on_screen(name_a),
+              "\n".join(l for l in s.screen.lines() if l.strip()))
+        s.send(b"\x1b", 0.3)
+        check("esc on the menu goes back to the picker",
+              s.wait(lambda: s.on_screen("choose drives")))
+        s.send(b"\n", 0.3)
+        s.wait(lambda: s.on_screen("choose an action"))
+        s.send(b"\n", 0.3)
+        check("enter on the menu opens the highlighted action's options",
+              s.wait(lambda: s.on_screen("Scan (3 of 3)")
+                     and s.on_screen("Chunk size")),
+              "\n".join(l for l in s.screen.lines() if l.strip()))
+        check("a scan's options hold neither format nor drive-only settings",
+              not s.on_screen("Sector size") and not s.on_screen("Fast format"))
+        s.send(b"\x1b", 0.3)
+        check("esc on the options goes back to the menu",
+              s.wait(lambda: s.on_screen("choose an action")))
+        s.send(b"2", 0.3)
+        check("2 opens the settings, which hold only drive settings",
+              s.wait(lambda: s.on_screen("Settings (3 of 3)")
+                     and s.on_screen("Write cache"))
+              and not s.on_screen("Chunk size")
+              and not s.on_screen("Drive look-ahead")
+              and not s.on_screen("Sector size"),
+              "\n".join(l for l in s.screen.lines() if l.strip()))
+        s.send(b"\x1b", 0.3)
+        s.wait(lambda: s.on_screen("choose an action"))
+        s.send(b"3", 0.3)
+        check("3 opens the low level format, which holds only its own options",
+              s.wait(lambda: s.on_screen("Low level format (3 of 3)")
+                     and s.on_screen("Protection info"))
+              and not s.on_screen("Write cache")
+              and not s.on_screen("Chunk size"),
+              "\n".join(l for l in s.screen.lines() if l.strip()))
         s.send(b"q"); s.close()
 
-        s = Session(["-i", a])
-        s.send(TAB, 0.3)
-        check("tab still jumps to the settings for anyone with the habit",
-              any("Mode" in h or "Settings" in h for h in s.screen.highlighted()))
+        # the drive picker is the same one it always was
+        s = Session(["-i", "--no-color", "--outdir", tmp, a])
+        check("down and up move through the drive list",
+              s.goto(name_a))
         s.send(b"q"); s.close()
+
+        # REGRESSION in spirit: a two-key start must not survive a change of
+        # screen.  's' arms a write, escape cancels it, and a second 's' has
+        # to ask again rather than start anything.
+        s = Session(["-i", "--no-color", "--dry-run", "--outdir", tmp, a],
+                    open="scan")
+        s.send(b"s", 0.3)
+        check("a write arms a confirmation", s.wait(lambda: s.on_screen("press y")))
+        s.send(b"\x1b", 0.3)
+        check("a key other than y disarms it",
+              s.wait(lambda: not s.on_screen("press y")))
+        s.send(b"s", 0.3)
+        check("the next s asks again instead of starting",
+              s.wait(lambda: s.on_screen("press y")) and s.alive)
+        s.send(b"n", 0.2)
+        s.send(b"q"); s.close()
+
+        print("== the settings screen is its own copy of the drive settings ==")
+
+        # predeploy saves a configuration, and that belongs to a scan.  The
+        # settings screen applies only what is named (invariant 7b), so it
+        # must not open with the profile's defaults filled in.
+        s = Session(["-i", "--no-color", "--dry-run", "--outdir", tmp, a],
+                    open="scan")
+        check("the scan screen starts with the profile's saved settings",
+              s.wait(lambda: s.value_of("Recommended config") == "yes")
+              and s.value_of("Background scan") == "enable")
+        s.send(b"\x1b", 0.3)
+        s.send(b"2", 0.3)
+        s.wait(lambda: s.on_screen("Settings (3 of 3)"))
+        check("the settings screen starts with none of them",
+              s.wait(lambda: s.value_of("Recommended config") == "no")
+              and s.value_of("Background scan") == "keep"
+              and s.value_of("Write cache") == "keep"
+              and s.value_of("Save to drive") == "this run",
+              "config %r bms %r wc %r" % (s.value_of("Recommended config"),
+                                          s.value_of("Background scan"),
+                                          s.value_of("Write cache")))
+        s.send(b"s", 0.3)
+        check("starting with nothing to apply says so instead of leaving",
+              s.wait(lambda: s.on_screen("nothing to apply")) and s.alive,
+              "\n".join(l for l in s.screen.lines() if l.strip()))
+        check("a change on the settings screen is kept there",
+              s.set_choice("Write cache", "on"))
+        s.send(b"\x1b", 0.3)
+        s.send(b"1", 0.3)
+        s.wait(lambda: s.on_screen("Scan (3 of 3)"))
+        check("and the scan screen's own settings are as it left them",
+              s.wait(lambda: s.value_of("Write cache") == "off")
+              and s.value_of("Recommended config") == "yes",
+              "wc %r config %r" % (s.value_of("Write cache"),
+                                   s.value_of("Recommended config")))
+        s.send(b"\x1b", 0.3)
+        s.send(b"2", 0.3)
+        s.wait(lambda: s.on_screen("Settings (3 of 3)"))
+        check("and the settings come back as they were left",
+              s.wait(lambda: s.value_of("Write cache") == "on"),
+              "got %r" % s.value_of("Write cache"))
+        s.send(b"s", 0.5)
+        s.pump(2)
+        s.close()
+        check("applying a named setting needs no confirmation and does it",
+              "dry run, drive settings not applied" in s.text()
+              and "would turn the write cache on" in s.text(),
+              s.text()[-300:])
 
         print("== the form opens on a profile, and the profile sets the rest ==")
 
-        s = Session(["-i", "--no-color", "--outdir", tmp, a])
+        s = Session(["-i", "--no-color", "--outdir", tmp, a], open="scan")
         check("the form defaults to the predeploy profile",
               s.wait(lambda: s.value_of("Profile") == "predeploy"),
               "got %r" % s.value_of("Profile"))
@@ -335,36 +465,22 @@ def main():
               "got %r" % s.value_of("Skip slow regions"))
         s.send(b"q"); s.close()
 
-        print("== the form is grouped by what a setting changes ==")
+        print("== each screen holds the settings of what it does ==")
 
-        # Tall enough for every setting at once on any machine: the drive
-        # list above them holds the machine's own drives too, up to eight
-        # rows, and at forty rows a machine with four of them scrolled
-        # "Save to drive" out of sight.
+        # Tall enough for every setting at once on any machine.
         s = Session(["-i", "--no-color", "--profile", "inservice",
-                     "--outdir", tmp, a], rows=48, cols=110)
-        s.wait(lambda: s.on_screen("Protection info"))
+                     "--outdir", tmp, a], rows=48, cols=110, open="scan")
+        s.wait(lambda: s.on_screen("Save to drive"))
         lines = s.screen.lines()
         idx = lambda t: next((i for i, l in enumerate(lines) if t in l), -1)
-        check("the form has a section for how the scan runs",
+        check("the scan screen has a section for how the scan runs",
               idx("-- How to test --") >= 0)
-        check("the form has a separate section for drive settings",
+        check("the scan screen has a separate section for drive settings",
               idx("Drive settings (sdparm/hdparm") >= 0)
-        check("drive settings say they are put back afterwards",
+        check("drive settings on a scan say they are put back afterwards",
               s.on_screen("restored on exit"))
         check("test settings come before drive settings",
               -1 < idx("-- How to test --") < idx("Drive settings (sdparm"))
-        # REGRESSION: the format options were reported as missing twice --
-        # once when they sat three screens down, and again when they were
-        # hidden until Mode was set to format, because nobody looking for
-        # them knows they are behind a value of Mode.  They are a section of
-        # their own now, on the form from the start, and they do not scroll.
-        check("the form has a separate section for low level format",
-              idx("Low level format") >= 0 and idx("Sector size") >= 0,
-              "\n".join(lines))
-        check("the format section comes after the drive settings",
-              -1 < idx("Drive settings (sdparm") < idx("Low level format"),
-              "\n".join(lines))
         for t, want_test in (("Profile", True), ("Mode", True),
                              ("Chunk size", True), ("Scan order", True),
                              ("Retries per sector", True),
@@ -378,30 +494,61 @@ def main():
             check("%s is in the %s section" % (t, "test" if want_test else "drive"),
                   where >= 0 and in_test == want_test,
                   "row %d, boundary %d" % (where, idx("Drive settings (sdparm")))
+        check("the scan screen has no format options",
+              idx("Sector size") < 0 and idx("Low level format") < 0,
+              "\n".join(lines))
+        check("Mode offers the scans and not the other two actions",
+              s.set_choice("Mode", "hide bad")
+              and s.set_choice("Mode", "read")
+              and s.value_of("Mode") == "read")
+        s.send(RIGHT * 7, 0.3)
+        seen = set()
+        for _ in range(8):
+            # the form repaints from scratch, so a read can land between
+            # the clear and the Mode row; poll rather than take one look
+            s.wait(lambda: s.value_of("Mode", scroll=False) is not None, 2.0)
+            seen.add(s.value_of("Mode", scroll=False))
+            s.send(RIGHT, 0.2)
+        check("Mode never lands on format or settings",
+              seen and not seen & {"format", "settings"} and None not in seen,
+              seen)
+        s.send(b"q"); s.close()
+
+        # Settings is the same drive settings and nothing else; look-ahead
+        # is a property of a scan and does nothing when settings are applied.
+        s = Session(["-i", "--no-color", "--outdir", tmp, a], rows=48,
+                    cols=110, open="settings")
+        s.wait(lambda: s.on_screen("Save to drive"))
+        lines = s.screen.lines()
+        idx = lambda t: next((i for i, l in enumerate(lines) if t in l), -1)
+        check("the settings screen holds every drive setting that applies",
+              all(idx(t) >= 0 for t in ("Read cache", "Write cache",
+                                        "Auto-reallocate", "Recovery limit",
+                                        "Background scan",
+                                        "Scan interval", "Recommended config",
+                                        "Save to drive")),
+              "\n".join(lines))
+        check("it holds nothing that belongs to a scan",
+              all(idx(t) < 0 for t in ("Profile", "Mode", "Chunk size",
+                                       "Drive look-ahead", "Scan order")),
+              "\n".join(lines))
+        check("it does not claim anything is restored on exit",
+              not s.on_screen("restored on exit"))
         s.send(b"q"); s.close()
 
         print("== format options on the form ==")
 
         s = Session(["-i", "--no-color", "--profile", "inservice",
-                     "--outdir", tmp, a], rows=42, cols=112)
-        check("the format section is there before format is chosen",
+                     "--outdir", tmp, a], rows=42, cols=112, open="format")
+        check("the format screen holds the format options",
               s.wait(lambda: s.on_screen("Low level format")
-                     and s.on_screen("Protection info")),
+                     and s.on_screen("Protection info")
+                     and s.on_screen("Sector size")
+                     and s.on_screen("Fast format")),
               "\n".join(s.screen.lines()))
-        check("choosing format says the section is now in use",
-              s.set_choice("Mode", "format")
-              and s.wait(lambda: s.on_screen("Mode is format")),
+        check("the format screen says it erases the drive",
+              s.on_screen("ERASES the drive completely"),
               "\n".join(s.screen.lines()))
-        # choosing format used to move the cursor into the section, so the
-        # next right-arrow meant for Mode changed the sector size instead
-        check("choosing format leaves the cursor on Mode",
-              any("Mode" in h for h in s.screen.highlighted()),
-              s.screen.highlighted())
-        check("format options come after the drive settings",
-              next((i for i, l in enumerate(s.screen.lines())
-                    if "Drive settings (sdparm" in l), -1)
-              < next((i for i, l in enumerate(s.screen.lines())
-                      if "Low level format" in l), -1))
         check("sector size offers the drive's two real choices",
               s.set_choice("Sector size", "512")
               and s.set_choice("Sector size", "4096"),
@@ -422,59 +569,39 @@ def main():
               "got %r" % s.value_of("Fast format"))
         check("a fast format can be requested",
               s.set_choice("Fast format", "yes"))
-        check("leaving format keeps the section on the form",
-              s.set_choice("Mode", "read")
-              and s.wait(lambda: s.on_screen("used when Mode is set to format")
-                         and s.on_screen("Sector size")),
-              "\n".join(s.screen.lines()))
         s.send(b"q"); s.close()
 
-        # REGRESSION: the check above runs on 42 rows, which is why this
-        # shipped.  On an ordinary 24x80 terminal choosing format scrolled
-        # only as far as the section's first field, so the heading and
-        # "Sector size" sat on the last line and the protection setting --
-        # the one sg_format silently strips if nobody looks -- was below
-        # "more below".  The section was reported as missing.
-        #
-        # Mode is stepped with raw keys, watching the selection line's
-        # warning: set_choice() reads a value back by walking the cursor to
-        # it, which scrolls the list straight back up and hides exactly what
-        # this is checking for.
-        s = Session(["-i", "--no-color", "--profile", "inservice",
-                     "--outdir", tmp, a], rows=24, cols=80)
-        section = ("Low level format", "Sector size", "Protection info",
-                   "Fast format")
-        # the report that started this: a 24x80 form, nothing chosen yet
-        check("the whole format section is on a 24x80 form from the start",
-              s.wait(lambda: all(s.on_screen(t) for t in section)),
-              "\n".join(l for l in s.screen.lines() if l.strip()))
-        s.goto("Mode")
-        for _ in range(8):
-            if s.on_screen("ERASES the drive completely"):
-                break
-            s.send(RIGHT, 0.3)
-        check("choosing format on a 24x80 terminal shows the whole section",
-              s.wait(lambda: all(s.on_screen(t) for t in section)),
-              "\n".join(l for l in s.screen.lines() if l.strip()))
-        # a row that wraps is a row the form's budget did not count, and
-        # the terminal answers by scrolling the top of the form away
-        check("the form fits a 24x80 terminal with format chosen",
-              s.on_screen("configure a run") and s.on_screen("q quit"),
-              "\n".join(l for l in s.screen.lines() if l.strip()))
-        s.send(b"q"); s.close()
+        # REGRESSION: the format section once showed only its heading and its
+        # first field on an ordinary terminal, and was reported as missing.
+        # It is a screen of its own now, so it cannot be scrolled out of
+        # reach, but the whole of every screen must still fit 24x80 -- and a
+        # row that wraps is a row the form's budget did not count.
+        for action, shown in (("format", ("Low level format", "Sector size",
+                                          "Protection info", "Fast format")),
+                              ("settings", ("Read cache", "Save to drive")),
+                              ("scan", ("Profile", "Mode"))):
+            s = Session(["-i", "--no-color", "--profile", "inservice",
+                         "--outdir", tmp, a], rows=24, cols=80, open=action)
+            check("the %s screen shows its options on a 24x80 terminal" % action,
+                  s.wait(lambda: all(s.on_screen(t) for t in shown)),
+                  "\n".join(l for l in s.screen.lines() if l.strip()))
+            check("and its banner and key hints with them",
+                  s.on_screen("(3 of 3)") and s.on_screen("q quit"),
+                  "\n".join(l for l in s.screen.lines() if l.strip()))
+            s.send(b"q"); s.close()
 
         # the default profile writes AND saves settings, and its warnings
         # side by side once ran past eighty columns
         s = Session(["-i", "--no-color", "--dry-run", "--outdir", tmp, a],
-                    rows=24, cols=80)
+                    rows=24, cols=80, open="scan")
         check("predeploy's footer fits a 24x80 terminal",
               s.wait(lambda: s.on_screen("saves drive settings"))
-              and s.on_screen("configure a run") and s.on_screen("q quit"),
+              and s.on_screen("Scan (3 of 3)") and s.on_screen("q quit"),
               "\n".join(l for l in s.screen.lines() if l.strip()))
         s.send(b"s", 0.2)
         check("predeploy's confirmation fits a 24x80 terminal",
               s.wait(lambda: s.on_screen("and save settings, other keys"))
-              and s.on_screen("configure a run"),
+              and s.on_screen("Scan (3 of 3)"),
               "\n".join(l for l in s.screen.lines() if l.strip()))
         s.send(b"n", 0.2)
         s.send(b"q"); s.close()
@@ -520,7 +647,8 @@ def main():
 
         print("== the form fits a small terminal ==")
 
-        s = Session(["-i", "--no-color", "--outdir", tmp, a], rows=24, cols=112)
+        s = Session(["-i", "--no-color", "--outdir", tmp, a], rows=24, cols=112,
+                    open="scan")
         check("the profile description is visible on a 24 row terminal",
               s.wait(lambda: s.on_screen("no data on it yet")),
               "\n".join(s.screen.lines()))
@@ -540,7 +668,7 @@ def main():
         os.system("%s --no-color --mode write --confirm %s %s >/dev/null 2>&1"
                   % (HDDSCAN, a, a))
         s = Session(["-i", "--no-color", "--profile", "inservice",
-                     "--outdir", tmp, a])
+                     "--outdir", tmp, a], open="scan")
         s.goto("Mode")
         check("the form can be set to 'check'",
               s.set_choice("Mode", "check"),
@@ -557,14 +685,18 @@ def main():
 
         print("== destructive choices take two keys ==")
 
-        for mode, presses, word, warn in (
-                ("write", 3, "write", "writes to the drive"),
-                ("repair", 4, "repair", "overwrites everything"),
-                ("format", 5, "format", "ERASES the drive completely"),
-                ("hide bad", 7, "hide bad", "hides the last scan's damage")):
-            s = Session(["-i", "--no-color", "--dry-run", "--outdir", tmp, a])
-            s.set_choice("Mode", word)
-            shown = s.value_of("Mode")
+        for mode, action, word, warn in (
+                ("write", "scan", "write", "writes to the drive"),
+                ("repair", "scan", "repair", "overwrites everything"),
+                ("format", "format", "format", "ERASES the drive completely"),
+                ("hide bad", "scan", "hide bad", "hides the last scan's damage")):
+            s = Session(["-i", "--no-color", "--dry-run", "--outdir", tmp, a],
+                        open=action)
+            if action == "scan":
+                s.set_choice("Mode", word)
+                shown = s.value_of("Mode")
+            else:
+                shown = word        # a screen of its own, not a Mode value
             # the warning is the only thing standing between a mistyped
             # keystroke and a wiped drive, so assert the exact wording
             check("choosing %s warns what it will do" % mode,
@@ -584,8 +716,8 @@ def main():
             s.send(b"q"); s.close()
 
         # REGRESSION: --format had no way in from the form at all.
-        s = Session(["-i", "--no-color", "--dry-run", "--outdir", tmp, a])
-        s.set_choice("Mode", "format")
+        s = Session(["-i", "--no-color", "--dry-run", "--outdir", tmp, a],
+                    open="format")
         s.send(b"s", 0.45); s.send(b"y", 0.8)
         s.pump(3)
         s.close()
@@ -602,7 +734,7 @@ def main():
         print("== settings on the form reach the scan ==")
 
         s = Session(["-i", "--no-color", "--profile", "inservice",
-                     "--outdir", tmp, a])
+                     "--outdir", tmp, a], open="scan")
         if s.goto("Chunk size"):
             for _ in range(3):
                 s.send(RIGHT, 0.16)          # 128K -> 1M
@@ -626,7 +758,7 @@ def main():
         # REGRESSION: a numeric field whose floor is the "keep" sentinel used
         # to display -1 and step to -1+step instead of to a round number.
         s = Session(["-i", "--no-color", "--profile", "inservice",
-                     "--outdir", tmp, a])
+                     "--outdir", tmp, a], open="scan")
         if s.goto("Recovery limit"):
             check("a numeric field at its floor reads 'keep', not -1",
                   s.wait(lambda: s.value_of("Recovery limit") == "keep"),
@@ -654,6 +786,7 @@ def main():
         sel = [s.ensure_selected(os.path.basename(big_a)),
                s.ensure_selected(os.path.basename(big_b))]
         check("both image drives can be selected on the form", all(sel), sel)
+        s.open_form("scan")
         s.send(b"s", 0.6)
 
         # The dashboard no longer lingers once the last drive finishes -- the
@@ -743,8 +876,10 @@ def main():
                   for l in s.screen.lines()) >= 2,  # one row per image
               "\n".join(l for l in s.screen.lines() if l.strip())[:400])
         s.send(b"n", 0.6)
+        # the picker comes first again, with the drives still ticked
         check("'n' on the summary returns to the form for another test",
-              s.wait(lambda: s.on_screen("Profile"), 6.0),
+              s.wait(lambda: s.on_screen("choose drives"), 6.0)
+              and s.open_form("scan") and s.on_screen("Profile"),
               "\n".join(l for l in s.screen.lines() if l.strip())[:400])
         s.send(b"q", 0.5)
         s.pump(1.5)
@@ -769,7 +904,7 @@ def main():
             f.seek(8 << 20)
             f.write(b"BADBADBAD")
         s = Session(["-i", "--no-color", "--profile", "inservice", "--mode",
-                     "check", "--outdir", tmp, hurt])
+                     "check", "--outdir", tmp, hurt], open="scan")
         s.send(b"s", 0.6)
         s.wait(lambda: s.on_screen("finished"), 12.0)
         check("a summary with damage on it offers h",
@@ -820,7 +955,7 @@ def main():
 
         clean = patterned("clean.bin")
         s = Session(["-i", "--no-color", "--profile", "inservice", "--mode",
-                     "check", "--outdir", tmp, clean])
+                     "check", "--outdir", tmp, clean], open="scan")
         s.send(b"s", 0.6)
         s.wait(lambda: s.on_screen("n new test"), 12.0)
         check("a clean drive's summary offers nothing to hide",
@@ -838,7 +973,7 @@ def main():
         # write pass -- the exact failure is a read that modifies the image.
         import hashlib
         lk = img(tmp, "leak.bin", 8)
-        s = Session(["-i", "--no-color", "--outdir", tmp, lk])
+        s = Session(["-i", "--no-color", "--outdir", tmp, lk], open="scan")
         s.wait(lambda: s.on_screen("Profile"), 6.0)
         s.set_choice("Mode", "repair")
         s.send(b"s", 0.5)
@@ -848,7 +983,7 @@ def main():
               s.wait(lambda: s.on_screen("finished"), 40.0))
         h1 = hashlib.md5(open(lk, "rb").read()).hexdigest()
         s.send(b"n", 0.6)
-        s.wait(lambda: s.on_screen("Profile"), 6.0)
+        s.open_form("scan")
         s.set_choice("Mode", "read")
         s.send(b"s", 0.5)
         check("a read pass after a repair run needs no write confirmation",
@@ -873,7 +1008,7 @@ def main():
                          real])
             s.ensure_selected(name)
             check("format is selected for %s" % real,
-                  s.set_choice("Mode", "format"))
+                  s.open_form("format"))
             s.send(b"s", 0.5); s.send(b"y", 1.0)
             s.pump(4); s.close()
             t = s.text()
@@ -889,7 +1024,7 @@ def main():
             s = Session(["-i", "--no-color", "--dry-run", "--outdir", tmp,
                          real], rows=42, cols=112)
             s.ensure_selected(name)
-            s.set_choice("Mode", "format")
+            s.open_form("format")
             s.wait(lambda: s.on_screen("Sector size"))
             s.set_choice("Sector size", "4096")
             s.set_choice("Protection info", "none")
@@ -941,6 +1076,7 @@ def main():
                     rows=26, cols=104)
         for path in big:
             s.ensure_selected(os.path.basename(path))
+        s.open_form("scan")
         s.send(b"s", 0.8)
         check("the dashboard says the run does not need this terminal",
               s.wait(lambda: s.on_screen("the run keeps going either way")),
@@ -985,7 +1121,7 @@ def main():
         # run carries on, which is how a second batch of drives gets started.
         s.send(b"n", 1.0)
         check("a run can be left for the form to start another",
-              s.wait(lambda: s.on_screen("configure a run")),
+              s.wait(lambda: s.on_screen("choose drives")),
               "\n".join(l for l in s.screen.lines() if l.strip())[:400])
         # REGRESSION: both of these were asserted the moment the form's
         # heading appeared, before the rows under it had been drawn, and
@@ -1385,7 +1521,7 @@ def main():
 
         # REGRESSION: with a run in progress and a tool missing, the form
         # printed two banner lines and budgeted for one, and the terminal
-        # scrolled "configure a run" off the top.  Only at heights where
+        # scrolled the title off the top.  Only at heights where
         # both settings groups are in view does the budget have no slack to
         # hide that in -- 29 to 37 rows when this was found -- so every
         # height from 24 up is tried rather than one that happens to pass.
@@ -1398,6 +1534,8 @@ def main():
         os.environ["HDDSCAN_TOOLS"] = "none"
         os.environ["HDDSCAN_NO_ENUMERATE"] = "1"
         lost, wrapped = [], []
+        titles = (("choose drives", None), ("choose an action", b"\n"),
+                  ("(3 of 3)", b"1"))
         try:
             for h in range(24, 41):
                 s = Session(["-i", "--no-color", "--outdir", tmp, a],
@@ -1405,17 +1543,23 @@ def main():
                 s.wait(lambda: s.on_screen("runs on this machine"), 5.0)
                 s.send(b"n", 0.3)
                 s.wait(lambda: s.on_screen("q quit"), 5.0)
-                s.pump(0.4)
-                lines = s.screen.lines()
-                if not (lines[0].strip().endswith("configure a run") and
-                        "already in progress" in lines[1]):
-                    lost.append(h)
-                miss = next((k for k, l in enumerate(lines)
-                             if "missing:" in l), -1)
-                if not (0 < miss and len(lines[miss]) < 80 and
-                        "hdparm" in lines[miss] and
-                        not lines[miss + 1].strip()):
-                    wrapped.append(h)
+                # the drive on the command line is already ticked, so enter
+                # leaves the picker, and 1 takes the scan
+                for want, key in titles:
+                    if key:
+                        s.send(key, 0.3)
+                    s.wait(lambda: s.on_screen(want), 3.0)
+                    s.pump(0.4)
+                    lines = s.screen.lines()
+                    if not (want in lines[0] and
+                            "already in progress" in lines[1]):
+                        lost.append((h, want))
+                    miss = next((k for k, l in enumerate(lines)
+                                 if "missing:" in l), -1)
+                    if not (0 < miss and len(lines[miss]) < 80 and
+                            "hdparm" in lines[miss] and
+                            not lines[miss + 1].strip()):
+                        wrapped.append((h, want))
                 s.send(b"q", 0.2)
                 s.close()
         finally:
@@ -1431,7 +1575,7 @@ def main():
         s = Session(["--no-tui"])
         s.pump(0.8)
         check("--no-tui does not open the picker even on a terminal",
-              not any("configure a run" in l for l in s.screen.lines()))
+              not any("choose drives" in l for l in s.screen.lines()))
         s.close()
 
     finally:

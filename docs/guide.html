@@ -138,18 +138,40 @@ opens the form. If work is already running on the machine, it shows that
 first.</p>
 
 <h3 id="form">The form</h3>
+<p>The form is three screens in a row. <kbd>Enter</kbd> moves on and
+<kbd>Esc</kbd> steps back, with everything you set kept as you left it:</p>
+<ol>
+	<li><b>The drives.</b> Which drives to act on.</li>
+	<li><b>The action.</b> Scan, change drive settings, or low level format.
+	Press <kbd>1</kbd>, <kbd>2</kbd> or <kbd>3</kbd>, or move and press
+	<kbd>Enter</kbd>.</li>
+	<li><b>That action's options.</b> Only the fields that mean something for
+	the action are shown.</li>
+</ol>
+
 <figure class="shot">
-	<img src="img/tui-form.svg" width="668" height="851" loading="lazy"
-	     alt="The configure form: four drives selected at the top, then the settings in three groups (how to test, drive settings, low level format), and a line saying the selected mode writes to the drive and saves drive settings.">
+	<img src="img/tui-drives.svg" width="635" height="257" loading="lazy"
+	     alt="The first screen: four drives, all selected, and the keys that pick them.">
 </figure>
-<figcaption>The form, with four drives selected and the predeploy profile.
-The drives here are image files, which is why they read <i>regular file
-(image)</i>.</figcaption>
-<p>Drives come first. <kbd>Space</kbd> picks one, <kbd>a</kbd> picks every
-free hard disk, and <kbd>g</kbd> picks every free disk on the same controller
-as the one under the cursor, which is one keystroke per shelf. Drives that are
-mounted, in use or already in a run are shown but cannot be picked.</p>
-<p>The settings below are in three groups, because they answer different
+<figcaption>Screen 1, the drives. The drives here are image files, which is
+why they read <i>regular file (image)</i>.</figcaption>
+<p><kbd>Space</kbd> picks one, <kbd>a</kbd> picks every free hard disk, and
+<kbd>g</kbd> picks every free disk on the same controller as the one under
+the cursor, which is one keystroke per shelf. Drives that are mounted, in use
+or already in a run are shown but cannot be picked.</p>
+
+<figure class="shot">
+	<img src="img/tui-action.svg" width="685" height="275" loading="lazy"
+	     alt="The second screen: Scan, Settings and Low level format, each with a line saying what it does.">
+</figure>
+<figcaption>Screen 2, the action.</figcaption>
+
+<figure class="shot">
+	<img src="img/tui-form.svg" width="854" height="545" loading="lazy"
+	     alt="The third screen for a scan: the settings in two groups (how to test and drive settings), the predeploy profile's description, and a line saying the selected mode writes to the drive and saves drive settings.">
+</figure>
+<figcaption>Screen 3, a scan's options, with the predeploy profile.</figcaption>
+<p>A scan's options are in two groups, because they answer different
 questions:</p>
 <ul>
 	<li><b>How to test</b>: profile, mode, chunk size, scan order. Changing the
@@ -158,8 +180,11 @@ questions:</p>
 	recovery limit, background scan. These change the drive itself and are put
 	back when the run ends, unless <b>Save to drive</b> or the profile says
 	otherwise.</li>
-	<li><b>Low level format</b>: used only when Mode is <i>format</i>.</li>
 </ul>
+<p><b>Settings</b> is the drive settings alone, applied without a scan, and
+<b>Low level format</b> is sector size, protection information and fast
+format. Neither shows the scan's fields, and the settings a profile saves are
+not carried into Settings.</p>
 <p>Press <kbd>s</kbd> to start. Anything that writes, saves a setting or erases
 the drive asks again, and needs <kbd>y</kbd>.</p>
 
@@ -427,7 +452,7 @@ whichever order they appear in.  The drive
 settings a profile carries apply only in its own
 mode: <a href="#opt-mode"><code>--mode</code></a> read on predeploy saves nothing</pre></dd>
 <dt id="opt-tui"><code>-i, --tui</code></dt>
-<dd>interactive terminal UI: pick drives and settings on one form, then watch a live dashboard while it runs. A summary holds the verdicts when the scan finishes; from there n starts another test and q quits. Implied when nothing to scan was named and stdin and stdout are a terminal; pass it to get the form even with devices named, which arrive pre-selected</dd>
+<dd>interactive terminal UI: pick drives, choose scan, settings or format, set that action&#x27;s options, then watch a live dashboard while it runs. A summary holds the verdicts when the scan finishes; from there n starts another test and q quits. Implied when nothing to scan was named and stdin and stdout are a terminal; pass it to get the form even with devices named, which arrive pre-selected</dd>
 <dt id="opt-no-tui"><code>--no-tui</code></dt>
 <dd>never open the UI, whatever the terminal looks like</dd>
 <dt id="opt-check-deps"><code>--check-deps</code></dt>
