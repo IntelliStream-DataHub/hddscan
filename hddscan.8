@@ -29,8 +29,9 @@ It is aimed at the failure that SMART misses entirely: a drive that still
 reads every sector successfully, but takes tens of milliseconds of internal
 recovery to do it. Those sectors are the ones about to become unreadable.
 .PP
-Run on a terminal with no device named, hddscan opens an interactive form to
-pick drives and settings, then shows a live dashboard while it runs. When
+Run on a terminal with no device named, hddscan opens an interactive form in three
+screens: the drives, what to do with them (scan, settings or low level format),
+and that action's own options. It then shows a live dashboard while it runs. When
 every drive finishes, a summary holds the verdicts on screen until a key is
 pressed:
 .B n

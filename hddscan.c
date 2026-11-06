@@ -8160,8 +8160,9 @@ static void usage(void)
 "                         whichever order they appear in.  The drive\n"
 "                         settings a profile carries apply only in its own\n"
 "                         mode: --mode read on predeploy saves nothing\n"
-"  -i, --tui              interactive terminal UI: pick drives and settings on\n"
-"                         one form, then watch a live dashboard while it runs.\n"
+"  -i, --tui              interactive terminal UI: pick drives, choose scan,\n"
+"                         settings or format, set that action's options, then\n"
+"                         watch a live dashboard while it runs.\n"
 "                         A summary holds the verdicts when the scan finishes;\n"
 "                         from there n starts another test and q quits.\n"
 "                         Implied when nothing to scan was named and stdin and\n"
@@ -10781,23 +10782,35 @@ static const char *derive_path(const char *base, const char *dev, int many,
 	return buf;
 }
 
-/* ---- configuration screen ---- */
+/* ---- configuration screens ---- */
+
+/*
+ * The form is three screens in a row, and Esc steps back through them: the
+ * drives, then what to do with them, then that action's own options.  One
+ * screen holding everything meant the format options sat three screens
+ * below the scan's and "Mode" had to carry the choice of doing something
+ * else entirely.
+ */
+enum { V_DRIVES, V_ACTION, V_FORM };
+enum { A_SCAN, A_SETTINGS, A_FORMAT, A_COUNT };
 
 typedef struct {
 	/*
 	 * A heading printed above this field, or NULL.  Headings are not
 	 * selectable, so the cursor still maps one-to-one onto fields and
-	 * nothing else in here has to know they exist.
+	 * nothing else in here has to know they exist.  The settings screen
+	 * words its own, since nothing there is put back afterwards.
 	 */
 	const char *head;
+	const char *head_set;
 	/*
-	 * Fields that only matter for one mode are hidden the rest of the
-	 * time.  Nineteen settings on a short terminal means six visible at
-	 * once and the format options three screens down, where they may as
-	 * well not exist.  The cursor walks the visible list, so nothing else
-	 * has to know they come and go.
+	 * The screens this field is on, one bit per action.  A field is
+	 * drawn only where it means something: look-ahead is a property of
+	 * a scan and does nothing when settings are applied on their own.
+	 * The cursor walks the visible list, so nothing else has to know
+	 * the others exist.
 	 */
-	int only_format;
+	unsigned screens;
 	const char *label;
 	const char *help;
 	int kind;               /* 0 = pick from choices, 1 = numeric */
@@ -10807,6 +10820,24 @@ typedef struct {
 	long long lo, hi, step;
 	int *sel;
 } field_t;
+
+#define ON(a) (1u << (a))
+
+/*
+ * The drive settings, kept apart from the rest because the scan and the
+ * settings screen each own a copy.  A profile fills the scan's with what it
+ * saves (predeploy turns on the background scan), and applying settings by
+ * themselves must not inherit that: the profile's settings apply only while
+ * its own mode stands.  Moving between the two screens swaps the copies, so
+ * what was typed on one is still there when it is visited again.
+ */
+typedef struct {
+	int rc, wc, awre, bms, fix, persist;
+	int rc_init, wc_init, wc_named;
+	long long rtl, bmsi;
+} dset_t;
+
+static int settings_wanted(const opts_t *o);
 
 static void tui_devices(device_t *devs, int ndev, int *pick, int cur, int top,
 			int rows)
@@ -10872,15 +10903,29 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 	 * into mode_v and never a scan_mode_t.  Casting the index straight to
 	 * the enum gave "check" a verify pass and "verify" a destructive
 	 * write -- silent, and on the wrong side of every safety check.
+	 *
+	 * mode_sel is that index space, widened: the entries past the scan
+	 * modes are the things that are not one (repair, format, settings,
+	 * hide bad).  The Mode field on the scan screen has its own index,
+	 * smsel, into smap, and format and settings are no longer modes at
+	 * all but screens of their own; mode_sel is worked out from the two
+	 * each time round.
 	 */
 	static const scan_mode_t mode_v[] = { MODE_READ, MODE_CHECK,
 					      MODE_VERIFY, MODE_WRITE };
 	static const char *mode_c[] = { "read", "check", "verify", "write",
 					"repair", "format", "settings",
 					"hide bad" };
+	static const char *act_name[] = { "Scan", "Settings",
+					  "Low level format" };
+	static const char *act_what[] = {
+		"find slow and failing sectors; read-only or writing",
+		"change drive cache, error recovery, background scan",
+		"erase the drive; change sector size or protection" };
 	int mode_sel = 0, order_sel = (int)o->order;
-	int la_sel = o->lookahead == 0 ? 0 : 1, bms_sel = o->bms ? 1 : 0;
-	int wc_sel = o->write_cache < 0 ? 0 : o->write_cache + 1;
+	int smap[6], smsel = 0;
+	int la_sel = o->lookahead == 0 ? 0 : 1;
+	dset_t ds, held;
 	/*
 	 * Chunk size on the form, because it is the biggest lever on how long
 	 * a scan takes -- and the default stays at 128 KiB, because it is also
@@ -10903,86 +10948,126 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 	static const int fbs_v[] = { 0, 512, 4096 };
 	static const int fpi_v[] = { -1, 0, 1, 2 };
 	int fbs_sel = 0, fpi_sel = 0, ffast_sel = 0;
-	int persist_sel = o->persist ? 1 : 0, fix_sel = o->fix_config ? 1 : 0;
 	int skip_sel = o->skip_slow ? 1 : 0;
-	int awre_sel = o->awre < 0 ? 0 : o->awre + 1;
-	int rc_sel = o->read_cache < 0 ? 0 : o->read_cache + 1;
-	long long rtl = o->recovery_ms;
 	int la_init = la_sel;   /* to tell "chose off" from "left at off" */
-	int rc_init = rc_sel, wc_init = wc_sel, wc_named = o->write_cache_set;
-	long long bmsi = o->bms_interval;
 	int in_was = -1;        /* Mode was the profile's own last time round */
 	long long retries = o->retries, segment_mb = (long long)(o->segment >> 20);
 	long long parallel = o->max_parallel, sample = (long long)o->sample;
-	int cur = 0, sec = 0, arm = 0, i, rows, cols, dtop = 0;
-	int needfmt = -1;       /* a picked drive only a format can take */
-	int ftop = 0, fshow = 0, dshow = 0, depline = 0, nscroll = 0;
+	int view = V_DRIVES, act = A_SCAN, acur = 0;
+	int dcur = 0, dtop = 0, fcur = 0, ftop = 0;
+	int arm = 0, i, rows, cols, depline = 0;
+	char msg[96] = "";
 	int nlive = store_live_count();
 	field_t f[] = {
 	/*
-	 * Two groups, because they answer different questions.  Everything
-	 * above the second heading decides how this run behaves; everything
-	 * below it changes the drive itself, through sdparm or hdparm, and is
-	 * put back afterwards unless "Save to drive" says otherwise.
+	 * Two groups on the scan screen, because they answer different
+	 * questions.  Everything above the second heading decides how this run
+	 * behaves; everything below it changes the drive itself, through
+	 * sdparm or hdparm, and is put back afterwards unless "Save to drive"
+	 * says otherwise.  The settings screen is the second group alone.
 	 */
-	{ "How to test", 0, "Profile",
+	{ "How to test", NULL, ON(A_SCAN), "Profile",
 	  "what you are about to do with the drive; sets the rest",
 	  0, 5, { "predeploy", "inservice", "survey", "decay", "repair" },
 	  NULL, 0, 0, 0, &prof_sel },
-	{ NULL, 0, "Mode", "read is safe; write and repair destroy data; format erases it",
-	  0, 8, { "read", "check", "verify", "write", "repair", "format",
-		  "settings", "hide bad" },
-	  NULL, 0, 0, 0, &mode_sel },
-	{ NULL, 0, "Chunk size", "bigger is much faster but raises the bar a sector must clear",
+	{ NULL, NULL, ON(A_SCAN), "Mode",
+	  "read is safe; write and repair destroy data",
+	  0, 6, { "read", "check", "verify", "write", "repair", "hide bad" },
+	  NULL, 0, 0, 0, &smsel },
+	{ NULL, NULL, ON(A_SCAN), "Chunk size",
+	  "bigger is much faster but raises the bar a sector must clear",
 	  0, 5, { "128K", "256K", "512K", "1M", "4M" },
 	  NULL, 0, 0, 0, &chunk_sel },
-	{ NULL, 0, "Scan order", "sequential is fastest; random defeats drive prefetch",
+	{ NULL, NULL, ON(A_SCAN), "Scan order",
+	  "sequential is fastest; random defeats drive prefetch",
 	  0, 3, { "sequential", "reverse", "random" }, NULL, 0, 0, 0, &order_sel },
-	{ NULL, 0, "Skip slow regions", "jump regions too slow to scan; they are condemned",
+	{ NULL, NULL, ON(A_SCAN), "Skip slow regions",
+	  "jump regions too slow to scan; they are condemned",
 	  0, 2, { "no", "yes" }, NULL, 0, 0, 0, &skip_sel },
-	{ NULL, 0, "Retries per sector", "re-reads before judging a suspect sector",
+	{ NULL, NULL, ON(A_SCAN), "Retries per sector",
+	  "re-reads before judging a suspect sector",
 	  1, 0, { 0 }, &retries, 0, 1000, 5, NULL },
-	{ NULL, 0, "Shuffle segment (MiB)", "must exceed the drive cache; random order only",
+	{ NULL, NULL, ON(A_SCAN), "Shuffle segment (MiB)",
+	  "must exceed the drive cache; random order only",
 	  1, 0, { 0 }, &segment_mb, 0, 1024 * 64, 256, NULL },
-	{ NULL, 0, "Max parallel drives", "0 means all at once",
+	{ NULL, NULL, ON(A_SCAN), "Max parallel drives", "0 means all at once",
 	  1, 0, { 0 }, &parallel, 0, 512, 1, NULL },
-	{ NULL, 0, "Sample 1 chunk in N", "1 tests everything; higher is a quick survey",
+	{ NULL, NULL, ON(A_SCAN), "Sample 1 chunk in N",
+	  "1 tests everything; higher is a quick survey",
 	  1, 0, { 0 }, &sample, 0, 4096, 8, NULL },
 
-	{ "Drive settings (sdparm/hdparm, restored on exit)", 0, "Drive look-ahead",
+	{ "Drive settings (sdparm/hdparm, restored on exit)", NULL,
+	  ON(A_SCAN), "Drive look-ahead",
 	  "off stops the drive masking a weak sector",
 	  0, 2, { "off", "keep" }, NULL, 0, 0, 0, &la_sel },
-	{ NULL, 0, "Read cache", "off stops the drive answering any read from DRAM",
-	  0, 3, { "keep", "off", "on" }, NULL, 0, 0, 0, &rc_sel },
-	{ NULL, 0, "Write cache", "off times the platter instead of the drive's DRAM",
-	  0, 3, { "keep", "off", "on" }, NULL, 0, 0, 0, &wc_sel },
-	{ NULL, 0, "Auto-reallocate", "lets the drive retire sectors it struggles with",
-	  0, 3, { "keep", "off", "on" }, NULL, 0, 0, 0, &awre_sel },
-	{ NULL, 0, "Recovery limit (ms)", "how long the drive fights one sector; 0 is forever",
-	  1, 0, { 0 }, &rtl, -1, 65535, 500, NULL },
-	{ NULL, 0, "Background scan", "SAS: drive sweeps its own media when idle; stays on",
-	  0, 2, { "keep", "enable" }, NULL, 0, 0, 0, &bms_sel },
-	{ NULL, 0, "Scan interval (hours)", "how often it sweeps, saved; 168 is weekly, 0 keeps",
-	  1, 0, { 0 }, &bmsi, 0, 65535, 24, NULL },
-	{ NULL, 0, "Recommended config", "auto-reallocate on, read cache on; saved",
-	  0, 2, { "no", "yes" }, NULL, 0, 0, 0, &fix_sel },
-	{ NULL, 0, "Save to drive", "permanently keeps the settings above after the scan",
-	  0, 2, { "this run", "permanently" }, NULL, 0, 0, 0, &persist_sel },
+	{ NULL, "Drive settings (sdparm/hdparm; this run only unless saved)",
+	  ON(A_SCAN) | ON(A_SETTINGS), "Read cache",
+	  "off stops the drive answering any read from DRAM",
+	  0, 3, { "keep", "off", "on" }, NULL, 0, 0, 0, &ds.rc },
+	{ NULL, NULL, ON(A_SCAN) | ON(A_SETTINGS), "Write cache",
+	  "off times the platter instead of the drive's DRAM",
+	  0, 3, { "keep", "off", "on" }, NULL, 0, 0, 0, &ds.wc },
+	{ NULL, NULL, ON(A_SCAN) | ON(A_SETTINGS), "Auto-reallocate",
+	  "lets the drive retire sectors it struggles with",
+	  0, 3, { "keep", "off", "on" }, NULL, 0, 0, 0, &ds.awre },
+	{ NULL, NULL, ON(A_SCAN) | ON(A_SETTINGS), "Recovery limit (ms)",
+	  "how long the drive fights one sector; 0 is forever",
+	  1, 0, { 0 }, &ds.rtl, -1, 65535, 500, NULL },
+	{ NULL, NULL, ON(A_SCAN) | ON(A_SETTINGS), "Background scan",
+	  "SAS: drive sweeps its own media when idle; stays on",
+	  0, 2, { "keep", "enable" }, NULL, 0, 0, 0, &ds.bms },
+	{ NULL, NULL, ON(A_SCAN) | ON(A_SETTINGS), "Scan interval (hours)",
+	  "how often it sweeps, saved; 168 is weekly, 0 keeps",
+	  1, 0, { 0 }, &ds.bmsi, 0, 65535, 24, NULL },
+	{ NULL, NULL, ON(A_SCAN) | ON(A_SETTINGS), "Recommended config",
+	  "auto-reallocate on, read cache on; saved",
+	  0, 2, { "no", "yes" }, NULL, 0, 0, 0, &ds.fix },
+	{ NULL, NULL, ON(A_SCAN) | ON(A_SETTINGS), "Save to drive",
+	  "permanently keeps the settings above after the scan",
+	  0, 2, { "this run", "permanently" }, NULL, 0, 0, 0, &ds.persist },
 
-	{ NULL, 1, "Sector size",
+	{ "Low level format (erases the whole drive)", NULL, ON(A_FORMAT),
+	  "Sector size",
 	  "4096 is not offered by every drive; it refuses without erasing",
 	  0, 3, { "keep", "512", "4096" }, NULL, 0, 0, 0, &fbs_sel },
-	{ NULL, 1, "Protection info",
+	{ NULL, NULL, ON(A_FORMAT), "Protection info",
 	  "keep preserves what the drive has; sg_format would strip it",
 	  0, 4, { "keep", "none", "type 1", "type 2" },
 	  NULL, 0, 0, 0, &fpi_sel },
-	{ NULL, 1, "Fast format",
+	{ NULL, NULL, ON(A_FORMAT), "Fast format",
 	  "skip visiting every block; hours become minutes when allowed",
 	  0, 2, { "no", "yes" }, NULL, 0, 0, 0, &ffast_sel },
 	};
 	int vis[32], nvis = 0;
 	int nf = (int)(sizeof(f) / sizeof(f[0]));
 	int nmode = (int)(sizeof(mode_v) / sizeof(mode_v[0]));
+	int mi;
+
+	smap[0] = 0;
+	smap[1] = 1;
+	smap[2] = 2;
+	smap[3] = 3;
+	smap[4] = nmode;        /* repair */
+	smap[5] = nmode + 3;    /* hide bad */
+
+	ds.rc = o->read_cache < 0 ? 0 : o->read_cache + 1;
+	ds.wc = o->write_cache < 0 ? 0 : o->write_cache + 1;
+	ds.awre = o->awre < 0 ? 0 : o->awre + 1;
+	ds.bms = o->bms ? 1 : 0;
+	ds.fix = o->fix_config ? 1 : 0;
+	ds.persist = o->persist ? 1 : 0;
+	ds.rtl = o->recovery_ms;
+	ds.bmsi = o->bms_interval;
+	ds.wc_init = ds.wc;
+	ds.wc_named = o->write_cache_set;
+	ds.rc_init = ds.rc;
+	/* the other screen's copy starts without anything a profile saves:
+	 * on the settings screen only what was named is applied (invariant
+	 * 7b), and what a command line named is in ds either way */
+	held = ds;
+	held.rc = held.wc = held.fix = held.bms = 0;
+	held.bmsi = 0;
+	held.rc_init = held.wc_init = held.wc_named = 0;
 
 	for (i = 0; i < nmode; i++)
 		if (mode_v[i] == o->mode)
@@ -11002,69 +11087,47 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 	ffast_sel = o->fmt_fast ? 1 : 0;
 	prof_was = prof_sel;
 	if (o->repair)
-		mode_sel = nmode;       /* the entries past the scan modes */
-	if (o->format)
-		mode_sel = nmode + 1;
-	if (o->apply_only)
-		mode_sel = nmode + 2;
+		mode_sel = nmode;
 	if (o->hide_bad)
 		mode_sel = nmode + 3;
+	for (i = 0; i < 6; i++)
+		if (smap[i] == mode_sel)
+			smsel = i;
+	/* what was asked for on the command line is where the menu rests */
+	if (o->format)
+		act = A_FORMAT;
+	else if (o->apply_only)
+		act = A_SETTINGS;
+	acur = act;
+	for (i = 0; i < ndev; i++)
+		if (pick[i]) {
+			dcur = i;
+			break;
+		}
 
-	/*
-	 * Drives and settings are one cursor space: index < ndev is a drive,
-	 * the rest are fields.  Up and down walk straight across the boundary
-	 * so nothing has to be switched into before it can be reached.
-	 */
 	for (;;) {
-		int k, nsel = 0, dcur, fcur;
+		int k, nsel = 0, saves, nfd = -1, fshow = 0, dshow = 0, nheads;
+		char names[256];
 
 		/*
-		 * Low level format is a section of its own, always on the form,
-		 * and it does not scroll.  It used to appear only once Mode was
-		 * set to format -- the settings above it are long enough that a
-		 * short terminal put it screens away -- and hiding it made it
-		 * look removed: someone looking for the format settings does
-		 * not know they are behind a value of Mode.  So the scan and
-		 * drive settings scroll in whatever room is left, and the
-		 * format fields, which are the last entries in f[], are drawn
-		 * underneath in rows of their own.
-		 *
-		 * The cursor no longer jumps into the section when format is
-		 * chosen, either.  With the section in plain view the jump
-		 * earned nothing, and it cost something: the next right-arrow
-		 * on Mode changed the sector size instead.
+		 * The profile is the question a person can answer;
+		 * everything below it is the consequence.  Moving it
+		 * resets those, and they stay overridable afterwards.
 		 */
-		nvis = nscroll = 0;
-		for (i = 0; i < nf; i++) {
-			vis[nvis++] = i;
-			if (!f[i].only_format)
-				nscroll = nvis;
-		}
-		if (cur > ndev + nvis - 1)
-			cur = ndev + nvis - 1;
-		if (cur < 0)
-			cur = 0;
-
-		/* 0 the drives, 1 the settings, 2 the format section */
-		sec = cur < ndev ? 0 : cur - ndev < nscroll ? 1 : 2;
-		dcur = sec == 0 ? cur : -1;
-		fcur = sec == 0 ? -1 : cur - ndev;
 		if (prof_sel != prof_was) {
-			/*
-			 * The profile is the question a person can answer;
-			 * everything below it is the consequence.  Moving it
-			 * resets those, and they stay overridable afterwards.
-			 */
 			const profile_t *p = &g_profiles[prof_sel];
 
 			prof_was = prof_sel;
 			in_was = 0;     /* take this profile's drive settings */
-			mode_sel = 0;
+			mi = 0;
 			for (i = 0; i < nmode; i++)
 				if (mode_v[i] == p->mode)
-					mode_sel = i;
+					mi = i;
 			if (p->force_remap)
-				mode_sel = nmode;       /* the repair entry */
+				mi = nmode;     /* the repair entry */
+			for (i = 0; i < 6; i++)
+				if (smap[i] == mi)
+					smsel = i;
 			sample = p->sample ? (long long)p->sample : 0;
 			skip_sel = p->skip_slow;
 			/* reset, not just set: leaving survey has to put the
@@ -11076,7 +11139,9 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 				if (chunk_v[i] == p->chunk)
 					chunk_sel = i;
 		}
-		{
+		mode_sel = act == A_FORMAT ? nmode + 1 :
+			   act == A_SETTINGS ? nmode + 2 : smap[smsel];
+		if (act == A_SCAN) {
 			/*
 			 * The drive settings follow the profile only while
 			 * Mode is the profile's own, exactly as on the command
@@ -11090,21 +11155,41 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 				 mode_sel == nmode && p->mode == MODE_WRITE;
 
 			if (in_was >= 0 && in != in_was) {
-				wc_sel = in && p->write_cache >= 0 ?
-					 p->write_cache + 1 : 0;
-				fix_sel = in ? p->fix_config : 0;
-				bms_sel = in ? p->bms : 0;
-				bmsi = in && p->bms ? p->bms_interval : 0;
-				wc_init = wc_sel;
-				wc_named = 0;
+				ds.wc = in && p->write_cache >= 0 ?
+					p->write_cache + 1 : 0;
+				ds.fix = in ? p->fix_config : 0;
+				ds.bms = in ? p->bms : 0;
+				ds.bmsi = in && p->bms ? p->bms_interval : 0;
+				ds.wc_init = ds.wc;
+				ds.wc_named = 0;
 			}
 			in_was = in;
 		}
+
+		nvis = 0;
+		for (i = 0; i < nf; i++)
+			if (f[i].screens & ON(act))
+				vis[nvis++] = i;
+		if (fcur > nvis - 1)
+			fcur = nvis - 1;
+		if (fcur < 0)
+			fcur = 0;
+		for (i = 0; i < ndev; i++)
+			if (pick[i]) {
+				nsel++;
+				if (devs[i].no_capacity && nfd < 0)
+					nfd = i;
+			}
+		saves = act != A_FORMAT && (ds.bms || ds.persist || ds.fix);
+
 		tui_size(&rows, &cols);
 		tui_clear();
 		g_dash = 0;     /* the form scrolls; messages can go inline */
 		nlive = store_live_count();
-		printf("\033[1m hddscan " VERSION " \033[0m  configure a run\n");
+		printf("\033[1m hddscan " VERSION " \033[0m  %s (%d of 3)\n",
+		       view == V_DRIVES ? "choose drives" :
+		       view == V_ACTION ? "choose an action" : act_name[act],
+		       view + 1);
 		depline = 0;
 		if (nlive) {
 			/*
@@ -11141,157 +11226,186 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 				       hint : "");
 			}
 		}
-		/*
-		 * Everything that is not a scrolling row: the banner, the
-		 * optional missing-tools and runs lines, a blank, the Drives
-		 * heading, a blank, the Settings heading, the two group
-		 * headings inside it, a blank, the profile line, the selection
-		 * line, a blank, the key hints and the newline after them --
-		 * and the format section's blank, heading and fields.  The
-		 * drive list and the settings share what is left, and both
-		 * scroll.
-		 *
-		 * The drive list takes up to eight rows, but not past the
-		 * bottom of the terminal: a few drives and a missing tool on
-		 * a 24-row terminal once left the settings less than the two
-		 * rows they are drawn in however short it is, and the form
-		 * ran off the top.  So the list gives back only what the
-		 * settings' two need, keeping two of its own.
-		 */
-		{
-			int room = rows - 13 - depline - (nvis - nscroll + 2);
-			int smin = nscroll < 2 ? nscroll : 2;
-			int dmin = ndev < 2 ? ndev : 2;
-
-			dshow = ndev < 8 ? ndev : 8;
-			if (dshow > room - smin)
-				dshow = room - smin;
-			if (dshow < dmin)
-				dshow = dmin;
-			fshow = room - dshow;
-			if (fshow < 2)
-				fshow = 2;
-			if (fshow > nscroll)
-				fshow = nscroll;
-		}
 		printf("\n");
 
-		printf(" %sDrives%s   (space one, a all free HDDs, g this "
-		       "controller, n none)",
-		       sec == 0 ? "\033[7m" : "", sec == 0 ? "\033[0m" : "");
-		/* a list cut short says so, or the drives past it are simply
-		 * not there as far as anyone looking can tell */
-		if (dshow < ndev)
-			printf("  %d of %d", dshow, ndev);
-		printf("\n");
-		if (dcur >= 0) {
+		if (view == V_DRIVES) {
+			/*
+			 * The banner, the optional lines above, a blank, the
+			 * heading, the list, a blank, the count, a message and
+			 * the key hints, with the last column of rows left
+			 * free: a footer on the bottom row makes the newline
+			 * after it scroll the whole form up one.  The list
+			 * takes all that is left, and scrolls if the shelf is
+			 * longer.
+			 */
+			dshow = rows - 8 - depline;
+			if (dshow > ndev)
+				dshow = ndev;
+			if (dshow < 1)
+				dshow = 1;
+			printf(" Drives   (space one, a all free HDDs, g this "
+			       "controller, n none)");
+			/* a list cut short says so, or the drives past it are
+			 * simply not there as far as anyone can tell */
+			if (dshow < ndev)
+				printf("  %d of %d", dshow, ndev);
+			printf("\n");
 			if (dcur >= dtop + dshow)
 				dtop = dcur - dshow + 1;
 			if (dcur < dtop)
 				dtop = dcur;
-		}
-		if (dtop > ndev - dshow)
-			dtop = ndev - dshow;
-		if (dtop < 0)
-			dtop = 0;
-		tui_devices(devs, ndev, pick, dcur, dtop, dshow);
-		for (i = 0; i < ndev; i++)
-			if (pick[i])
-				nsel++;
+			if (dtop > ndev - dshow)
+				dtop = ndev - dshow;
+			if (dtop < 0)
+				dtop = 0;
+			tui_devices(devs, ndev, pick, dcur, dtop, dshow);
+			printf("\n  %d drive%s selected\n", nsel,
+			       nsel == 1 ? "" : "s");
+			if (msg[0])
+				printf("  %s%s%s", c_yel(), msg, c_off());
+			printf("\n  up/down move  space picks  enter next  "
+			       "r runs  q quit\n");
+		} else if (view == V_ACTION) {
+			int w = cols - 20;
 
-		{
-			/*
-			 * The settings scroll inside what the budget above left
-			 * them.  Without one the form simply ran off the bottom
-			 * of anything shorter than about thirty rows, taking the
-			 * profile description and the start/quit hint with it.
-			 */
-			if (fcur >= 0 && fcur < nscroll) {
-				if (fcur >= ftop + fshow)
-					ftop = fcur - fshow + 1;
-				if (fcur < ftop)
-					ftop = fcur;
+			names[0] = 0;
+			for (i = 0; i < ndev; i++) {
+				size_t l = strlen(names);
+
+				if (pick[i] && l + 16 < sizeof(names))
+					snprintf(names + l, sizeof(names) - l,
+						 "%s%s", l ? " " : "",
+						 disp_name(&devs[i]));
 			}
-			if (ftop > nscroll - fshow)
-				ftop = nscroll - fshow;
+			printf(" %d drive%s selected: %.*s\n\n", nsel,
+			       nsel == 1 ? "" : "s", w > 0 ? w : 0, names);
+			for (i = 0; i < A_COUNT; i++)
+				printf("  %s %d  %-18s%s  %.*s\n",
+				       i == acur ? "\033[7m" : "", i + 1,
+				       act_name[i], i == acur ? "\033[0m" : "",
+				       cols > 27 ? cols - 27 : 0, act_what[i]);
+			printf("\n");
+			if (nfd >= 0)
+				printf("  %s%s needs a low level format first; "
+				       "only Settings and Low level format can "
+				       "take it%s\n", c_red(),
+				       disp_name(&devs[nfd]), c_off());
+			else if (acur == A_FORMAT)
+				printf("  %sthis ERASES every selected drive "
+				       "completely%s\n", c_red(), c_off());
+			else if (acur == A_SETTINGS)
+				printf("  %sapplies the settings and stops, no "
+				       "scan%s\n", c_yel(), c_off());
+			else
+				printf("  the profile on the next screen decides "
+				       "whether it writes\n");
+			printf("\n");
+			if (msg[0])
+				printf("  %s%s%s", c_yel(), msg, c_off());
+			printf("\n  up/down move  enter opens  1-3 opens  esc "
+			       "back  r runs  q quit\n");
+		} else {
+			/*
+			 * Everything that is not a scrolling row: the banner,
+			 * the optional lines, a blank, the blank under the
+			 * fields, the profile line on the scan screen, the
+			 * count, a blank and the key hints -- and one row for
+			 * each heading, which the window may or may not
+			 * include.
+			 */
+			nheads = 0;
+			for (i = 0; i < nvis; i++)
+				if (act == A_SETTINGS ? f[vis[i]].head_set :
+				    f[vis[i]].head)
+					nheads++;
+			fshow = rows - 7 - depline - (act == A_SCAN) - nheads;
+			if (fshow < 2)
+				fshow = 2;
+			if (fshow > nvis)
+				fshow = nvis;
+			if (fcur >= ftop + fshow)
+				ftop = fcur - fshow + 1;
+			if (fcur < ftop)
+				ftop = fcur;
+			if (ftop > nvis - fshow)
+				ftop = nvis - fshow;
 			if (ftop < 0)
 				ftop = 0;
-		}
-		printf("\n %sSettings%s   (left/right changes a value%s)\n",
-		       sec == 1 ? "\033[7m" : "", sec == 1 ? "\033[0m" : "",
-		       fshow < nscroll ? ", more below" : "");
-		for (i = ftop; i < nscroll && i < ftop + fshow; i++) {
-			field_t *fp = &f[vis[i]];
+			for (i = ftop; i < nvis && i < ftop + fshow; i++) {
+				field_t *fp = &f[vis[i]];
+				const char *hd = act == A_SETTINGS ?
+						 fp->head_set : fp->head;
 
-			if (fp->head)
-				printf("  %s-- %s --%s\n", c_grn(), fp->head,
-				       c_off());
-			form_row(fp, fcur == i, cols);
-		}
-
-		/* the format section: its own heading, never scrolled away */
-		printf("\n %sLow level format%s   %s%s%s\n",
-		       sec == 2 ? "\033[7m" : "", sec == 2 ? "\033[0m" : "",
-		       mode_sel == nmode + 1 ? c_red() : "",
-		       mode_sel == nmode + 1 ?
-		       "Mode is format: the selected drives are erased" :
-		       "used when Mode is set to format",
-		       mode_sel == nmode + 1 ? c_off() : "");
-		for (i = nscroll; i < nvis; i++)
-			form_row(&f[vis[i]], fcur == i, cols);
-
-		printf("\n  %s%s%s: %s\n", c_grn(), g_profiles[prof_sel].name,
-		       c_off(), g_profiles[prof_sel].what);
-		printf("  %d drive%s selected", nsel, nsel == 1 ? "" : "s");
-		if (mode_sel == nmode)
-			printf("   %soverwrites everything and heals%s",
-			       c_red(), c_off());
-		else if (mode_sel == nmode + 1)
-			printf("   %sthis ERASES the drive completely%s",
-			       c_red(), c_off());
-		else if (mode_sel == nmode + 2)
-			printf("   %sapplies the settings and stops, no scan%s",
-			       c_yel(), c_off());
-		else if (mode_sel == nmode + 3)
-			printf("   %shides the last scan's damage; data lost%s",
-			       c_red(), c_off());
-		else if (mode_sel >= 2)
-			printf("   %sthis mode writes to the drive%s",
-			       c_red(), c_off());
-		/*
-		 * One short phrase for everything that outlives the run, the
-		 * background scan included: predeploy turns on all of it by
-		 * default, and three warnings side by side ran past eighty
-		 * columns, where a wrapped row scrolls the top of the form away.
-		 */
-		if (bms_sel || persist_sel || fix_sel)
-			printf("   %ssaves drive settings%s", c_yel(), c_off());
-		if (needfmt >= 0)
-			printf("\n\n  %s%s needs a low level format first: set "
-			       "Mode to format%s\n", c_red(),
-			       disp_name(&devs[needfmt]), c_off());
-		else if (arm)
-			printf("\n\n  %spress y to start a %s on %d drive%s%s, "
-			       "other keys cancel%s\n",
-			       c_red(), mode_c[mode_sel], nsel,
-			       nsel == 1 ? "" : "s",
-			       (bms_sel || persist_sel || fix_sel) ?
-			       " and save settings" : "", c_off());
-		else
+				if (hd)
+					printf("  %s-- %s --%s\n", c_grn(), hd,
+					       c_off());
+				form_row(fp, fcur == i, cols);
+			}
+			if (ftop > 0 && ftop + fshow < nvis)
+				printf("   more above and more below\n");
+			else if (ftop + fshow < nvis)
+				printf("   more below\n");
+			else if (ftop > 0)
+				printf("   more above\n");
+			else
+				printf("\n");
+			if (act == A_SCAN)
+				printf("  %s%s%s: %s\n", c_grn(),
+				       g_profiles[prof_sel].name, c_off(),
+				       g_profiles[prof_sel].what);
+			printf("  %d drive%s selected", nsel, nsel == 1 ? "" : "s");
+			if (act == A_FORMAT)
+				printf("   %sthis ERASES the drive completely%s",
+				       c_red(), c_off());
+			else if (act == A_SETTINGS)
+				printf("   %sapplies the settings and stops, no "
+				       "scan%s", c_yel(), c_off());
+			else if (mode_sel == nmode)
+				printf("   %soverwrites everything and heals%s",
+				       c_red(), c_off());
+			else if (mode_sel == nmode + 3)
+				printf("   %shides the last scan's damage; data "
+				       "lost%s", c_red(), c_off());
+			else if (mode_sel >= 2)
+				printf("   %sthis mode writes to the drive%s",
+				       c_red(), c_off());
 			/*
-			 * Eighty columns, always.  A footer that wraps makes the
-			 * form a line taller than the row budget above assumed,
-			 * and the terminal scrolls the top of it away.  The
-			 * banner already says when runs are in progress.
+			 * One short phrase for everything that outlives the
+			 * run, the background scan included: predeploy turns
+			 * on all of it by default, and three warnings side by
+			 * side ran past eighty columns, where a wrapped row
+			 * scrolls the top of the form away.
 			 */
-			printf("\n\n  up/down move  space picks  left/right "
-			       "sets  s start  r runs  q quit\n");
+			if (saves)
+				printf("   %ssaves drive settings%s", c_yel(),
+				       c_off());
+			if (arm)
+				printf("\n\n  %spress y to start a %s on %d "
+				       "drive%s%s, other keys cancel%s\n",
+				       c_red(), mode_c[mode_sel], nsel,
+				       nsel == 1 ? "" : "s",
+				       saves ? " and save settings" : "",
+				       c_off());
+			else {
+				printf("\n");
+				if (msg[0])
+					printf("  %s%s%s", c_yel(), msg, c_off());
+				/*
+				 * Eighty columns, always.  A footer that wraps
+				 * makes the form a line taller than the row
+				 * budget above assumed, and the terminal
+				 * scrolls the top of it away.
+				 */
+				printf("\n  up/down move  left/right sets  "
+				       "s start  esc back  r runs  q quit\n");
+			}
+		}
 		fflush(stdout);
 
 		k = tui_key(200);
 		if (k < 0)
 			continue;
-		needfmt = -1;
+		msg[0] = 0;
 		if (arm) {
 			/* the second key of a two-key start; anything that is
 			 * not a yes puts the form back the way it was */
@@ -11311,66 +11425,113 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 			 */
 			return 2;
 		}
-		if (k == '\t') {
-			/* up and down already cross the boundary; tab is kept
-			 * because the section headings invite it */
-			cur = sec == 0 ? ndev : sec == 1 ? ndev + nscroll : 0;
+		if (k == 27 || (k == 'b' && view != V_DRIVES) ||
+		    (k == K_LEFT && view == V_ACTION)) {
+			if (view != V_DRIVES)
+				view--;
 			continue;
 		}
+
+		if (view == V_DRIVES) {
+#define USABLE(x) (!devs[x].unsafe && devs[x].rotational && \
+		   !devs[x].no_capacity && \
+		   (devs[x].is_file || transport_is_local(devs[x].transport)))
+			if (k == K_UP && dcur > 0)
+				dcur--;
+			else if (k == K_DOWN && dcur < ndev - 1)
+				dcur++;
+			else if (k == K_PGUP)
+				dcur = dcur > dshow ? dcur - dshow : 0;
+			else if (k == K_PGDN)
+				dcur = dcur + dshow < ndev ? dcur + dshow :
+				       ndev - 1;
+			else if (k == K_HOME)
+				dcur = 0;
+			else if (k == K_END)
+				dcur = ndev - 1;
+			else if (k == ' ')
+				pick[dcur] = !pick[dcur];
+			else if (k == 'a') {
+				for (i = 0; i < ndev; i++)
+					pick[i] = USABLE(i);
+			} else if (k == 'n') {
+				for (i = 0; i < ndev; i++)
+					pick[i] = 0;
+			} else if (k == 'g') {
+				/* every free HDD on the same controller as the
+				 * one under the cursor: one keystroke per shelf
+				 * rather than one per drive */
+				const char *g = devs[dcur].group;
+
+				for (i = 0; i < ndev; i++)
+					if (!strcmp(devs[i].group, g) && USABLE(i))
+						pick[i] = 1;
+			} else if (k == '\n' || k == '\r') {
+				if (!nsel)
+					snprintf(msg, sizeof(msg), "pick at "
+						 "least one drive first "
+						 "(space)");
+				else
+					view = V_ACTION;
+			}
+			continue;
+		}
+		if (view == V_ACTION) {
+			if (k == K_UP && acur > 0)
+				acur--;
+			else if (k == K_DOWN && acur < A_COUNT - 1)
+				acur++;
+			else if (k >= '1' && k < '1' + A_COUNT)
+				acur = k - '1';
+			if (k == '\n' || k == '\r' || k == K_RIGHT ||
+			    (k >= '1' && k < '1' + A_COUNT)) {
+				/*
+				 * A drive with no capacity has nothing to
+				 * scan; only a format (or settings, which are
+				 * mode pages) can take it.  Say so here
+				 * rather than after the form is gone.
+				 */
+				if (acur == A_SCAN && nfd >= 0) {
+					snprintf(msg, sizeof(msg), "choose "
+						 "Settings or Low level "
+						 "format for it");
+					continue;
+				}
+				/* the drive settings each screen owns follow
+				 * it in and out */
+				if ((act == A_SCAN) != (acur == A_SCAN)) {
+					dset_t t = ds;
+
+					ds = held;
+					held = t;
+				}
+				act = acur;
+				view = V_FORM;
+				fcur = ftop = 0;
+			}
+			continue;
+		}
+
+		/* the form of one action */
 		if (k == K_UP) {
-			if (cur > 0)
-				cur--;
+			if (fcur > 0)
+				fcur--;
 			continue;
 		}
 		if (k == K_DOWN) {
-			if (cur < ndev + nvis - 1)
-				cur++;
-			continue;
-		}
-#define USABLE(x) (!devs[x].unsafe && devs[x].rotational && \
-		   (!devs[x].no_capacity || mode_sel == nmode + 1) && \
-		   (devs[x].is_file || transport_is_local(devs[x].transport)))
-		if (k == 'a') {
-			for (i = 0; i < ndev; i++)
-				pick[i] = USABLE(i);
-			continue;
-		}
-		if (k == 'n') {
-			for (i = 0; i < ndev; i++)
-				pick[i] = 0;
-			continue;
-		}
-		if (k == 'g' && dcur >= 0) {
-			/* every free HDD on the same controller as the one
-			 * under the cursor: one keystroke per shelf rather
-			 * than one per drive */
-			const char *g = devs[dcur].group;
-
-			for (i = 0; i < ndev; i++)
-				if (!strcmp(devs[i].group, g) && USABLE(i))
-					pick[i] = 1;
+			if (fcur < nvis - 1)
+				fcur++;
 			continue;
 		}
 		if (k == 's' || k == 'S') {
 			if (!nsel)
 				continue;
-			/*
-			 * A drive with no capacity has nothing to scan; only a
-			 * format (or settings, which are mode pages) can take
-			 * it.  Say so here rather than after the form is gone.
-			 */
-			if (mode_sel != nmode + 1 && mode_sel != nmode + 2)
-				for (i = 0; i < ndev && needfmt < 0; i++)
-					if (pick[i] && devs[i].no_capacity)
-						needfmt = i;
-			if (needfmt >= 0)
-				continue;
 			/* a writing mode is one keystroke from destroying a
 			 * drive now that the form is the default entry point,
 			 * so make it two */
-			if (k == 's' && ((mode_sel >= 2 &&
-					  mode_sel != nmode + 2) ||
-					 persist_sel || fix_sel || bms_sel)) {
+			if (k == 's' && (act == A_FORMAT ||
+					 (act == A_SCAN && mode_sel >= 2) ||
+					 saves)) {
 				arm = 1;
 				continue;
 			}
@@ -11384,12 +11545,12 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 			o->format = 0;
 			o->apply_only = 0;
 			o->hide_bad = 0;
-			if (mode_sel == nmode)
-				o->repair = 1;
-			else if (mode_sel == nmode + 1)
+			if (act == A_FORMAT)
 				o->format = 1;
-			else if (mode_sel == nmode + 2)
+			else if (act == A_SETTINGS)
 				o->apply_only = 1;
+			else if (mode_sel == nmode)
+				o->repair = 1;
 			else if (mode_sel == nmode + 3)
 				o->hide_bad = 1;
 			else
@@ -11410,19 +11571,19 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 			o->skip_slow = skip_sel;
 			o->order = (order_t)order_sel;
 			o->lookahead = la_sel == 0 ? 0 : -1;
-			o->bms = bms_sel;
-			o->bms_interval = bms_sel ? (int)bmsi : 0;
-			o->write_cache = wc_sel == 0 ? -1 : wc_sel - 1;
+			o->bms = ds.bms;
+			o->bms_interval = ds.bms ? (int)ds.bmsi : 0;
+			o->write_cache = ds.wc == 0 ? -1 : ds.wc - 1;
 			/* named means moved off what the profile put there;
 			 * --persist saves nothing else (invariant 7b) */
-			o->write_cache_set = wc_named || wc_sel != wc_init;
-			if (rc_sel != rc_init)
+			o->write_cache_set = ds.wc_named || ds.wc != ds.wc_init;
+			if (ds.rc != ds.rc_init)
 				o->read_cache_set = 1;
-			o->persist = persist_sel;
-			o->fix_config = fix_sel;
-			o->awre = o->arre = awre_sel == 0 ? -1 : awre_sel - 1;
-			o->read_cache = rc_sel == 0 ? -1 : rc_sel - 1;
-			o->recovery_ms = rtl;
+			o->persist = ds.persist;
+			o->fix_config = ds.fix;
+			o->awre = o->arre = ds.awre == 0 ? -1 : ds.awre - 1;
+			o->read_cache = ds.rc == 0 ? -1 : ds.rc - 1;
+			o->recovery_ms = ds.rtl;
 			/* only a look-ahead the user actually moved counts as
 			 * asked for; see the note in scan_device() */
 			if (la_sel != la_init)
@@ -11431,12 +11592,20 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 			o->segment = (uint64_t)segment_mb << 20;
 			o->max_parallel = (int)parallel;
 			o->sample = (uint64_t)(sample > 1 ? sample : 0);
+			/*
+			 * Applying settings with none chosen would leave the
+			 * form for a terminal and an error; say so here, where
+			 * the field to change is still in front of the user.
+			 */
+			if (act == A_SETTINGS && !settings_wanted(o)) {
+				o->apply_only = 0;
+				snprintf(msg, sizeof(msg), "nothing to apply: "
+					 "change a setting first");
+				continue;
+			}
 			return 1;
 		}
-		if (sec == 0) {
-			if (k == ' ')
-				pick[cur] = !pick[cur];
-		} else if (k == K_LEFT || k == K_RIGHT) {
+		if (k == K_LEFT || k == K_RIGHT) {
 			int d = (k == K_RIGHT) ? 1 : -1;
 			field_t *fp = &f[vis[fcur]];
 
