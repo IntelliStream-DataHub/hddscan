@@ -36,8 +36,9 @@ sudo ln -sf hddscan /usr/local/sbin/dm-badblocks   # optional: the map tool's ow
 
 ## Quick start
 
-Run it on a terminal with no arguments and it opens a picker: choose drives,
-choose what you are doing, watch a live dashboard. When the scan finishes a
+Run it on a terminal with no arguments and it opens a form of three screens:
+choose drives, choose what to do with them (scan, settings or low level
+format), set that action's options, then watch a live dashboard. When the scan finishes a
 summary holds the verdicts on screen — `n` starts another test, `q` quits, and
 on a drive the scan found damage on, `h` hides it (below). If
 something is already running on the machine, it shows you that first.

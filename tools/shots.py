@@ -155,8 +155,15 @@ class Term:
         return "\n".join(self.lines())
 
 
-def svg(rows, title, path):
-    """rows: lists of cells, as Term.grid holds them"""
+def svg(rows, title, path, trim=False):
+    """rows: lists of cells, as Term.grid holds them.  trim drops the blank
+    rows under the last one drawn, for a screen that is short on a tall
+    terminal."""
+    if trim:
+        rows = list(rows)
+        while len(rows) > 1 and all(c[0] == " " and c[2] is None and
+                                    not c[5] for c in rows[-1]):
+            rows.pop()
     cols = max((len(r) for r in rows), default=80)
     # trailing blank cells carry nothing, so the window is as wide as its text
     used = 0
@@ -485,8 +492,15 @@ def shoot(tmp, state, work, env, live):
     # must not depend on which ones the machine drawing it has installed
     p = Pty(["-i", "sdb.img", "sdc.img", "sdd.img", "sde.img"], 44, 100,
             dict(env, HDDSCAN_TOOLS="all"), work)
-    p.wait("Protection info")
-    svg(p.screen().grid, "sudo hddscan", img("tui-form.svg"))
+    # three screens: the drives, what to do with them, that action's options
+    p.wait("choose drives")
+    svg(p.screen().grid, "sudo hddscan", img("tui-drives.svg"), trim=True)
+    p.send(b"\n", 0.5)
+    p.wait("choose an action")
+    svg(p.screen().grid, "sudo hddscan  (enter)", img("tui-action.svg"), trim=True)
+    p.send(b"1", 0.5)
+    p.wait("Save to drive")
+    svg(p.screen().grid, "sudo hddscan  (enter, 1)", img("tui-form.svg"), trim=True)
     p.close()
 
     # ---- the shelf: a demo store with two live runs and a finished one
