@@ -94,6 +94,7 @@ sudo ./hddscan       # opens the form</code></pre>
 				<tr><td><b>Testing a drive with data on it</b></td><td><code>-n</code> reads each block, writes test patterns over it, then puts the data back.</td><td><code>--mode verify</code> does the same, and <code>--profile inservice</code> never writes at all.</td></tr>
 				<tr><td><b>Testing a new drive</b></td><td><code>-w</code> writes four patterns and reads each one back.</td><td><code>predeploy</code> writes a pattern to every sector and reads it back, then sets the drive up for service.</td></tr>
 				<tr><td><b>Many drives</b></td><td>One drive per run. You start and watch one process for each.</td><td>One worker per drive, all in parallel, with one live dashboard. The run keeps going if your terminal closes.</td></tr>
+				<tr><td><b>Using the drive afterwards</b></td><td>The list works for ext2, ext3 and ext4 only: <code>mke2fs -l</code> builds the filesystem around it. Any other filesystem cannot use it.</td><td>The same list for ext4, and <code>--hide-bad</code> for everything else. It saves a map of the damage on the drive and uses device-mapper to present a new device without the bad areas. Put ZFS, btrfs or XFS on that.</td></tr>
 				<tr><td><b>What you get</b></td><td>A list of bad block numbers.</td><td>A verdict per drive (healthy, suspect or failing) that says how much of the drive was tested, plus the same list in badblocks format.</td></tr>
 			</tbody>
 		</table></div>
@@ -101,6 +102,13 @@ sudo ./hddscan       # opens the form</code></pre>
 		found in the format <code>mke2fs -l</code> reads, so a new filesystem
 		steps around it. If you only need to know whether a disk has sectors
 		that fail outright, badblocks is enough.</p>
+		<p><b>A damaged drive is not always scrap.</b> After a scan, hddscan can
+		hide the bad areas with device-mapper, so you can still use the drive.
+		It makes a new device, <code>/dev/mapper/bb-&lt;serial&gt;</code>, that
+		skips them, and it needs no kernel module. Put any filesystem on it.
+		It is best for a backup target or a scratch disk where a second copy
+		exists, and you should scan it again every few months, because the map
+		only covers damage found so far.</p>
 	</div>
 </section>
 
