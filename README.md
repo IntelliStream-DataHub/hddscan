@@ -60,11 +60,11 @@ depends entirely on what you are about to do with it:
 
 | profile | mode | for |
 |---|---|---|
-| **predeploy** *(default)* | write | No data on it yet. Writes every sector and verifies it reads back, then leaves the drive configured for service. |
+| **predeploy** *(default)* | write | No data on it yet. Writes every sector and verifies it reads back, skipping regions slow as a whole (`--skip-slow`), then leaves the drive configured for service. |
 | **inservice** | read | It holds data you want to keep. Never writes anything. |
 | **survey** | read, sampled | Quick triage of a shelf. |
 | **decay** | check | Weeks after a predeploy run: has the pattern rotted? |
-| **repair** | write | predeploy, plus forcing a reallocation of anything unreadable, and skipping regions slow as a whole (`--skip-slow`). |
+| **repair** | write | predeploy, plus forcing a reallocation of anything unreadable. |
 
 A drive being prepared is the one moment someone is deliberately configuring
 it, so predeploy (and repair) also **save** the configuration it should run
@@ -173,7 +173,7 @@ A drive can also be slow across whole regions rather than in single sectors:
 every chunk there misses its budget, nearly every sector inside comes back in
 time, and the scan crawls while its WEAK count stands still. Or only a few
 chunks miss it, each so full of weak sectors that retrying them takes minutes.
-`--skip-slow` (on under repair) stops reading a region that is too slow to
+`--skip-slow` (on under predeploy and repair) stops reading a region that is too slow to
 scan either way: it probes 1 GiB on, then doubling steps, until the drive is fast again,
 bisects back to the edge, and carries on there. What it jumped over is
 condemned unread, and the report says so plainly. The dashboard's **SKIP**

@@ -450,8 +450,9 @@ def main():
               s.set_choice("Profile", "decay")
               and s.wait(lambda: s.value_of("Chunk size") == "128K"),
               "chunk %r" % s.value_of("Chunk size"))
-        # --skip-slow condemns what it jumps over, so only the profile for
-        # a drive already being salvaged turns it on
+        # --skip-slow condemns what it jumps over, so only the profiles that
+        # write to a drive with nothing on it turn it on; where the data
+        # matters a report has to keep meaning every sector was read
         check("decay reads every region however slow",
               s.wait(lambda: s.value_of("Skip slow regions") == "no"),
               "got %r" % s.value_of("Skip slow regions"))
@@ -459,8 +460,12 @@ def main():
               s.set_choice("Profile", "repair")
               and s.wait(lambda: s.value_of("Skip slow regions") == "yes"),
               "got %r" % s.value_of("Skip slow regions"))
-        check("and leaving repair turns it off again",
+        check("leaving repair for predeploy keeps it on",
               s.set_choice("Profile", "predeploy")
+              and s.wait(lambda: s.value_of("Skip slow regions") == "yes"),
+              "got %r" % s.value_of("Skip slow regions"))
+        check("and leaving predeploy for inservice turns it off",
+              s.set_choice("Profile", "inservice")
               and s.wait(lambda: s.value_of("Skip slow regions") == "no"),
               "got %r" % s.value_of("Skip slow regions"))
         s.send(b"q"); s.close()

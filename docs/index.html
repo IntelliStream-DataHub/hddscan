@@ -58,28 +58,49 @@ sudo ./hddscan       # opens the form</code></pre>
 		<div>
 			<p class="kicker">The problem</p>
 			<h2>“SMART Health Status: OK” until the day it isn’t</h2>
-			<p>A drive can return every sector correctly and still be failing.
-			When a sector gets hard to read, the firmware retries it,
-			re-reads it with different settings, and corrects the data. Your
-			read succeeds; it just takes tens of milliseconds instead of a few.
-			Nothing is reallocated, nothing is logged as an error, and SMART
-			keeps saying OK.</p>
-			<p>Those slow sectors are the ones about to become unreadable.
-			Timing reads is the only way to see them coming, and that is what
-			hddscan does.</p>
+			<p>A drive can return every sector and still be failing. When a
+			sector gets hard to read, the drive tries again, and again, until
+			it gets the data right. Your read works, but it takes tens of
+			milliseconds instead of a few. The drive logs no error and moves
+			nothing, so SMART keeps saying OK.</p>
+			<p>Those slow sectors are the ones about to fail. The only way to
+			catch them is to time every read. That is what hddscan does.</p>
 		</div>
 		<div class="evidence" role="group" aria-label="One real drive">
 			<dl>
 				<div><dt>SMART health status</dt><dd class="ok">OK</dd></div>
 				<div><dt>Sectors reallocated, ever</dt><dd>1</dd></div>
 				<div><dt>Uncorrected read errors</dt><dd>0</dd></div>
-				<div><dt>Reads the drive had to grind for</dt><dd class="bad">42,899,520</dd></div>
+				<div><dt>Reads that needed heavy recovery</dt><dd class="bad">42,899,520</dd></div>
 				<div><dt>Its own long self-test</dt><dd class="bad">failed</dd></div>
 			</dl>
 			<p style="font-size:14px;color:var(--muted);margin:10px 0 12px">One real SAS drive, from its own error
-			counter log: about 80,000 slow recoveries per terabyte read, and a
-			failure prediction years old.</p>
+			log: about 80,000 slow recoveries for every terabyte read, and a
+			failure warning that was years old.</p>
 		</div>
+	</div>
+	<div class="wrap" style="margin-top:56px">
+		<p class="kicker">Compared with badblocks</p>
+		<h2>badblocks asks “can it read?” hddscan also asks “how long did it take?”</h2>
+		<p>badblocks is the standard tool, and it is good at what it does: it
+		finds sectors that fail. But a sector that needed 80 ms of retries
+		passes, because badblocks has no time limit on a read. Those are the
+		sectors hddscan is looking for.</p>
+		<div class="table-wrap"><table>
+			<thead><tr><th></th><th>badblocks</th><th>hddscan</th></tr></thead>
+			<tbody>
+				<tr><td><b>A read that works but is slow</b></td><td>Passes, however long it took.</td><td>Flagged as weak. Every read is timed against a budget measured on this drive.</td></tr>
+				<tr><td><b>A read that fails, or returns the wrong data</b></td><td>Reported as a bad block.</td><td>Reported as unreadable or corrupt.</td></tr>
+				<tr><td><b>Testing a drive with data on it</b></td><td><code>-n</code> reads each block, writes test patterns over it, then puts the data back.</td><td><code>--mode verify</code> does the same, and <code>--profile inservice</code> never writes at all.</td></tr>
+				<tr><td><b>Testing a new drive</b></td><td><code>-w</code> writes four patterns and reads each one back.</td><td><code>predeploy</code> writes a pattern to every sector and reads it back, then sets the drive up for service.</td></tr>
+				<tr><td><b>Many drives</b></td><td>One drive per run. You start and watch one process for each.</td><td>One worker per drive, all in parallel, with one live dashboard. The run keeps going if your terminal closes.</td></tr>
+				<tr><td><b>What you get</b></td><td>A list of bad block numbers.</td><td>A verdict per drive (healthy, suspect or failing) that says how much of the drive was tested, plus the same list in badblocks format.</td></tr>
+			</tbody>
+		</table></div>
+		<p>They work together. <code>--badblocks-list</code> writes what hddscan
+		found in the format <code>mke2fs -l</code> reads, so a new filesystem
+		steps around it. If you only need to know whether a disk has sectors
+		that fail outright, badblocks is enough.</p>
 	</div>
 </section>
 

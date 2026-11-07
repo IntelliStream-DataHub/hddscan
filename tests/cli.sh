@@ -626,6 +626,29 @@ assert_has "--skip-slow is refused for an order that does not walk" \
 	"$(slowrun 1G:1G --skip-slow --order random "$f")" \
 	"needs a scan that walks the drive"
 
+# predeploy turns it on by itself.  --mode read keeps the profile's flags, and
+# its --rewrite-weak is what needs the --confirm (the image's own path, as
+# given), so the slow region can be seen without a write pass of its own.
+pslow() {
+	local range=$1; shift
+	HDDSCAN_SLOW=$range HDDSCAN_SLOW_MS=5000 \
+		runp --mode read --chunk 1M --chunk-slow-ms 1000 --retries 1 \
+		--confirm "${@: -1}" "$@"
+}
+out=$(pslow 1G:1G "$f")
+assert_has "predeploy skips a slow region without being asked" "$out" \
+	"Slow regions, condemned by --skip-slow"
+assert_has "--no-skip-slow turns it off under predeploy" \
+	"$(pslow 1G:1G --no-skip-slow "$f")" \
+	"every sector of the device was read"
+assert_hasnt "predeploy's own skip is dropped quietly for a random order" \
+	"$(pslow 1G:1G --order random "$f")" "needs a scan that walks the drive"
+assert_has "a typed --skip-slow still complains about a random order" \
+	"$(pslow 1G:1G --skip-slow --order random "$f")" \
+	"needs a scan that walks the drive"
+assert_hasnt "and a sampled predeploy drops its own skip without a word" \
+	"$(pslow 1G:1G --sample 4 "$f")" "needs a scan that walks the drive"
+
 f=$(slowimg skipend.bin 3G)
 out=$(slowrun 1G:2G --skip-slow --json "$TMP/skipend.json" "$f")
 assert_has "a region slow to the end of the drive is condemned to it" \
