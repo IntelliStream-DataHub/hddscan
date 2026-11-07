@@ -23,6 +23,40 @@ $(BIN): $(SRC)
 static: $(SRC)
 	$(CC) $(CFLAGS) -static -o $(BIN)-static $< $(LDFLAGS)
 
+# AddressSanitizer and UBSan.  This is the binary that parses /proc, kernel log
+# lines, smartctl output, checkpoints and the map's metadata, and one of its
+# modes writes to drives, so a memory error here is worse than a crash.  Not
+# part of `make` or `make test`: it is about twice as slow, and tests/tui.py
+# keeps time.  Threads there are none, so there is no TSan target; MSan wants
+# libc rebuilt with it.
+#
+# -fsanitize-recover and halt_on_error=0 keep a run going past its first
+# report so one pass lists everything, and the reports go to files rather
+# than stderr, because the suites read stderr and assert on it.  Leak
+# detection is off: the workers and the supervisor end through exit() and
+# hold what they hold until then on purpose.
+SAN        := -fsanitize=address,undefined -fsanitize-recover=address,undefined
+ASAN_BIN   := $(BIN)-asan
+ASAN_LOGS  ?= $(CURDIR)/asan-logs
+
+asan: $(SRC)
+	$(CC) $(CFLAGS) -O1 -fno-omit-frame-pointer $(SAN) -o $(ASAN_BIN) $< $(LDFLAGS)
+
+test-asan: asan
+	@rm -rf $(ASAN_LOGS) && mkdir -p $(ASAN_LOGS)
+	@export ASAN_OPTIONS="detect_leaks=0:halt_on_error=0:abort_on_error=0:log_path=$(ASAN_LOGS)/asan"; \
+	export UBSAN_OPTIONS="print_stacktrace=1:log_path=$(ASAN_LOGS)/ubsan"; \
+	HDDSCAN=./$(ASAN_BIN) tests/cli.sh; a=$$?; \
+	BIN="./$(ASAN_BIN) dm" bash tests/dm.sh; b=$$?; \
+	n=$$(ls $(ASAN_LOGS) | wc -l); \
+	if [ $$n -gt 0 ]; then \
+		echo "sanitizer: $$n report file(s) in $(ASAN_LOGS)"; \
+		grep -h -E 'ERROR: AddressSanitizer|runtime error' $(ASAN_LOGS)/* \
+			| sed 's/^[^ ]* *//' | sort | uniq -c | sort -rn | head -40; \
+		exit 1; \
+	fi; \
+	[ $$a -eq 0 ] && [ $$b -eq 0 ]
+
 # A release tarball: the static binary, stripped, with the man page, the boot
 # unit for the device-mapper maps, and the licence.  The same target builds the
 # GitHub release, so what is published can be reproduced by hand.
@@ -77,6 +111,6 @@ sitecheck: $(BIN)
 	@python3 tools/options.py --check
 
 clean:
-	rm -f $(BIN) $(BIN)-static $(BIN)-*-linux-*.tar.gz*
+	rm -rf $(BIN) $(BIN)-static $(BIN)-asan asan-logs $(BIN)-*-linux-*.tar.gz*
 
-.PHONY: all static dist install clean mancheck sitecheck site test
+.PHONY: all static dist install clean mancheck sitecheck site test asan test-asan
