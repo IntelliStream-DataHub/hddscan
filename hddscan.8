@@ -160,7 +160,9 @@ order the two appear in. The report names the profile that produced it.
 .TP
 .B predeploy
 No data on it yet: write every sector and verify it reads back, in 1M chunks
-with the write cache off for the run. It also leaves the drive configured for
+with the write cache off for the run, and
+.B \-\-skip\-slow
+so a region too slow to write is condemned rather than waited on. It also leaves the drive configured for
 service, which is the part that outlives the run:
 .B \-\-fix\-config
 and
@@ -182,8 +184,7 @@ Quick triage of a shelf: samples the surface, read only.
 Weeks after a predeploy run: has the pattern rotted?
 .TP
 .B repair
-predeploy, plus forcing a reallocation of anything unreadable, and
-.BR \-\-skip\-slow .
+predeploy, plus forcing a reallocation of anything unreadable.
 .RE
 .IP
 The drive settings a profile carries apply only in its own mode.
@@ -406,10 +407,12 @@ cuts the regions out with the rest of the damage, and a scan with skips still
 counts as covering the whole drive for it. Any skip makes the verdict at least
 SUSPECT. Sequential or reverse order only, and not with
 .BR \-\-sample .
-On under the repair profile.
+On under the predeploy and repair profiles, where it is dropped without a
+word for an order that cannot walk the drive; named by hand it complains.
 .TP
 .B \-\-no\-skip\-slow
-Read every region however slow, including under the repair profile.
+Read every region however slow, including under the predeploy and repair
+profiles.
 .TP
 .B \-\-rewrite\-weak
 Rewrite readable-but-slow sectors in place so the drive refreshes or remaps

@@ -7998,6 +7998,7 @@ typedef struct {
 	int force_remap;
 	int second_pass;
 	int skip_slow;          /* condemn a region too slow to scan, unread */
+	int skip_slow_set;      /* named, not just the profile's default */
 	int repair;             /* the whole repair sequence in one flag */
 	const char *profile;    /* which profile produced these defaults */
 	int retries;
@@ -8087,9 +8088,12 @@ typedef struct {
 	int bms;                /* turn the background scan on, saved */
 	int bms_interval;       /* its interval in hours, 0 keep */
 	/*
-	 * Skip regions too slow to scan: only for repair, which is
-	 * already a drive being salvaged.  Everywhere else a report has to
-	 * keep meaning every sector was tested.
+	 * Skip regions too slow to scan: on for the two profiles that write
+	 * to a drive with no data on it, where a region too slow to write
+	 * is a drive to send back and not one to wait on for days.  Where
+	 * the data matters (inservice, survey, decay) it stays off, so a
+	 * report there keeps meaning every sector was tested.  What it
+	 * skips is condemned and the report says so.
 	 */
 	int skip_slow;
 } profile_t;
@@ -8097,7 +8101,7 @@ typedef struct {
 static const profile_t g_profiles[] = {
 	{ "predeploy",
 	  "no data on it yet: write every sector and verify it reads back",
-	  MODE_WRITE, 1, 0, 1, 0, 1024u * 1024, 0, 1, 1, 168, 0 },
+	  MODE_WRITE, 1, 0, 1, 0, 1024u * 1024, 0, 1, 1, 168, 1 },
 	{ "inservice",
 	  "it holds data you want to keep: never writes anything",
 	  MODE_READ,  0, 0, 0, 0, 0, -1, 0, 0, 0, 0 },
@@ -8144,8 +8148,9 @@ static void usage(void)
 "                         --confirm rather than doing anything:\n"
 "                           predeploy  no data on it yet: write every sector\n"
 "                                      and verify it reads back, 1M chunks,\n"
-"                                      write cache off for the run.  Leaves\n"
-"                                      the drive configured for service:\n"
+"                                      write cache off for the run, and\n"
+"                                      --skip-slow.  Leaves the drive\n"
+"                                      configured for service:\n"
 "                                      --fix-config and --bms on, weekly,\n"
 "                                      SAVED on SAS drives\n"
 "                           inservice  it holds data you want to keep: never\n"
@@ -8154,8 +8159,7 @@ static void usage(void)
 "                                      surface, read only\n"
 "                           decay      weeks after predeploy: has it rotted?\n"
 "                           repair     predeploy, plus forcing a reallocation\n"
-"                                      of anything unreadable, and\n"
-"                                      --skip-slow\n"
+"                                      of anything unreadable\n"
 "                         Any explicit flag overrides what the profile set,\n"
 "                         whichever order they appear in.  The drive\n"
 "                         settings a profile carries apply only in its own\n"
@@ -8245,8 +8249,11 @@ static void usage(void)
 "                         whose drill-down costs over 10 s is condemned\n"
 "                         whole.  What was jumped over is condemned unread;\n"
 "                         the report says so and --hide-bad cuts it out.\n"
-"                         Sequential or reverse order only.  On under repair\n"
-"  --no-skip-slow         read every region, however slow, under repair too\n"
+"                         Sequential or reverse order only.  On under\n"
+"                         predeploy and repair, and dropped there without\n"
+"                         comment where the order cannot walk\n"
+"  --no-skip-slow         read every region, however slow, under predeploy\n"
+"                         and repair too\n"
 "  --rewrite-weak         rewrite readable-but-slow sectors in place to make\n"
 "                         the drive refresh or remap them (needs verify/write,\n"
 "                         or read mode plus this flag for read-modify-write)\n"
@@ -8624,6 +8631,14 @@ static int scan_device(device_t *d, const opts_t *o, const char *json_path,
 	c.pos = c.start;
 	order_setup(&c, o->segment);
 	c.skip_slow = o->skip_slow;
+	/*
+	 * A profile turns this on without being asked, so a scan that cannot
+	 * walk the drive does without it quietly; only a --skip-slow that
+	 * was typed gets the complaint from skip_setup().
+	 */
+	if (c.skip_slow && !o->skip_slow_set &&
+	    (c.order == ORD_RANDOM || c.sample > 1))
+		c.skip_slow = 0;
 	skip_setup(&c);
 
 	kmsg_open(&c);
@@ -11569,6 +11584,9 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 			o->force_remap = g_profiles[prof_sel].force_remap;
 			o->second_pass = g_profiles[prof_sel].second_pass;
 			o->skip_slow = skip_sel;
+			/* moved off the profile's own value is a choice */
+			o->skip_slow_set =
+				skip_sel != g_profiles[prof_sel].skip_slow;
 			o->order = (order_t)order_sel;
 			o->lookahead = la_sel == 0 ? 0 : -1;
 			o->bms = ds.bms;
@@ -15216,8 +15234,10 @@ int main(int argc, char **argv)
 			o.second_pass = 1;
 		} else if (!strcmp(a, "--skip-slow")) {
 			o.skip_slow = 1;
+			o.skip_slow_set = 1;
 		} else if (!strcmp(a, "--no-skip-slow")) {
 			o.skip_slow = 0;
+			o.skip_slow_set = 1;
 		} else if (!strcmp(a, "--start")) {
 			if (parse_size(NEXT(), &o.start))
 				die("bad --start value");

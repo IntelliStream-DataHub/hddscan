@@ -327,7 +327,7 @@ cost minutes. Another real drive spent six and a half minutes on its first
 forty megabytes that way: 4.4% of chunks over budget, a climbing weak count,
 and an ETA of four years.
 
-`--skip-slow` (on under the repair profile) handles both. A region is too slow
+`--skip-slow` (on under the predeploy and repair profiles) handles both. A region is too slow
 to scan when, over a trailing window of chunks, either:
 
 - three quarters of the last 64 MiB were over budget, or
