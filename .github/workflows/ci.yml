@@ -56,3 +56,25 @@ jobs:
         run: |
           echo "dynamic build needs glibc $(nm -D --undefined-only hddscan \
             | grep -oE 'GLIBC_[0-9.]+' | sort -uV | tail -1)"
+
+  # AddressSanitizer and UBSan over the logic suites.  tests/tui.py is left
+  # out: it keeps time against a 200 ms repaint and the sanitizers roughly
+  # halve the speed.  No -Werror here -- the build is -O1, where gcc cannot
+  # see that dmbb_name_ok() bounds a name it then copies.  Leak detection is
+  # off on purpose; see the comment above `asan` in the Makefile.
+  sanitizers:
+    name: ASan and UBSan (x86_64)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: cli and dm suites under ASan and UBSan
+        run: make test-asan
+
+      - name: Keep the reports of a failed run
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanitizer-reports
+          path: asan-logs
+          if-no-files-found: ignore
