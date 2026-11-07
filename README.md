@@ -1,5 +1,7 @@
 # hddscan
 
+[![CI](https://github.com/IntelliStream-DataHub/hddscan/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/IntelliStream-DataHub/hddscan/actions/workflows/ci.yml)
+
 Finds sectors on a rotating disk that return data **too slowly**, not just ones
 that fail outright.
 
