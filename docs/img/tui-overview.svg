@@ -6,7 +6,7 @@
 <circle cx="40" cy="15" r="6" fill="#febc2e"/>
 <circle cx="60" cy="15" r="6" fill="#28c840"/>
 <text x="389" y="20" fill="#9aa3b2" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" text-anchor="middle">sudo hddscan --attach 20260912-080512</text>
-<text y="61" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de" font-weight="bold"> hddscan 1.0</tspan><tspan x="119.2" fill="#d0d4de">   destructive write + verify   24 drives   elapsed 83h 00m                 </tspan></text>
+<text y="61" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de" font-weight="bold"> hddscan 1.1</tspan><tspan x="119.2" fill="#d0d4de">   destructive write + verify   24 drives   elapsed 83h 00m                 </tspan></text>
 <text y="79" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de"> [=========================================================================---]  95.7%  </tspan></text>
 <text y="115" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de">  5 scanning   0 queued   19 done   </tspan><tspan x="321.5" fill="#8fd66b">15 healthy</tspan><tspan x="422.6" fill="#e5c07b">4 suspect</tspan><tspan x="515.4" fill="#ff7b72">0 failing</tspan></text>
 <text y="133" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de">  905.75 MiB/s aggregate   472.63 TiB tested   eta 7h 36m                               </tspan></text>

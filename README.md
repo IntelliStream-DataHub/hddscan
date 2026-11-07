@@ -31,8 +31,8 @@ file, no glibc version floor, tested on its own architecture before it was
 published.
 
 ```sh
-tar xzf hddscan-1.0-linux-x86_64.tar.gz
-sudo install hddscan-1.0-linux-x86_64/hddscan /usr/local/sbin/
+tar xzf hddscan-1.1-linux-x86_64.tar.gz
+sudo install hddscan-1.1-linux-x86_64/hddscan /usr/local/sbin/
 sudo ln -sf hddscan /usr/local/sbin/dm-badblocks   # optional: the map tool's own name
 ```
 

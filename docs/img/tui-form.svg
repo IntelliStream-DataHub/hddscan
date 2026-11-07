@@ -6,7 +6,7 @@
 <circle cx="40" cy="15" r="6" fill="#febc2e"/>
 <circle cx="60" cy="15" r="6" fill="#28c840"/>
 <text x="427" y="20" fill="#9aa3b2" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" text-anchor="middle">sudo hddscan  (enter, 1)</text>
-<text y="61" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de" font-weight="bold"> hddscan 1.0 </tspan><tspan x="127.6" fill="#d0d4de">  Scan (3 of 3)                                                                     </tspan></text>
+<text y="61" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de" font-weight="bold"> hddscan 1.1 </tspan><tspan x="127.6" fill="#d0d4de">  Scan (3 of 3)                                                                     </tspan></text>
 <text y="97" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="34.9" fill="#8fd66b">-- How to test --</tspan></text>
 <rect x="18.0" y="101.5" width="354.1" height="18" fill="#d0d4de"/>
 <text y="115" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#1b1f27">   Profile                &lt; predeploy    &gt;</tspan><tspan x="372.1" fill="#d0d4de">  what you are about to do with the drive; sets the res</tspan></text>

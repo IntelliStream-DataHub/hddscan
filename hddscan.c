@@ -46,7 +46,7 @@
 #include <linux/fs.h>
 
 #define PROG "hddscan"
-#define VERSION "1.0"
+#define VERSION "1.1"
 
 /*
  * How many chunks may be refused back to back before a scan concludes it is

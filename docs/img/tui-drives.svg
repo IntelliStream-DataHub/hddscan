@@ -6,7 +6,7 @@
 <circle cx="40" cy="15" r="6" fill="#febc2e"/>
 <circle cx="60" cy="15" r="6" fill="#28c840"/>
 <text x="317" y="20" fill="#9aa3b2" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" text-anchor="middle">sudo hddscan</text>
-<text y="61" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de" font-weight="bold"> hddscan 1.0 </tspan><tspan x="127.6" fill="#d0d4de">  choose drives (1 of 3)                                  </tspan></text>
+<text y="61" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de" font-weight="bold"> hddscan 1.1 </tspan><tspan x="127.6" fill="#d0d4de">  choose drives (1 of 3)                                  </tspan></text>
 <text y="97" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de"> Drives   (space one, a all free HDDs, g this controller, n none)      </tspan></text>
 <rect x="34.9" y="101.5" width="581.7" height="18" fill="#d0d4de"/>
 <text y="115" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="34.9" fill="#1b1f27"> [x] sdb.img  file    12.73 TiB  regular file (image) HDD       ready</tspan></text>

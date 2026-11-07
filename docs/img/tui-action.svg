@@ -6,7 +6,7 @@
 <circle cx="40" cy="15" r="6" fill="#febc2e"/>
 <circle cx="60" cy="15" r="6" fill="#28c840"/>
 <text x="342" y="20" fill="#9aa3b2" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" text-anchor="middle">sudo hddscan  (enter)</text>
-<text y="61" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de" font-weight="bold"> hddscan 1.0 </tspan><tspan x="127.6" fill="#d0d4de">  choose an action (2 of 3)                                     </tspan></text>
+<text y="61" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de" font-weight="bold"> hddscan 1.1 </tspan><tspan x="127.6" fill="#d0d4de">  choose an action (2 of 3)                                     </tspan></text>
 <text y="97" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de"> 4 drives selected: sdb.img sdc.img sdd.img sde.img                          </tspan></text>
 <rect x="34.9" y="119.5" width="185.5" height="18" fill="#d0d4de"/>
 <text y="133" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="34.9" fill="#1b1f27"> 1  Scan              </tspan><tspan x="220.3" fill="#d0d4de">  find slow and failing sectors; read-only or writing</tspan></text>

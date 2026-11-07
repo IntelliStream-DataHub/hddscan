@@ -6,7 +6,7 @@
 <circle cx="40" cy="15" r="6" fill="#febc2e"/>
 <circle cx="60" cy="15" r="6" fill="#28c840"/>
 <text x="376" y="20" fill="#9aa3b2" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" text-anchor="middle">sudo hddscan --attach</text>
-<text y="61" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de" font-weight="bold"> hddscan 1.0 </tspan><tspan x="127.6" fill="#d0d4de">  runs on this machine   2 in progress                                  </tspan></text>
+<text y="61" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de" font-weight="bold"> hddscan 1.1 </tspan><tspan x="127.6" fill="#d0d4de">  runs on this machine   2 in progress                                  </tspan></text>
 <text y="97" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#d0d4de">  RUN               KIND    WHAT                   DRIVES PROGRESS  STATE     ELAPSED</tspan></text>
 <rect x="18.0" y="101.5" width="699.7" height="18" fill="#d0d4de"/>
 <text y="115" font-family="DejaVu Sans Mono,Menlo,Consolas,Liberation Mono,monospace" font-size="14" xml:space="preserve"><tspan x="18.0" fill="#1b1f27">  20260912-093044   format  format 4096B PI kept       30   60.6%  running   4h 08m</tspan></text>
