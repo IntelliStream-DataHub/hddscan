@@ -1243,7 +1243,7 @@ static const uint64_t bucket_hi[NBUCKETS] = {
 	1000000, 2000000, 5000000, 10000000, 30000000, UINT64_MAX
 };
 
-typedef struct {
+typedef struct lat_s {
 	uint64_t count;
 	uint64_t sum_us;
 	uint64_t min_us;
@@ -1260,6 +1260,11 @@ typedef struct {
 	 * one that omits the number.
 	 */
 	uint64_t over[NTIERS];
+	/*
+	 * Fed every sample this one is, so a pass can have statistics of its
+	 * own while the report keeps the whole scan's: see the drive history.
+	 */
+	struct lat_s *shadow;
 } lat_t;
 
 static void lat_init(lat_t *l)
@@ -1272,6 +1277,8 @@ static void lat_add(lat_t *l, uint64_t us)
 {
 	int i;
 
+	if (l->shadow)
+		lat_add(l->shadow, us);
 	l->count++;
 	for (i = 0; i < NTIERS; i++)
 		if (us > lat_tiers[i])
@@ -1434,6 +1441,13 @@ typedef struct {
 	int is_root_disk;
 	int no_access;          /* could not even open it: almost always "not root" */
 	int no_capacity;        /* attached with no capacity: needs a format */
+	/*
+	 * The drive history this device's passes are written to, when it is
+	 * not this device's own: a map's test belongs in the file of the
+	 * drive under it, named here.  over is that drive's name.
+	 */
+	char uid[200];
+	char over[64];
 } device_t;
 
 /*
@@ -2756,6 +2770,18 @@ static uint64_t gcd_u64(uint64_t a, uint64_t b)
 	return a;
 }
 
+/*
+ * Where the counters stood when a pass began, so the drive history can say
+ * what that pass alone found.  The report is about the whole scan and keeps
+ * the running totals; a pass is the difference.
+ */
+typedef struct {
+	uint64_t t_us, bytes, skip_bytes, chunks, chunks_slow, writes;
+	uint64_t writes_slow, drilled, weak, bad, corrupt, healed, unrepaired;
+	uint64_t reassigned, hard, align, prot;
+	int nfind, nskip;
+} passsnap_t;
+
 typedef struct {
 	device_t *dev;
 	int fd;
@@ -2858,6 +2884,9 @@ typedef struct {
 	lat_t chunk_lat;
 	lat_t block_lat;      /* per-4K reads, drill-down + retries */
 	lat_t write_lat;
+	/* the same, for the current pass alone: the drive history */
+	lat_t pass_chunk, pass_block, pass_write;
+	passsnap_t ps;
 
 	band_t bands[N_BANDS];
 	topslow_t top[TOP_SLOW];
@@ -6923,6 +6952,8 @@ static void fs_plan(const ctx_t *c)
 	    "   covers damage that had already appeared by the time it was made.\n");
 }
 
+static int hist_path(const device_t *d, char *out, size_t n);
+
 static void report(ctx_t *c)
 {
 	device_t *d = c->dev;
@@ -6960,6 +6991,12 @@ static void report(ctx_t *c)
 	}
 	if (c->profile)
 		out("  Profile          %s\n", c->profile);
+	{
+		char hp[STORE_MAX + 300];
+
+		if (hist_path(c->dev, hp, sizeof(hp)) == 0)
+			out("  History          %s\n", hp);
+	}
 	out("  Mode             %s\n", mode_name(c->mode));
 	out("  Range            %s .. %s (%s)\n",
 	    human_size(c->start, b1, sizeof(b1)),
@@ -7924,6 +7961,339 @@ static void write_prometheus(ctx_t *c, const char *path)
 		msg(PROG ": wrote %s\n", path);
 }
 
+/* ------------------------------------------------------------------ *
+ * the drive history
+ *
+ * A report belongs to a run and is named after the device, and sdb today is
+ * sdc after a reboot.  The history belongs to the drive: one file per drive,
+ * named by model and serial -- the identity --hide-bad already trusts to find
+ * a drive again -- with a line appended after every pass.  Each line is
+ * what that pass alone found: its counters, its latency, the drive's SMART
+ * counters as it ended, and every block it condemned, so a drive's decay
+ * can be followed from one pass to the next without the run that found it.
+ *
+ * JSON Lines, because a pass is appended without reading or rewriting what
+ * is there, and because a reader needs nothing but jq.  A line is built in
+ * memory and written whole with O_APPEND, then synced, so a crash leaves the
+ * file ending at the last complete pass rather than half way through one.
+ * ------------------------------------------------------------------ */
+
+/* anything that is not plainly safe in a file name becomes '_' */
+static void id_slug(const char *s, char *out, size_t n)
+{
+	size_t i;
+
+	for (i = 0; i + 1 < n && s[i]; i++)
+		out[i] = (isalnum((unsigned char)s[i]) || s[i] == '.' ||
+			  s[i] == '-') ? s[i] : '_';
+	out[i] = 0;
+}
+
+/*
+ * The name a drive's history goes by.  Model and serial, as the by-id names
+ * are made: a serial is unique only within a vendor.  An image is its whole
+ * path, since two images of one name are two drives.  A drive with no
+ * serial falls back to its kernel name and says so in the file name, since
+ * that is not stable across a reboot.
+ */
+static void dev_uid(const device_t *d, char *out, size_t n)
+{
+	char a[96], b[96], p[PATH_MAX];
+
+	if (d->uid[0]) {
+		snprintf(out, n, "%s", d->uid);
+		return;
+	}
+	if (d->is_file) {
+		char big[160];
+
+		if (!realpath(d->path, p))
+			snprintf(p, sizeof(p), "%s", d->path);
+		id_slug(p, big, sizeof(big));
+		snprintf(out, n, "image%s", big);
+		return;
+	}
+	if (d->serial[0]) {
+		id_slug(d->model[0] ? d->model : "drive", a, sizeof(a));
+		id_slug(d->serial, b, sizeof(b));
+		snprintf(out, n, "%s_%s", a, b);
+		return;
+	}
+	id_slug(d->name, a, sizeof(a));
+	snprintf(out, n, "noserial_%s", a);
+}
+
+static int hist_path(const device_t *d, char *out, size_t n)
+{
+	char uid[200], dir[STORE_MAX + 16];
+
+	dev_uid(d, uid, sizeof(uid));
+	if (snprintf(dir, sizeof(dir), "%s/drives", store_root()) >=
+	    (int)sizeof(dir) ||
+	    snprintf(out, n, "%s/%s.jsonl", dir, uid) >= (int)n)
+		return -1;
+	return mkpath(dir);
+}
+
+/* a pass starts: remember the counters, and start its own latency */
+static void hist_begin(ctx_t *c)
+{
+	passsnap_t *p = &c->ps;
+
+	p->t_us = now_us();
+	p->bytes = c->bytes_done;
+	p->skip_bytes = c->skip_bytes;
+	p->chunks = c->chunks_read;
+	p->chunks_slow = c->chunks_slow;
+	p->writes = c->writes_done;
+	p->writes_slow = c->writes_slow;
+	p->drilled = c->blocks_drilled;
+	p->weak = weak_total(c);
+	p->bad = c->blocks_bad;
+	p->corrupt = c->blocks_corrupt;
+	p->healed = c->blocks_fixed;
+	p->unrepaired = c->blocks_unrepaired;
+	p->reassigned = c->sas_reassigned;
+	p->hard = c->hard_errors;
+	p->align = c->align_errors;
+	p->prot = c->prot_errors;
+	p->nfind = c->nfind;
+	p->nskip = c->nskip;
+	lat_init(&c->pass_chunk);
+	lat_init(&c->pass_block);
+	lat_init(&c->pass_write);
+	c->chunk_lat.shadow = &c->pass_chunk;
+	c->block_lat.shadow = &c->pass_block;
+	c->write_lat.shadow = &c->pass_write;
+}
+
+static void hist_lat(FILE *m, const char *name, const lat_t *l, int last)
+{
+	fprintf(m, "\"%s\":", name);
+	if (!l->count)
+		fprintf(m, "null");
+	else
+		fprintf(m, "{\"n\":%" PRIu64 ",\"min\":%.3f,\"p50\":%.3f,"
+			"\"p99\":%.3f,\"avg\":%.3f,\"max\":%.3f}", l->count,
+			(double)l->min_us / 1000.0, lat_pct(l, 50) / 1000.0,
+			lat_pct(l, 99) / 1000.0,
+			(double)l->sum_us / (double)l->count / 1000.0,
+			(double)l->max_us / 1000.0);
+	fputs(last ? "" : ",", m);
+}
+
+static int find_cmp_off(const void *a, const void *b)
+{
+	const finding_t *x = a, *y = b;
+
+	return x->offset < y->offset ? -1 : x->offset > y->offset;
+}
+
+/*
+ * Every block this pass condemned, merged into ranges of one kind so a
+ * drive with a million weak sectors in a few bands is a few thousand lines
+ * of JSON rather than a million.  count is how many drilled blocks a range
+ * merged, worst_ms the slowest any of them took.  A block a rewrite healed
+ * is kept apart from one it did not.
+ */
+static void hist_blocks(FILE *m, const ctx_t *c, int from)
+{
+	finding_t *v;
+	int n = 0, i, first = 1;
+	uint64_t lbs = c->dev->logical_bs > 0 ? (uint64_t)c->dev->logical_bs :
+						 512;
+
+	fputs("\"blocks\":[", m);
+	v = malloc((size_t)(c->nfind - from + 1) * sizeof(*v));
+	if (!v) {
+		fputs("]", m);
+		return;
+	}
+	for (i = from; i < c->nfind; i++)
+		if (c->find[i].status != ST_OK)
+			v[n++] = c->find[i];
+	qsort(v, (size_t)n, sizeof(*v), find_cmp_off);
+	for (i = 0; i < n;) {
+		uint64_t off = v[i].offset;
+		uint64_t end = off + (v[i].len ? v[i].len : c->block);
+		uint64_t worst = v[i].max_us, cnt = 1;
+		int k = i + 1;
+
+		while (k < n && v[k].status == v[i].status &&
+		       v[k].fixed_by_rewrite == v[i].fixed_by_rewrite &&
+		       v[k].offset <= end) {
+			uint64_t e = v[k].offset + (v[k].len ? v[k].len :
+							c->block);
+
+			if (e > end)
+				end = e;
+			if (v[k].max_us > worst)
+				worst = v[k].max_us;
+			cnt++;
+			k++;
+		}
+		fprintf(m, "%s{\"offset\":%" PRIu64 ",\"length\":%" PRIu64
+			",\"lba\":%" PRIu64 ",\"lbas\":%" PRIu64
+			",\"kind\":\"%s\",\"count\":%" PRIu64
+			",\"worst_ms\":%.3f,\"healed\":%s}", first ? "" : ",",
+			off, end - off, off / lbs, (end - off + lbs - 1) / lbs,
+			status_name(v[i].status), cnt, (double)worst / 1000.0,
+			v[i].fixed_by_rewrite ? "true" : "false");
+		first = 0;
+		i = k;
+	}
+	fputs("]", m);
+	free(v);
+}
+
+/*
+ * Append what this pass found to the drive's history.  sm is the SMART read
+ * as the pass ended; the verdict is the scan's as it stands then, with sm as
+ * its "after", which for the last pass is exactly the report's.
+ */
+static void hist_append(ctx_t *c, const char *profile, int resumed,
+			int pass, int complete, const smart_t *sm)
+{
+	const passsnap_t *p = &c->ps;
+	const device_t *d = c->dev;
+	char path[STORE_MAX + 300], uid[200], wwn[128] = "", ts[40];
+	char *buf = NULL;
+	size_t len = 0, done = 0;
+	smart_t keep = c->smart_after;
+	const char *why = "";
+	double secs = (double)(now_us() - p->t_us) / 1e6;
+	uint64_t bytes = c->bytes_done - p->bytes;
+	time_t now = time(NULL);
+	struct tm tmv;
+	FILE *m;
+	int fd, v, i, first;
+
+	if (hist_path(d, path, sizeof(path)) < 0)
+		return;
+	dev_uid(d, uid, sizeof(uid));
+	if (!d->is_file && !d->over[0]) {
+		char wp[PATH_MAX];
+		FILE *w;
+
+		snprintf(wp, sizeof(wp), "/sys/block/%s/device/wwid", d->name);
+		if ((w = fopen(wp, "re"))) {
+			if (fgets(wwn, sizeof(wwn), w))
+				wwn[strcspn(wwn, "\r\n")] = 0;
+			fclose(w);
+		}
+	}
+	localtime_r(&now, &tmv);
+	strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S%z", &tmv);
+	if (sm)
+		c->smart_after = *sm;
+	v = verdict_of(c, &why);
+	c->smart_after = keep;
+
+	m = open_memstream(&buf, &len);
+	if (!m)
+		return;
+	fprintf(m, "{\"v\":1,\"time\":\"%s\",\"epoch\":%lld,\"id\":\"", ts,
+		(long long)now);
+	json_escape(m, uid);
+	fprintf(m, "\",\"run\":\"");
+	json_escape(m, g_own_run);
+	fprintf(m, "\",\"target\":\"%s\",\"device\":\"", d->over[0] ? "map" :
+		"drive");
+	json_escape(m, d->path);
+	if (d->over[0]) {
+		fprintf(m, "\",\"over\":\"");
+		json_escape(m, d->over);
+	}
+	fprintf(m, "\",\"model\":\"");
+	json_escape(m, d->model);
+	fprintf(m, "\",\"serial\":\"");
+	json_escape(m, d->serial);
+	fprintf(m, "\",\"wwn\":\"");
+	json_escape(m, wwn);
+	fprintf(m, "\",\"size\":%" PRIu64 ",\"logical_block_size\":%d,"
+		"\"profile\":\"", d->size, d->logical_bs);
+	json_escape(m, profile ? profile : "");
+	fprintf(m, "\",\"mode\":\"%s\",\"pass\":%d,\"complete\":%s,"
+		"\"resumed\":%s,",
+		c->mode == MODE_READ ? "read" : c->mode == MODE_VERIFY ?
+		"verify" : c->mode == MODE_CHECK ? "check" : "write", pass,
+		complete ? "true" : "false", resumed ? "true" : "false");
+	if (c->abort_reason[0]) {
+		fprintf(m, "\"abort_reason\":\"");
+		json_escape(m, c->abort_reason);
+		fprintf(m, "\",");
+	}
+	fprintf(m, "\"start\":%" PRIu64 ",\"end\":%" PRIu64 ",\"bytes\":%"
+		PRIu64 ",\"skipped_bytes\":%" PRIu64 ",\"elapsed_s\":%.1f,"
+		"\"rate_mib_s\":%.2f,", c->start, c->end, bytes,
+		c->skip_bytes - p->skip_bytes, secs,
+		secs > 0 ? (double)bytes / secs / 1048576.0 : 0.0);
+	fprintf(m, "\"counts\":{\"chunks\":%" PRIu64 ",\"chunks_over_budget\":%"
+		PRIu64 ",\"writes\":%" PRIu64 ",\"writes_over_budget\":%" PRIu64
+		",\"sectors_drilled\":%" PRIu64 ",\"weak\":%" PRIu64 ",\"bad\":%"
+		PRIu64 ",\"corrupt\":%" PRIu64 ",\"healed\":%" PRIu64
+		",\"unrepaired\":%" PRIu64 ",\"reassigned\":%" PRIu64
+		",\"hard_errors\":%" PRIu64 ",\"align_errors\":%" PRIu64
+		",\"prot_errors\":%" PRIu64 "},",
+		c->chunks_read - p->chunks, c->chunks_slow - p->chunks_slow,
+		c->writes_done - p->writes, c->writes_slow - p->writes_slow,
+		c->blocks_drilled - p->drilled, weak_total(c) - p->weak,
+		c->blocks_bad - p->bad, c->blocks_corrupt - p->corrupt,
+		c->blocks_fixed - p->healed,
+		c->blocks_unrepaired - p->unrepaired,
+		c->sas_reassigned - p->reassigned, c->hard_errors - p->hard,
+		c->align_errors - p->align, c->prot_errors - p->prot);
+	fputs("\"latency_ms\":{", m);
+	hist_lat(m, "read", &c->pass_chunk, 0);
+	hist_lat(m, "write", &c->pass_write, 0);
+	hist_lat(m, "sector", &c->pass_block, 1);
+	fputs("},", m);
+	if (sm && sm->have) {
+		fprintf(m, "\"smart\":{\"health\":\"");
+		json_escape(m, sm->health);
+		fprintf(m, "\",\"power_on_hours\":%lld,\"reallocated\":%lld,"
+			"\"pending\":%lld,\"offline_uncorrectable\":%lld,"
+			"\"reported_uncorrectable\":%lld,\"grown_defects\":%lld,"
+			"\"temperature_c\":%lld},", sm->power_on_hours,
+			sm->realloc_ct, sm->pending, sm->offline_uncorr,
+			sm->reported_uncorr, sm->grown, sm->temp_c);
+	}
+	fprintf(m, "\"verdict\":\"%s\",\"verdict_reason\":\"",
+		v == 0 ? "healthy" : v == 1 ? "suspect" : "failing");
+	json_escape(m, why);
+	fputs("\",", m);
+	hist_blocks(m, c, p->nfind);
+	fputs(",\"slow_regions\":[", m);
+	for (i = p->nskip, first = 1; i < c->nskip; i++, first = 0)
+		fprintf(m, "%s{\"offset\":%" PRIu64 ",\"length\":%" PRIu64
+			",\"unread\":%" PRIu64 "}", first ? "" : ",",
+			c->skips[i].off, c->skips[i].len, c->skips[i].unread);
+	fputs("]}\n", m);
+	if (fclose(m) != 0 || !buf) {
+		free(buf);
+		return;
+	}
+	fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+	if (fd < 0) {
+		msg(PROG ": cannot write the drive history %s: %s\n", path,
+		    strerror(errno));
+		free(buf);
+		return;
+	}
+	while (done < len) {
+		ssize_t w = write(fd, buf + done, len - done);
+
+		if (w < 0 && errno == EINTR)
+			continue;
+		if (w <= 0)
+			break;
+		done += (size_t)w;
+	}
+	fsync(fd);
+	close(fd);
+	free(buf);
+}
+
 static void write_csv(ctx_t *c, const char *path)
 {
 	FILE *f = fopen(path, "we");
@@ -8623,7 +8993,7 @@ static int scan_device(device_t *d, const opts_t *o, const char *json_path,
 	uint64_t slow_off = 0, slow_was = 0, slow_now = 0;
 	calib_t cal;
 	const char *why;
-	int v;
+	int v, passes = 1;
 	int save_la;
 
 	memset(&c, 0, sizeof(c));
@@ -8994,6 +9364,7 @@ static int scan_device(device_t *d, const opts_t *o, const char *json_path,
 	c.t_start_us = now_us();
 	c.bytes_at_start = c.bytes_done;
 	c.rate_floor = rate_floor_of(&c, o->min_rate);
+	hist_begin(&c);
 	scan_loop(&c, c.mode == MODE_CHECK);
 
 	g_hide_next = 0;
@@ -9012,6 +9383,17 @@ static int scan_device(device_t *d, const opts_t *o, const char *json_path,
 		    "and verified instead\n");
 		g_hide_next = 1;
 	} else if (c.second_pass && c.mode == MODE_WRITE && !g_stop) {
+		smart_t mid;
+
+		/* the first pass is over: it goes into the history now, with
+		 * the drive's counters as they stand between the two */
+		memset(&mid, 0, sizeof(mid));
+		if (!o->no_smart)
+			smart_read(d, &mid);
+		hist_append(&c, o->profile, o->resume, 1, !c.abort_reason[0],
+			    &mid);
+		hist_begin(&c);
+		passes = 2;
 		out("\n  second pass: re-reading and verifying the pattern\n");
 		c.pos = c.start;
 		c.step = 0;
@@ -9058,6 +9440,10 @@ static int scan_device(device_t *d, const opts_t *o, const char *json_path,
 	c.fd = -1;
 	kmsg_close(&c);
 
+	/* last, so its verdict is the one the report is about to give */
+	hist_append(&c, o->profile, o->resume && passes == 1, passes,
+		    !g_stop && !c.abort_reason[0],
+		    o->no_smart ? NULL : &c.smart_after);
 	report(&c);
 	if (json_path)
 		write_json(&c, json_path);
@@ -13949,9 +14335,17 @@ static int map_target(const char *path, const char *over, device_t *d)
 static int rescan_target(const char *name, const char *over, device_t *d)
 {
 	char link[PATH_MAX];
+	device_t u;
 
 	snprintf(link, sizeof(link), "/dev/mapper/%s", name);
-	return map_target(link, over, d);
+	if (map_target(link, over, d) < 0)
+		return -1;
+	/* its passes go into the history of the drive underneath */
+	if (resolve_target(over, &u) == 0) {
+		dev_uid(&u, d->uid, sizeof(d->uid));
+		snprintf(d->over, sizeof(d->over), "%s", u.name);
+	}
+	return 0;
 }
 
 /*
@@ -14798,6 +15192,9 @@ static int map_job(run_t *r, const job_t *raw, device_t *slot, job_t *jb,
 		return -1;
 	if (map_target(x.map, raw->dev->name, slot) < 0)
 		return -1;
+	/* its passes go into the history of the drive underneath */
+	dev_uid(raw->dev, slot->uid, sizeof(slot->uid));
+	snprintf(slot->over, sizeof(slot->over), "%s", raw->dev->name);
 	job_init(jb, r, slot, o->outdir, 0);
 	r->njobs++;
 	run_put(r);

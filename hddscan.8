@@ -1037,6 +1037,30 @@ when not running as root, or wherever
 .B \-\-state\-dir
 says. The records are plain key-and-value text, rewritten through a temporary
 file and renamed, so reading one with grep while a scan is running is safe.
+.TP
+.I /var/lib/hddscan/drives/<model>_<serial>.jsonl
+The drive's history, one file per drive however many runs touch it, and the
+same state directory. A line of JSON is appended after every pass, a
+predeploy run's write pass and its re-read each getting their own: when and in
+which run, the mode and the pass, whether it finished, what it covered and how
+fast, that pass's own counters and read, write and sector latency, the drive's
+SMART counters as it ended, the verdict as it stood, every bad, weak and
+corrupt block it found, merged into ranges of one kind with byte offset, LBA
+and the slowest read in each, and every region
+.B \-\-skip\-slow
+condemned. A stopped pass is written too, marked as not complete. A map's
+test goes into the file of the drive underneath, marked as a map. An image is
+named by its whole path, and a drive with no serial by its kernel name, which
+says so. Read it with
+.BR jq ;
+for example, every weak range of every pass:
+.RS
+.EX
+jq \-c '.blocks[] | select(.kind == "weak")' \fIfile\fP
+.EE
+.RE
+.IP
+Nothing prunes it.
 .SH DEPENDENCIES
 hddscan links nothing beyond libc, so the binary works on a rescue system with
 no packages installed. The following are shelled out to when present and done

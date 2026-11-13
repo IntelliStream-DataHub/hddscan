@@ -868,6 +868,51 @@ assert_has "the repair profile (predeploy now) skips slow regions" "$out" \
 assert_has "the verify pass leaves the unwritten region alone" "$out" \
 	"sectors with wrong data              0"
 
+echo "== the drive history: one line per pass, per drive =="
+
+# The history is the drive's, not the run's: one file named by the drive,
+# a line appended after every pass with what that pass alone found.  Images
+# are named by their whole path; real drives by model and serial.
+f=$(image 16 hist.bin)
+out=$(runp --confirm "$f" "$f")
+hf=$(ls "$HDDSCAN_STATE_DIR"/drives/*hist.bin.jsonl 2>/dev/null)
+assert_has "the report says where the drive's history is" "$out" \
+	"History          $hf"
+assert_eq "a predeploy run writes a line for each of its two passes" \
+	"$(wc -l < "$hf" 2>/dev/null)" "2"
+hist_field() {	# FILE LINE EXPR -> the value, via python's json
+	python3 - "$1" "$2" "$3" <<'PY'
+import json, sys
+line = open(sys.argv[1]).read().splitlines()[int(sys.argv[2]) - 1]
+d = json.loads(line)
+print(eval(sys.argv[3], {}, {"d": d}))
+PY
+}
+assert_eq "every line is JSON, and the first is pass 1" \
+	"$(hist_field "$hf" 1 "d['pass'], d['mode'], d['target']")" \
+	"(1, 'write', 'drive')"
+assert_eq "the second is the re-read" "$(hist_field "$hf" 2 "d['pass']")" "2"
+assert_eq "a pass counts its own reads, not the scan's" \
+	"$(hist_field "$hf" 2 "d['counts']['chunks'], d['counts']['writes']")" \
+	"(16, 0)"
+assert_eq "both passes covered the drive" \
+	"$(hist_field "$hf" 2 "d['bytes'], d['complete']")" "(16777216, True)"
+# corruption at known offsets: the blocks are exact, LBAs included, and the
+# count is the report's (a chunk counts its first wrong block)
+printf 'BADBADBAD' | dd of="$f" bs=1 seek=8388608 conv=notrunc status=none
+printf 'ZZZZ' | dd of="$f" bs=1 seek=12582912 conv=notrunc status=none
+out=$(runp --profile decay "$f")
+assert_eq "the next run appends rather than starting again" \
+	"$(wc -l < "$hf")" "3"
+assert_eq "the pass's blocks are where the damage is" \
+	"$(hist_field "$hf" 3 "[(b['offset'], b['lba'], b['kind']) for b in d['blocks']]")" \
+	"[(8388608, 16384, 'corrupt'), (12582912, 24576, 'corrupt')]"
+assert_eq "and the line's verdict and counts are the report's" \
+	"$(hist_field "$hf" 3 "d['verdict'], d['counts']['corrupt']")" \
+	"('failing', 2)"
+assert_has "which says the same" "$out" "sectors with wrong data              2"
+rm -f "$f"
+
 echo "== --hide-and-rescan: the second pass goes through the map =="
 
 # An image cannot be activated without a loop device, so HDDSCAN_MAP_IMAGE
@@ -900,6 +945,11 @@ assert_hasnt "and no second pass of its own: it is the drive's" "$mrep" \
 assert_has "the run grew a row for it" "$out" "2 drives"
 assert_eq "both jobs ran to the end" \
 	"$(grep -l '^state 2' "$rd"/*.job | wc -l)" "2"
+h=$(grep -l '"device":"[^"]*/hr.bin"' "$HDDSCAN_STATE_DIR"/drives/*.jsonl)
+assert_has "the map's pass goes into the drive's own history" \
+	"$(cat "$h" 2>/dev/null)" '"target":"map","device":"'"$m"'","over":"'
+assert_has "with the region the drive's pass condemned" \
+	"$(head -1 "$h" 2>/dev/null)" '"slow_regions":[{"offset":'
 
 # no damage: nothing to hide, so the drive gets its re-read
 f=$(image 16 hrclean.bin)
@@ -1176,6 +1226,12 @@ else
 		bad "a stopped drive still wrote its report" \
 			"no $TMP/hddscan-sp1.bin.txt"
 	fi
+	# and its history has the pass it was in, saying it did not finish:
+	# a line claiming a pass covered a drive it stopped part way through
+	# is the same lie as a HEALTHY over 3% of one
+	h=$(ls "$HDDSCAN_STATE_DIR"/drives/*sp1.bin.jsonl 2>/dev/null)
+	assert_has "a stopped pass is in the drive history" \
+		"$(tail -1 "$h" 2>/dev/null)" '"pass":1,"complete":false'
 	# Each drive gets its own checkpoint inside the run.  One --state path
 	# shared by a whole parallel run had every worker overwriting the
 	# others, so nothing could be resumed.

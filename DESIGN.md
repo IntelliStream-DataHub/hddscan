@@ -1178,6 +1178,22 @@ checkpoint, and a `log` for anything the run had to say. All of it is plain
 key-and-value text, rewritten whole through a temporary file and `rename(2)`,
 so a reader never sees half a record and `grep` is a perfectly good client.
 
+**The drive history.** Beside the runs, `drives/<model>_<serial>.jsonl` belongs
+to the drive rather than to any run: a report is named after a device, and sdb
+today is sdc after a reboot. After every pass a line of JSON is appended with
+what that pass alone found — its counters and latency (a shadow histogram fed
+alongside the scan's own, reset as each pass starts, so the report's totals
+are untouched), the drive's SMART counters as it ended, the verdict as it
+stood, and every bad, weak and corrupt block, merged into ranges of one kind so
+a drive with a million weak sectors in a few bands stays a few thousand
+entries. Following one drive's decay over months is then one `jq` away, with
+no run directory needed. A line is built in memory and written whole with
+`O_APPEND`, then synced, so a crash leaves the file ending at the last complete
+pass. The last line of a scan is written after everything the verdict depends
+on is known, so it gives the report's verdict, never an earlier guess. A
+stopped pass is written as not complete, and a map's test goes into the file
+of the drive under it.
+
 **One writer per record.** The worker that holds a drive is the only thing that
 writes that drive's record; the supervisor patches in only how the worker
 ended, by reading the record and writing it back. Progress is therefore never

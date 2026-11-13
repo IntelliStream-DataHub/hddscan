@@ -443,6 +443,13 @@ Two more things that follow from the store, both easy to get wrong:
   asks the store, because `O_EXCL` only covers the drive a worker currently
   holds open — not one sitting twenty-ninth in a queue — and two runs on one
   spindle time each other's seeks.
+- **The drive history is append-only and per pass.** `hist_begin()` snapshots
+  the counters and resets the pass's shadow histograms; `hist_append()`
+  writes what changed since. The last line is written after `spares_exhausted`
+  and the kernel log are settled, just before `report()`, so its verdict is
+  the report's -- the report-must-not-contradict-itself rule extends to it.
+  A pass's blocks are `find[ps.nfind..]`; adding a finding anywhere else
+  than at the end of that array would put it in the wrong pass.
 - **Composing store paths needs `STORE_MAX`, not `PATH_MAX`.** A run directory
   is root + id + slug; three `PATH_MAX` parts cannot live in a `PATH_MAX`
   buffer, and `-Wformat-truncation` (part of `-Wformat=2`, which must stay

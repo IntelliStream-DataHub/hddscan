@@ -406,6 +406,7 @@ Removing it can recover real capacity: on one 14 TB Seagate it gave back
 		<tr><td><code>--badblocks-list</code></td><td>Bad sectors in <code>badblocks(8)</code> format, ready for <code>mkfs -l</code></td></tr>
 		<tr><td><code>--prometheus</code></td><td>Metrics for node_exporter's textfile collector</td></tr>
 		<tr><td><code>/var/lib/hddscan/runs/</code></td><td>Run records and a checkpoint per drive, which <code>--badblocks-from</code> and <code>--hide-bad</code> read</td></tr>
+		<tr><td><code>/var/lib/hddscan/drives/</code></td><td>Each drive's history, named by model and serial: a JSON line per pass with its counters, latency, SMART counters, verdict and every bad, weak and corrupt block, LBAs included. Never pruned</td></tr>
 	</tbody>
 </table></div>
 

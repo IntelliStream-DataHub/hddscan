@@ -106,6 +106,13 @@ pass over the new device, which is what `--rescan` does on the command line.
 If that pass finds more damage, hiding it again adds it to the same map rather
 than stacking a second one on top. See `DESIGN.md` for how the map works.
 
+Every pass also leaves a line in the drive's own history,
+`/var/lib/hddscan/drives/<model>_<serial>.jsonl`, whichever run it was in and
+whatever the drive is called today: that pass's counters, latency and SMART
+counters, its verdict, and every bad, weak and corrupt block it found, with
+LBAs. `jq -c '.blocks[] | select(.kind == "weak")'` lists the weak ranges of
+every pass the drive has had.
+
 A drive going into service can have both done as part of its predeploy run:
 `--hide-and-rescan`, or **If damage is found → hide it** on the form. If the
 write pass finds damage, bad, weak or skipped, the second pass is a write and
