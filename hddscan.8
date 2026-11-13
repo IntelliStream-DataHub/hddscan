@@ -728,6 +728,38 @@ doing this after hiding a drive's damage, and does nothing unless the answer
 is yes. An image file gets its map written but no
 device, so there is nothing to rescan.
 .TP
+.B \-\-hide\-and\-rescan
+Both of the above, as part of a write pass, without waiting for a person
+between them. When the first pass has covered the whole drive and found
+damage of any kind \(em unreadable, weak, wrong data, or a region
+.B \-\-skip\-slow
+condemned \(em the raw drive is not re-read. Its report is written as usual,
+then its damage is hidden from that scan's own checkpoint, and the second
+pass becomes a write and verify of
+.IR /dev/mapper/bb\-<serial> ,
+started straight away as a job of its own in the same run, with its own
+record, report and row on the dashboard. That job has no second pass of its
+own, so a damaged drive still costs two sweeps, and the second one tests the
+device that will actually hold data. A drive with no damage gets its re-read
+as usual.
+.IP
+Needs
+.BI \-\-mode " write"
+over the whole drive, which rules out
+.BR \-\-start ,
+.B \-\-end
+and
+.BR \-\-sample ,
+and root, since the map is activated with device-mapper. It always runs as a
+run, so one drive at a time is
+.B \-\-max\-parallel 1
+rather than
+.BR \-\-sequential .
+If the map cannot be made (a drive that already carries one, or damage where
+the map itself would live), the drive's report says why, and that no second
+pass ran. The form offers it as
+.BR "If damage is found" .
+.TP
 .BI \-\-badblocks\-blocksize " N"
 Unit for that list. Default 1024. Use the block size the filesystem will be
 made with, usually 4096.

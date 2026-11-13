@@ -482,6 +482,15 @@ and `msg()`. Five rules:
 The kernel side (`activate`, a live `remap`, the boot unit) needs root and
 has not been run. Say so rather than implying otherwise.
 
+`--hide-and-rescan` chains the two inside a run: the drive's worker hides its
+damage once the write pass is done, and the supervisor adds a job for the map.
+The rules above hold inside it -- the list comes from that scan's own
+checkpoint, judged by `ckpt_whole()` -- and two more keep it honest. The hide
+runs in a forked child with the restore list disarmed, because `dmbb_die()`
+exits and must not take the drive's verdict or the run's settings with it.
+And the map's test is a job of its own, with its own record and report, never
+a second scan written into the drive's record (invariant 12).
+
 **11. `--format` is not a scan mode and must not become one.** FORMAT UNIT
 erases the drive, runs for hours and cannot be undone, so it dispatches before
 the scan path entirely rather than joining `scan_mode_t`. It keeps three
@@ -534,6 +543,12 @@ and the address taken from sysfs, both of which need root and a real drive.
 a before and an after report so counters can be seen to move. It proves the
 parser and the verdict, not smartmontools' real layout on real drives -- that
 is still what the captured fixtures are for.
+
+`HDDSCAN_MAP_IMAGE` is the device-mapper equivalent: when `--hide-and-rescan`
+has written a map onto an image, which nothing can activate without a loop
+device and root, the file it names stands in for `/dev/mapper/bb-*` and is
+what the run tests next. Everything up to the kernel is real. Keep any
+`HDDSCAN_SLOW` range clear of the stand-in's size, or it slows that too.
 
 ## When reporting results
 

@@ -1007,6 +1007,66 @@ def main():
         s.pump(1.0)
         s.close()
 
+        print("== hiding the damage, then testing the rest ==")
+
+        # A choice on the form, made before the run: the run has no terminal
+        # to ask on once the first pass is done.  The image is sparse and
+        # slow in its middle, so the write pass condemns a region and the
+        # second pass becomes a test of the map.  HDDSCAN_MAP_IMAGE stands
+        # in for the device the kernel would have made; see cli.sh.
+        hd = os.path.join(tmp, "hide.bin")
+        hm = os.path.join(tmp, "hidemap.bin")
+        for p, size in ((hd, 1300 << 20), (hm, 128 << 20)):
+            with open(p, "wb") as f:
+                f.truncate(size)
+        env = {"HDDSCAN_MAP_IMAGE": hm, "HDDSCAN_SLOW": "400M:600M",
+               "HDDSCAN_SLOW_MS": "5000"}
+        os.environ.update(env)
+        try:
+            s = Session(["-i", "--no-color", "--outdir", tmp,
+                         "--chunk-slow-ms", "1000", "--retries", "1", hd],
+                        rows=24, cols=80, open="scan")
+        finally:
+            for k in env:
+                del os.environ[k]
+        s.wait(lambda: s.on_screen("Profile"), 6.0)
+        check("the form offers hiding the damage, at 24x80",
+              s.set_choice("If damage is found", "hide it"),
+              "value %r" % s.value_of("If damage is found"))
+        s.send(b"s", 0.5)
+        s.wait(lambda: s.on_screen("press y"), 3.0)
+        s.send(b"y", 0.5)
+        check("the run reaches its summary",
+              s.wait(lambda: s.on_screen("finished"), 90.0))
+        check("with a row for the map's own test",
+              s.on_screen("hidemap"),
+              "\n".join(l for l in s.screen.lines() if l.strip()))
+        s.send(b"q", 0.5)
+        s.pump(1.0)
+        s.close()
+        rd = os.path.join(STATE, "runs")
+        runs = sorted((os.path.join(rd, r) for r in os.listdir(rd)),
+                      key=os.path.getmtime)
+        job = os.path.join(runs[-1], "hide.bin.job")
+        job = open(job).read() if os.path.exists(job) else ""
+        check("the drive's record names the map it made",
+              ("map " + hm) in job, job)
+
+        # the command line refuses it without a write pass; the form must
+        # not hand it one, or the run dies after the form instead of reading
+        hr = img(tmp, "hideread.bin", 8)
+        s = Session(["-i", "--no-color", "--outdir", tmp, hr], open="scan")
+        s.wait(lambda: s.on_screen("Profile"), 6.0)
+        s.set_choice("If damage is found", "hide it")
+        s.set_choice("Mode", "read")
+        s.send(b"s", 0.5)
+        check("a read pass with 'hide it' chosen still runs",
+              s.wait(lambda: s.on_screen("finished"), 30.0),
+              "\n".join(l for l in s.screen.lines() if l.strip()))
+        s.send(b"q", 0.5)
+        s.pump(1.0)
+        s.close()
+
         print("== format against a real drive (opt in) ==")
 
         real = os.environ.get("HDDSCAN_TEST_DEVICE")

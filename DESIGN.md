@@ -435,6 +435,29 @@ map and read back through it. That proves the surviving surface is sound and
 that the map puts every byte back where it will be found. No drive setting is
 touched, because the device is a map.
 
+`--hide-and-rescan` (the form's **If damage is found → hide it**) does both
+inside a write pass, without a person in between. Once the first pass has
+covered the whole drive and found damage of any kind, the raw drive is not
+re-read: a day spent confirming damage the map is about to cut out says
+nothing about the device that will hold data. The drive's report is written,
+then the process that owned the drive hides the damage from that scan's own
+checkpoint, judged whole by the same test `--hide-bad` uses. The supervisor
+adds a job to the run for `/dev/mapper/bb-*` and starts it in the slot the
+drive just left. It is a write and verify with no second pass of its own,
+because it *is* the drive's second pass, so a damaged drive still costs two
+sweeps. A drive with no damage gets its re-read as usual.
+
+It is a choice made before the run, not a question asked after the first
+pass, because the run belongs to a supervisor with no terminal (invariant 12).
+A drive waiting for somebody to look at a screen would be idle for however
+long that took. The map's test is a job of its own, with its own record,
+report and row, because one process writing one record is what lets every
+viewer trust it. The hide runs in a child of the drive's worker with the
+run's restore list disarmed, because the map code exits on whatever it
+refuses, and that must cost the hide, not the drive's recorded verdict or the
+run's drive settings. When the map cannot be made, the drive's report says why
+and says plainly that no second pass ran.
+
 ### The budget follows the platter
 
 A disk spins at a fixed rate, so an outer track sweeps further per revolution
@@ -1323,7 +1346,10 @@ MIT. See [LICENSE](LICENSE). Copyright (c) 2026 Olav Gjerde.
 **The device-mapper side of `hddscan dm` has not been run.** Activating a map,
 remapping on a live device (suspend, reload, resume, and putting the old map
 back when a reload fails), the boot unit, and `--rescan` of an activated
-device all need root. The suite proves
+device all need root, and so does `--hide-and-rescan` activating the map it
+writes. The suite reaches the rest of that chain with `HDDSCAN_MAP_IMAGE`, a
+file standing in for the activated device: the decision, the map written onto
+the image, the record, the job the supervisor adds and the scan of it. The suite proves
 the table arithmetic and that data survives a remap by applying each table
 with `dd`, not the kernel.
 

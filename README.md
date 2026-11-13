@@ -106,6 +106,13 @@ pass over the new device, which is what `--rescan` does on the command line.
 If that pass finds more damage, hiding it again adds it to the same map rather
 than stacking a second one on top. See `DESIGN.md` for how the map works.
 
+A drive going into service can have both done as part of its predeploy run:
+`--hide-and-rescan`, or **If damage is found → hide it** on the form. If the
+write pass finds damage, bad, weak or skipped, the second pass is a write and
+verify of the device with that damage cut out, run as a job of its own,
+instead of a re-read of the raw drive. A drive with no damage is re-read as
+usual. It needs root, since the map is activated with device-mapper.
+
 ## Runs keep going without you
 
 A scan or a format is a **run**, and it belongs to a supervisor process of its

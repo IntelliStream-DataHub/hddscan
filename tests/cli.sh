@@ -868,6 +868,86 @@ assert_has "the repair profile (predeploy now) skips slow regions" "$out" \
 assert_has "the verify pass leaves the unwritten region alone" "$out" \
 	"sectors with wrong data              0"
 
+echo "== --hide-and-rescan: the second pass goes through the map =="
+
+# An image cannot be activated without a loop device, so HDDSCAN_MAP_IMAGE
+# stands in for /dev/mapper/bb-*: everything up to the kernel is real -- the
+# decision, the map written onto the image, the record the supervisor reads,
+# the job it adds and the scan of that job.  The slow range starts past the
+# end of the stand-in, which would otherwise be slowed by it too.
+f=$(slowimg hr.bin 1300M)
+m=$(slowimg hrmap.bin 128M)
+out=$(HDDSCAN_MAP_IMAGE="$m" HDDSCAN_SLOW=400M:600M HDDSCAN_SLOW_MS=5000 \
+	runp --chunk-slow-ms 1000 --retries 1 --hide-and-rescan \
+	--confirm "$f" "$f")
+rid=$(ls -t "$HDDSCAN_STATE_DIR/runs" | head -1)
+rd=$HDDSCAN_STATE_DIR/runs/$rid
+rep=$(cat "$TMP/hddscan-hr.bin.txt" 2>/dev/null)
+assert_has "a damaged drive is not re-read" "$rep" \
+	"second pass: not over this drive"
+assert_hasnt "and runs no re-read of its own" "$rep" \
+	"second pass: re-reading"
+assert_has "its damage is hidden from this scan's own checkpoint" "$rep" \
+	"created map"
+assert_has "its record names the device to test next" \
+	"$(cat "$rd/hr.bin.job")" "map $m"
+mrep=$(cat "$TMP/hddscan-hrmap.bin.txt" 2>/dev/null)
+assert_has "the map is tested as a job of its own" "$mrep" \
+	"hrmap.bin over"
+assert_has "with a write and verify" "$mrep" "destructive write + verify"
+assert_hasnt "and no second pass of its own: it is the drive's" "$mrep" \
+	"second pass"
+assert_has "the run grew a row for it" "$out" "2 drives"
+assert_eq "both jobs ran to the end" \
+	"$(grep -l '^state 2' "$rd"/*.job | wc -l)" "2"
+
+# no damage: nothing to hide, so the drive gets its re-read
+f=$(image 16 hrclean.bin)
+out=$(HDDSCAN_MAP_IMAGE="$m" runp --hide-and-rescan --confirm "$f" "$f")
+rep=$(cat "$TMP/hddscan-hrclean.bin.txt" 2>/dev/null)
+assert_has "a clean drive keeps its re-read" "$rep" "second pass: re-reading"
+assert_hasnt "and nothing is hidden on it" "$rep" "hiding the damage"
+
+assert_eq "the run log says each thing once" \
+	"$(grep -c 'Applying settings' "$rd/log")" "1"
+
+# damage where the map itself would live: the map code refuses, and the
+# report has to say that no second pass ran either, or the drive looks
+# re-read when it was not
+f=$(slowimg hrend.bin 1300M)
+out=$(HDDSCAN_MAP_IMAGE="$m" HDDSCAN_SLOW=600M:1G HDDSCAN_SLOW_MS=5000 \
+	runp --chunk-slow-ms 1000 --retries 1 --hide-and-rescan \
+	--confirm "$f" "$f")
+rep=$(cat "$TMP/hddscan-hrend.bin.txt" 2>/dev/null)
+assert_has "a map that cannot be made says why" "$rep" "first or last"
+assert_has "and that no second pass ran" "$rep" \
+	"pass ran over the drive either"
+rid=$(ls -t "$HDDSCAN_STATE_DIR/runs" | head -1)
+assert_eq "and no job is added for a device that is not there" \
+	"$(ls "$HDDSCAN_STATE_DIR/runs/$rid"/*.job | wc -l)" "1"
+
+# an image with nothing to activate stops at the map, and says so
+f=$(slowimg hrimg.bin 1300M)
+out=$(HDDSCAN_SLOW=400M:600M HDDSCAN_SLOW_MS=5000 runp --chunk-slow-ms 1000 \
+	--retries 1 --hide-and-rescan --confirm "$f" "$f")
+rid=$(ls -t "$HDDSCAN_STATE_DIR/runs" | head -1)
+assert_has "an image gets its map and no device" \
+	"$(cat "$TMP/hddscan-hrimg.bin.txt" 2>/dev/null)" \
+	"activating it needs a loop device"
+assert_has "and its record says so" \
+	"$(cat "$HDDSCAN_STATE_DIR/runs/$rid/hrimg.bin.job")" \
+	"note map written on the image"
+
+assert_has "--hide-and-rescan needs a write pass" \
+	"$(runp --hide-and-rescan --mode read "$f" 2>&1)" "needs --mode write"
+assert_has "over the whole drive" \
+	"$(runp --hide-and-rescan --sample 4 --confirm "$f" "$f" 2>&1)" \
+	"needs the whole drive"
+assert_has "and runs as a run" \
+	"$(runp --hide-and-rescan --sequential --confirm "$f" "$f" 2>&1)" \
+	"--max-parallel 1"
+rm -f "$TMP"/hr*.bin "$TMP"/hddscan-hr*
+
 echo "== what the kernel logged against the drive =="
 
 # A drive that stops answering is aborted, reset and retried by the kernel,

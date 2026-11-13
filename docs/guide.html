@@ -334,6 +334,12 @@ finished. A list from a sampled or interrupted scan would hide the damage it
 happened to look at and leave the rest in the middle of the new device. The
 drive is found by serial, since <code>sdc</code> may be <code>sdd</code> after
 a reboot.</p>
+<p>A drive going into service can have it done as part of its predeploy run:
+<code>--hide-and-rescan</code>, or <b>If damage is found → hide it</b> on the
+form. If the write pass finds damage, bad, weak or skipped, the second pass is
+a write and verify of the device with that damage cut out, run as a job of its
+own with its own row on the dashboard, instead of a re-read of the raw drive. A
+drive with no damage is re-read as usual.</p>
 <figure class="shot">
 	<img src="img/cli-dm.svg" width="862" height="473" loading="lazy"
 	     alt="hddscan dm create on a 12.7 TiB image with four bad extents skipped and 13,348 spares; a later remap moving one extent to the nearest spare; the status afterwards; the first lines of the device-mapper table.">
@@ -653,6 +659,8 @@ mode: <a href="#opt-mode"><code>--mode</code></a> read on predeploy saves nothin
 <dd>write a map of the damage the last finished whole-drive scan found onto the drive, and activate /dev/mapper/bb-&lt;serial&gt;: the same drive with the damage cut out, for any filesystem (see &#x27;dm&#x27; below). Whatever is on the drive becomes unreachable, so it needs <a href="#opt-confirm"><code>--confirm</code></a> like a write.  Given a bb- device it made, it adds that device&#x27;s scan to the map already on the drive (a remap, which keeps the data) instead of putting a second map on top</dd>
 <dt id="opt-rescan"><code>--rescan</code></dt>
 <dd>with <a href="#opt-hide-bad"><code>--hide-bad</code></a>, then write and verify every sector of the new device: proves what is left is sound and that data written through the map reads back.  The form asks before doing this after hiding</dd>
+<dt id="opt-hide-and-rescan"><code>--hide-and-rescan</code></dt>
+<dd>both, as part of a write pass: if it finds damage anywhere -- bad, weak or skipped -- hide it straight away and make the second pass a write and verify of /dev/mapper/bb-&lt;serial&gt;, as a job of its own in the run, instead of a re-read of the raw drive.  A drive with no damage gets its re-read as usual.  Needs <a href="#opt-mode"><code>--mode</code></a> write over the whole drive, and root</dd>
 <dt id="opt-prometheus"><code>--prometheus FILE</code></dt>
 <dd>write metrics for node_exporter&#x27;s textfile collector</dd>
 <dt id="opt-journal"><code>--journal FILE</code></dt>

@@ -462,6 +462,12 @@ typedef struct {
 	int lat_idle;           /* no read at all finished inside the window */
 	char report[PATH_MAX];
 	char note[160];         /* the last thing this job had to say */
+	/*
+	 * --hide-and-rescan: the device this drive's damage was hidden
+	 * behind, for the supervisor to test next.  The worker that owned the
+	 * drive writes it; the supervisor only reads it.
+	 */
+	char map[PATH_MAX];
 } jrec_t;
 
 typedef struct {
@@ -680,6 +686,8 @@ static void jrec_put(const jrec_t *j)
 		fprintf(f, "report %s\n", j->report);
 	if (j->note[0])
 		fprintf(f, "note %s\n", j->note);
+	if (j->map[0])
+		fprintf(f, "map %s\n", j->map);
 	fclose(f);
 	rename(tmp, j->file);
 }
@@ -723,6 +731,7 @@ static int jrec_get(const char *path, jrec_t *j)
 		JSTR("serial", j->serial)
 		JSTR("report", j->report)
 		JSTR("note", j->note)
+		JSTR("map", j->map)
 #undef JSTR
 		if (!strcmp(k, "size"))
 			j->size = strtoull(v, NULL, 10);
@@ -7995,6 +8004,8 @@ typedef struct {
 	int fix_config_set;     /* named on the command line, either way */
 	int hide_bad;           /* hand the last scan's damage to dm-badblocks */
 	int rescan;             /* and then test the device that made */
+	int hide_rescan;        /* --hide-and-rescan: the second pass goes
+				 * through a map of what the first found */
 	int rescan_ok;          /* the targets are what --hide-bad just made:
 				 * its --confirm covered writing to them */
 	int apply_only;         /* apply the settings and stop, do not scan */
@@ -8444,6 +8455,13 @@ static void usage(void)
 "                         of the new device: proves what is left is sound and\n"
 "                         that data written through the map reads back.  The\n"
 "                         form asks before doing this after hiding\n"
+"  --hide-and-rescan      both, as part of a write pass: if it finds damage\n"
+"                         anywhere -- bad, weak or skipped -- hide it straight\n"
+"                         away and make the second pass a write and verify of\n"
+"                         /dev/mapper/bb-<serial>, as a job of its own in the\n"
+"                         run, instead of a re-read of the raw drive.  A drive\n"
+"                         with no damage gets its re-read as usual.  Needs\n"
+"                         --mode write over the whole drive, and root\n"
 "  --prometheus FILE      write metrics for node_exporter's textfile collector\n"
 "  --journal FILE         crash journal for --mode verify: the original bytes\n"
 "                         are fsynced here before the pattern is written, so a\n"
@@ -8564,6 +8582,35 @@ static int open_device(device_t *d, scan_mode_t mode, int writable, int force,
 		fd = open(d->path, flags);
 	}
 	return fd;
+}
+
+/*
+ * --hide-and-rescan: set by scan_device() when the write pass is done, found
+ * damage and covered the whole drive, so the process that owns the drive
+ * hides that damage next instead of re-reading the raw drive.
+ */
+static int g_hide_next;
+
+/*
+ * Is what the first pass found a list --hide-bad would take?  The same
+ * test it applies to the checkpoint (invariant 15): the whole drive, start to
+ * end, not sampled, not cut short -- and something on it to hide.  Every
+ * finding that is not OK goes into the list, weak sectors included, and so
+ * does every region --skip-slow condemned.
+ */
+static int hide_ready(const ctx_t *c)
+{
+	int i;
+
+	if (c->start || c->end != c->dev->size || c->sample > 1 ||
+	    c->abort_reason[0])
+		return 0;
+	if (c->nskip)
+		return 1;
+	for (i = 0; i < c->nfind; i++)
+		if (c->find[i].status != ST_OK)
+			return 1;
+	return 0;
 }
 
 static int scan_device(device_t *d, const opts_t *o, const char *json_path,
@@ -8949,7 +8996,22 @@ static int scan_device(device_t *d, const opts_t *o, const char *json_path,
 	c.rate_floor = rate_floor_of(&c, o->min_rate);
 	scan_loop(&c, c.mode == MODE_CHECK);
 
-	if (c.second_pass && c.mode == MODE_WRITE && !g_stop) {
+	g_hide_next = 0;
+	if (o->hide_rescan && c.mode == MODE_WRITE && !g_stop &&
+	    hide_ready(&c)) {
+		/*
+		 * The re-read would spend a day confirming damage the map is
+		 * about to cut out, and say nothing about the device that
+		 * will actually hold data.  Writing and verifying that device
+		 * is the second pass worth having: it proves the map puts
+		 * every byte where it is found again, over exactly the
+		 * surface that is left.
+		 */
+		out("\n  second pass: not over this drive.  Its damage is "
+		    "hidden next, and the\n  device that leaves is written "
+		    "and verified instead\n");
+		g_hide_next = 1;
+	} else if (c.second_pass && c.mode == MODE_WRITE && !g_stop) {
 		out("\n  second pass: re-reading and verifying the pattern\n");
 		c.pos = c.start;
 		c.step = 0;
@@ -10174,6 +10236,10 @@ static int hide_bad(device_t *t, int n, const opts_t *o, mapname_t *made);
 static void hide_name(const device_t *d, char *name, size_t len);
 static int hide_under(const device_t *d, char *under, size_t ulen,
 		      char *name, size_t nlen);
+static int hide_after_scan(const device_t *d, const char *ckpt, char *next,
+			   size_t len);
+static int map_target(const char *path, const char *over, device_t *d);
+static void rescan_opts(opts_t *o);
 /* a device the summary just made, for the form to test next: --rescan */
 static mapname_t g_rescan;
 static char g_rescan_over[64];
@@ -10188,8 +10254,9 @@ static int summary_can_hide(const run_t *r, const jrec_t *x)
 {
 	char ck[STORE_MAX + 128];
 
+	/* --hide-and-rescan already did, and the map's own test is a row */
 	if (strcmp(r->kind, "scan") || x->state != JS_DONE ||
-	    !(x->bad + x->weak + x->skipped))
+	    !(x->bad + x->weak + x->skipped) || x->map[0])
 		return 0;
 	if (snprintf(ck, sizeof(ck), "%s/%s.ckpt", r->dir, x->slug) >=
 	    (int)sizeof(ck))
@@ -10979,6 +11046,7 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 	static const int fpi_v[] = { -1, 0, 1, 2 };
 	int fbs_sel = 0, fpi_sel = 0, ffast_sel = 0;
 	int skip_sel = o->skip_slow ? 1 : 0;
+	int hide_sel = o->hide_rescan ? 1 : 0;
 	int la_init = la_sel;   /* to tell "chose off" from "left at off" */
 	int in_was = -1;        /* Mode was the profile's own last time round */
 	long long retries = o->retries, segment_mb = (long long)(o->segment >> 20);
@@ -11014,6 +11082,15 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 	{ NULL, NULL, ON(A_SCAN), "Skip slow regions",
 	  "jump regions too slow to scan; they are condemned",
 	  0, 2, { "no", "yes" }, NULL, 0, 0, 0, &skip_sel },
+	/*
+	 * A choice made here, before the run, and not a question asked
+	 * after the first pass: the run belongs to a supervisor with no
+	 * terminal, and a drive waiting days for someone to look would be
+	 * the slowest scan there is.
+	 */
+	{ NULL, NULL, ON(A_SCAN), "If damage is found",
+	  "write mode: hide it, then test what is left",
+	  0, 2, { "re-read", "hide it" }, NULL, 0, 0, 0, &hide_sel },
 	{ NULL, NULL, ON(A_SCAN), "Retries per sector",
 	  "re-reads before judging a suspect sector",
 	  1, 0, { 0 }, &retries, 0, 1000, 5, NULL },
@@ -11591,6 +11668,9 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 				g_profiles[prof_sel].force_remap : 0;
 			o->second_pass = g_profiles[prof_sel].second_pass;
 			o->skip_slow = skip_sel;
+			/* only where the command line would take it */
+			o->hide_rescan = hide_sel && mode_sel < nmode &&
+				mode_v[mode_sel] == MODE_WRITE && sample <= 1;
 			/* moved off the profile's own value is a choice */
 			o->skip_slow_set =
 				skip_sel != g_profiles[prof_sel].skip_slow;
@@ -11680,6 +11760,8 @@ static void spawn_job(job_t *jobs, int n, int idx, const opts_t *o,
 	job_t *j = &jobs[idx];
 	pid_t pid;
 
+	/* a worker that flushes stdio must not write the log a second time */
+	fflush(NULL);
 	pid = fork();
 	if (pid < 0)
 		die("fork: %s", strerror(errno));
@@ -11739,6 +11821,36 @@ static void spawn_job(job_t *jobs, int n, int idx, const opts_t *o,
 				 derive_path(o->badblocks, j->dev->name, 1, bb, sizeof(bb)),
 				 derive_path(o->prometheus, j->dev->name, 1, pb,
 					     sizeof(pb)));
+		/*
+		 * Still the only process that has had the drive, and the one
+		 * whose report says what was done to it: so the hide happens
+		 * here, and the supervisor only learns where the device is.
+		 */
+		if (g_hide_next && st != 130) {
+			char next[PATH_MAX];
+			int hr;
+
+			snprintf(g_job.note, sizeof(g_job.note),
+				 "hiding the damage");
+			job_flush(JS_RUNNING);
+			hr = hide_after_scan(j->dev, wo.state, next,
+					     sizeof(next));
+			if (!hr) {
+				snprintf(g_job.map, sizeof(g_job.map), "%s",
+					 next);
+				snprintf(g_job.note, sizeof(g_job.note),
+					 "damage hidden; the rest is tested "
+					 "as %.100s", next);
+			} else if (hr > 0) {
+				snprintf(g_job.note, sizeof(g_job.note),
+					 "map written on the image; nothing "
+					 "activates it without a loop device");
+			} else {
+				snprintf(g_job.note, sizeof(g_job.note),
+					 "damage not hidden, and no second "
+					 "pass ran; see the report");
+			}
+		}
 		if (g_log)
 			fclose(g_log);
 		g_job.verdict = st;
@@ -13813,19 +13925,139 @@ static int hide_bad(device_t *t, int n, const opts_t *o, mapname_t *made)
  * found the damage.
  */
 
-static int rescan_target(const char *name, const char *over, device_t *d)
+/* the device at path, which is a map over the drive called over */
+static int map_target(const char *path, const char *over, device_t *d)
 {
-	char link[PATH_MAX], real[PATH_MAX];
+	char real[PATH_MAX];
+	const char *base = strrchr(path, '/');
+	struct stat sb;
 
-	snprintf(link, sizeof(link), "/dev/mapper/%s", name);
-	if (!realpath(link, real)) {
-		msg(PROG ": %s: %s; nothing to rescan\n", link, strerror(errno));
+	/* /dev/mapper/x is a link to the dm-N the kernel knows it by; an
+	 * image standing in for one keeps the name it was given */
+	if (!realpath(path, real)) {
+		msg(PROG ": %s: %s; nothing to rescan\n", path, strerror(errno));
 		return -1;
 	}
-	if (resolve_target(real, d) < 0)
+	if (resolve_target(!stat(real, &sb) && S_ISREG(sb.st_mode) ? path :
+			   real, d) < 0)
 		return -1;
-	snprintf(d->model, sizeof(d->model), "%.*s over %.*s", 38, name, 30,
-		 over);
+	snprintf(d->model, sizeof(d->model), "%.*s over %.*s", 38,
+		 base ? base + 1 : path, 30, over);
+	return 0;
+}
+
+static int rescan_target(const char *name, const char *over, device_t *d)
+{
+	char link[PATH_MAX];
+
+	snprintf(link, sizeof(link), "/dev/mapper/%s", name);
+	return map_target(link, over, d);
+}
+
+/*
+ * --hide-and-rescan: the write pass found damage, so the second pass is a
+ * write and verify of the device with that damage cut out rather than a
+ * re-read of the raw drive.  This makes the device.  It runs in the process
+ * that owned the drive for the scan, which has closed it by now: the map's
+ * writes and the table's claim on the drive both need it free, and nothing
+ * else may have it in between (invariant 5).
+ *
+ * The list is this scan's own checkpoint, judged whole the way --hide-bad
+ * judges any other (invariant 15).  The map code dies on whatever it refuses
+ * -- a drive that already has a map, damage where the map itself would
+ * live -- and that must cost the hide, not the verdict this process is about
+ * to record.  So it runs in a child, with the run's restore list disarmed
+ * there: the drive settings are the run's to put back when the run ends
+ * (invariant 12), not a child's to put back on its way out.  What it says
+ * goes into the drive's report.
+ *
+ * Fills next with the device to test and returns 0, or says why not and
+ * returns -1, or 1 for an image, where the map is written and nothing can
+ * activate it
+ * without a loop device.  HDDSCAN_MAP_IMAGE names a file the suite stands in
+ * for the activated map, which is the only way the rest of the chain can be
+ * reached without root.
+ */
+static int hide_after_scan(const device_t *d, const char *ckpt, char *next,
+			   size_t len)
+{
+	char list[STORE_MAX + 128], name[DMBB_NAME_MAX_LEN + 1];
+	const char *stand = getenv("HDDSCAN_MAP_IMAGE");
+	dmbb_opts_t dop;
+	pid_t pid;
+	int st = 0;
+
+	next[0] = 0;
+	if (!ckpt || !ckpt_whole(ckpt, d->size)) {
+		out("\n  %s: this scan's checkpoint does not cover the whole "
+		    "drive, so its list\n  could leave damage in the middle "
+		    "of the device; nothing was hidden\n", d->name);
+		return -1;
+	}
+	if (snprintf(list, sizeof(list), "%.*s.dmbb",
+		     (int)(strlen(ckpt) - 5), ckpt) >= (int)sizeof(list) ||
+	    badblocks_replay(ckpt, list, 4096, 0, 1))
+		return -1;
+	hide_name(d, name, sizeof(name));
+	memset(&dop, 0, sizeof(dop));
+	dop.dev = d->path;
+	dop.bad = list;
+	dop.bs = 4096;
+	dop.ext = hide_extent(list);
+	dop.reserve = DMBB_DEF_RESERVE;
+	dop.name = name;
+	dop.confirm = d->path;      /* the scan's own --confirm covered it */
+
+	out("\n  %s: hiding the damage this scan found behind "
+	    "/dev/mapper/%s\n", d->name, name);
+	fflush(NULL);
+	pid = fork();
+	if (pid < 0)
+		return -1;
+	if (!pid) {
+		g_nrestore = 0;
+		g_timeout_changed = 0;
+		g_la_changed = 0;
+		g_tty_raw = 0;
+		g_job_own = 0;
+		if (g_log) {
+			int fd = fileno(g_log);
+
+			dup2(fd, STDOUT_FILENO);
+			dup2(fd, STDERR_FILENO);
+			g_quiet = 1;
+		}
+		if (dmbb_cmd_create(&dop) != 0 ||
+		    (!d->is_file && dmbb_cmd_activate(&dop) != 0)) {
+			fflush(NULL);
+			_exit(2);
+		}
+		fflush(NULL);
+		_exit(0);
+	}
+	while (waitpid(pid, &st, 0) < 0 && errno == EINTR)
+		;
+	if (!WIFEXITED(st) || WEXITSTATUS(st)) {
+		out("\n  %s: the damage could not be hidden, for the reason "
+		    "above, and no second\n  pass ran over the drive either.  "
+		    "Once that is dealt with:\n    %s --hide-bad --rescan "
+		    "--confirm %s %s\n", d->name, PROG, d->name, d->path);
+		return -1;
+	}
+	if (d->is_file) {
+		if (!stand || !*stand) {
+			out("  %s is an image: the map is written, and "
+			    "activating it needs a loop device\n", d->path);
+			return 1;
+		}
+		snprintf(next, len, "%s", stand);
+	} else {
+		snprintf(next, len, "/dev/mapper/%s", name);
+	}
+	out("\n  /dev/mapper/%s is %s with its damage cut out; it is "
+	    "written and verified\n  next, as a scan of its own.  Put the "
+	    "filesystem on that, never on %s\n  itself\n", name, d->path,
+	    d->path);
 	return 0;
 }
 
@@ -14429,6 +14661,34 @@ static void run_what(run_t *r, const opts_t *o, int format)
  * supervisor, the workers, every viewer -- addresses the run through these
  * files and never through this process.
  */
+/* one drive's place in a run: what the supervisor keeps, and its record */
+static void job_init(job_t *jb, const run_t *r, device_t *d,
+		     const char *outdir, int format)
+{
+	char slug[96];
+	jrec_t j;
+
+	report_slug(d->name, slug, sizeof(slug));
+	memset(jb, 0, sizeof(*jb));
+	jb->dev = d;
+	snprintf(jb->file, sizeof(jb->file), "%s/%s.job", r->dir, slug);
+	snprintf(jb->report, sizeof(jb->report), "%s/" PROG "-%s%s.txt",
+		 outdir, format ? "format-" : "", slug);
+
+	memset(&j, 0, sizeof(j));
+	snprintf(j.file, sizeof(j.file), "%s", jb->file);
+	snprintf(j.dev, sizeof(j.dev), "%s", d->name);
+	snprintf(j.path, sizeof(j.path), "%s", d->path);
+	snprintf(j.model, sizeof(j.model), "%s", d->model);
+	snprintf(j.serial, sizeof(j.serial), "%s", d->serial);
+	snprintf(j.report, sizeof(j.report), "%s", jb->report);
+	j.size = d->size;
+	j.state = JS_QUEUED;
+	j.verdict = -1;
+	j.updated = (long long)time(NULL);
+	jrec_put(&j);
+}
+
 static int run_create(run_t *r, device_t *t, int n, const opts_t *o,
 		      int format, job_t *jobs)
 {
@@ -14495,32 +14755,8 @@ static int run_create(run_t *r, device_t *t, int n, const opts_t *o,
 	snprintf(g_own_run, sizeof(g_own_run), "%s", r->id);
 	run_put(r);
 
-	for (i = 0; i < n; i++) {
-		char slug[96];
-		jrec_t j;
-
-		report_slug(t[i].name, slug, sizeof(slug));
-		memset(jobs + i, 0, sizeof(jobs[i]));
-		jobs[i].dev = &t[i];
-		snprintf(jobs[i].file, sizeof(jobs[i].file), "%s/%s.job",
-			 r->dir, slug);
-		snprintf(jobs[i].report, sizeof(jobs[i].report),
-			 "%s/" PROG "-%s%s.txt", o->outdir,
-			 format ? "format-" : "", slug);
-
-		memset(&j, 0, sizeof(j));
-		snprintf(j.file, sizeof(j.file), "%s", jobs[i].file);
-		snprintf(j.dev, sizeof(j.dev), "%s", t[i].name);
-		snprintf(j.path, sizeof(j.path), "%s", t[i].path);
-		snprintf(j.model, sizeof(j.model), "%s", t[i].model);
-		snprintf(j.serial, sizeof(j.serial), "%s", t[i].serial);
-		snprintf(j.report, sizeof(j.report), "%s", jobs[i].report);
-		j.size = t[i].size;
-		j.state = JS_QUEUED;
-		j.verdict = -1;
-		j.updated = (long long)now;
-		jrec_put(&j);
-	}
+	for (i = 0; i < n; i++)
+		job_init(&jobs[i], r, &t[i], o->outdir, format);
 	store_prune();
 	return 0;
 }
@@ -14546,15 +14782,53 @@ static void job_cancel(const job_t *j, const char *why)
  * terminal, by design -- so it blocks in waitpid() and costs nothing while
  * the drives work.
  */
-static int scan_run(const run_t *r, job_t *jobs, device_t *t, int n,
+/*
+ * --hide-and-rescan: the drive's worker hid its damage and left the device
+ * in its record.  The test of that device is a job of its own -- its own
+ * record, its own report, its own row -- because one process writing one
+ * record is what lets every viewer trust it (invariant 12).  Returns 0 with
+ * jobs[*total] made, -1 when there is nothing to add.
+ */
+static int map_job(run_t *r, const job_t *raw, device_t *slot, job_t *jb,
+		   const opts_t *o)
+{
+	jrec_t x;
+
+	if (jrec_get(raw->file, &x) < 0 || !x.map[0] || x.state != JS_DONE)
+		return -1;
+	if (map_target(x.map, raw->dev->name, slot) < 0)
+		return -1;
+	job_init(jb, r, slot, o->outdir, 0);
+	r->njobs++;
+	run_put(r);
+	return 0;
+}
+
+static int scan_run(run_t *r, job_t *jobs, device_t *t, int n,
 		    const opts_t *o)
 {
 	int maxpar = o->max_parallel > 0 ? o->max_parallel : n;
 	int launched = 0, live = 0, finished = 0, worst = 0, i;
+	int total = n, nmaps = 0;
+	device_t *maps = NULL;
+	opts_t mo = *o;
 
+	/*
+	 * What the map is tested with: the predeploy test, as --rescan runs
+	 * it, without a second pass of its own -- this test *is* the drive's
+	 * second pass, so the whole drive still costs two sweeps.
+	 */
+	if (o->hide_rescan) {
+		maps = calloc((size_t)n, sizeof(*maps));
+		if (!maps)
+			die("out of memory");
+		rescan_opts(&mo);
+		mo.second_pass = 0;
+		mo.hide_rescan = 0;
+	}
 	if (maxpar > n)
 		maxpar = n;
-	while (finished < n) {
+	while (finished < total) {
 		pid_t p;
 		int st;
 
@@ -14578,12 +14852,12 @@ static int scan_run(const run_t *r, job_t *jobs, device_t *t, int n,
 		if (p < 0) {
 			if (errno == EINTR) {
 				if (g_stop)
-					forward_stop(jobs, n);
+					forward_stop(jobs, total);
 				continue;
 			}
 			break;
 		}
-		for (i = 0; i < n; i++) {
+		for (i = 0; i < total; i++) {
 			int code;
 
 			if (jobs[i].pid != p || jobs[i].done)
@@ -14594,10 +14868,25 @@ static int scan_run(const run_t *r, job_t *jobs, device_t *t, int n,
 				worst = code;
 			live--;
 			finished++;
+			/*
+			 * Straight into the slot the drive just left: this
+			 * is that drive's second pass, not a newcomer for
+			 * the back of the queue.
+			 */
+			if (maps && i < n && !g_stop && nmaps < n &&
+			    !map_job(r, &jobs[i], &maps[nmaps], &jobs[total],
+				     o)) {
+				spawn_job(jobs, total + 1, total, &mo, r);
+				nmaps++;
+				total++;
+				live++;
+			}
+			break;
 		}
 		if (g_stop)
-			forward_stop(jobs, n);
+			forward_stop(jobs, total);
 	}
+	free(maps);
 	return worst;
 }
 
@@ -14616,7 +14905,8 @@ static int scan_run(const run_t *r, job_t *jobs, device_t *t, int n,
  */
 static int run_begin(run_t *r, device_t *t, int n, const opts_t *o, int format)
 {
-	job_t *jobs = calloc((size_t)n, sizeof(job_t));
+	/* room for a map's test after each drive: --hide-and-rescan */
+	job_t *jobs = calloc((size_t)n * 2, sizeof(job_t));
 	pid_t pid;
 
 	if (!jobs)
@@ -15343,6 +15633,8 @@ int main(int argc, char **argv)
 			o.hide_bad = 1;
 		} else if (!strcmp(a, "--rescan")) {
 			o.rescan = 1;
+		} else if (!strcmp(a, "--hide-and-rescan")) {
+			o.hide_rescan = 1;
 		} else if (!strcmp(a, "--fix-config") ||
 			   !strcmp(a, "--no-fix-config")) {
 			o.fix_config = !strcmp(a, "--fix-config");
@@ -15845,6 +16137,26 @@ tui_again:
 	 * exits (invariant 7b).  --apply-settings has no run at all, so it
 	 * does the work here and now.
 	 */
+	/*
+	 * It needs a write pass over the whole drive, or there is no list
+	 * --hide-bad would take, and a run of its own: the test of the map is
+	 * a job the supervisor adds once the drive's worker has made it.
+	 */
+	if (o.hide_rescan) {
+		if (o.mode != MODE_WRITE)
+			die("--hide-and-rescan follows a write pass; it needs "
+			    "--mode write, which predeploy is");
+		if (o.start || o.end || o.sample > 1)
+			die("--hide-and-rescan needs the whole drive scanned: "
+			    "a list from part of it would hide only what was "
+			    "looked at");
+		if (o.hide_bad)
+			die("--hide-and-rescan scans first; --hide-bad hides "
+			    "what an earlier scan found.  Pick one");
+		if (o.sequential)
+			die("--hide-and-rescan runs as a run, a drive at a "
+			    "time with --max-parallel 1, not --sequential");
+	}
 	if (o.rescan && !o.hide_bad)
 		die("--rescan goes with --hide-bad: it tests the device that "
 		    "makes");
@@ -16075,7 +16387,8 @@ rescan_go:
 	sigaction(SIGTERM, &sa, NULL);
 	signal(SIGPIPE, SIG_IGN);
 
-	if ((ntargets > 1 || o.tui || o.detach) && !o.sequential && !o.dry_run) {
+	if ((ntargets > 1 || o.tui || o.detach || o.hide_rescan) &&
+	    !o.sequential && !o.dry_run) {
 		int st = run_dispatch(targets, ntargets, &o, 0);
 
 		/* the exit code covers every run this process made */
