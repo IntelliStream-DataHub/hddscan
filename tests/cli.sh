@@ -376,6 +376,25 @@ assert_has "--repair re-reads the device afterwards" "$out" "second pass"
 assert_has "--repair reports what it healed" "$out" "healed by rewrite"
 [ "$(md5sum < "$f")" != "$before" ] && ok "--repair really wrote to the device" \
 	|| bad "--repair really wrote to the device" "contents unchanged"
+# repair was predeploy plus --force-remap, and predeploy forces the remap
+# itself now; both old names have to keep working, and say what they became
+assert_has "--repair says it is predeploy now" "$out" \
+	"using --profile predeploy"
+assert_has "and its report names predeploy" "$out" "Profile          predeploy"
+assert_has "--profile repair is accepted as predeploy" \
+	"$(runp --profile repair "$f")" "using --profile predeploy"
+assert_hasnt "the repair profile is gone from --help" "$($HDDSCAN --help)" \
+	"  repair "
+assert_has "predeploy forces a remap of what stays unreadable" \
+	"$(runp "$f")" "--force-remap will modify"
+# forcing a remap destroys what an unreadable sector held, which predeploy
+# can afford only because its write pass has already destroyed everything:
+# a read pass under it may be a drive in service
+out=$(runp --mode read "$f")
+assert_hasnt "a read pass under predeploy does not force remaps" "$out" \
+	"--force-remap"
+out=$(runp --mode read --force-remap "$f")
+assert_has "unless --force-remap is named" "$out" "--force-remap will modify"
 
 # --rewrite-weak in read mode is a read-modify-write and must keep the data.
 f=$(image 16 rw.bin)
@@ -844,7 +863,7 @@ assert_has "and warns that the list is the wrong tool for it" "$out" \
 f=$(slowimg skipw.bin 1300M)
 out=$(HDDSCAN_SLOW=16M:1184M HDDSCAN_SLOW_MS=5000 runp --profile repair \
 	--chunk-slow-ms 1000 --retries 1 --confirm "$f" "$f")
-assert_has "the repair profile skips slow regions by default" "$out" \
+assert_has "the repair profile (predeploy now) skips slow regions" "$out" \
 	"skipped"
 assert_has "the verify pass leaves the unwritten region alone" "$out" \
 	"sectors with wrong data              0"

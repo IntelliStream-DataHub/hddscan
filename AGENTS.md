@@ -110,7 +110,7 @@ can be configured once and left. All of them announce what they did on stderr
 and print the exact command that undoes it. Do not "fix" them by adding a
 restore handler.
 
-The first two are defaults of the **predeploy** and **repair** profiles (with
+The first two are defaults of the **predeploy** profile (with
 `--bms-interval 168`), and that is the only place a saved setting is not typed
 by hand. A drive being prepared for service is the moment someone is
 deliberately configuring it, and a run there has already been confirmed as a
@@ -119,6 +119,10 @@ apply only while its own mode stands (`--mode read` under predeploy may be a
 drive in service, and saves nothing), never under `--apply-settings` or
 `--format`, never under `--dry-run`, and never through `--persist`, which saves
 only what was named. `--persist` stays opt-in and is never a profile default.
+Predeploy's `--force-remap` follows the same rule, on the command line and in
+the form: it destroys what an unreadable sector held, so a read pass under
+predeploy drops it unless it was named. (`repair` used to be a profile of its
+own, predeploy plus that flag; the name and `--repair` are kept as aliases.)
 
 All of it is applied by `apply_settings()` in the process that owns the run —
 the supervisor `run_begin()` forks — before the scan starts, and never inside

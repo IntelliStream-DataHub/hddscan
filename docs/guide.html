@@ -101,11 +101,10 @@ go with it; any flag you give explicitly overrides it.</p>
 <div class="table-wrap"><table>
 	<thead><tr><th>Profile</th><th>Mode</th><th>For</th></tr></thead>
 	<tbody>
-		<tr><td><b>predeploy</b> (default)</td><td>write</td><td>No data on it yet. Writes every sector, verifies it reads back, and leaves a SAS drive configured for service.</td></tr>
+		<tr><td><b>predeploy</b> (default)</td><td>write</td><td>No data on it yet. Writes every sector, verifies it reads back, forces a reallocation of anything that still will not read, re-reads the whole device, and leaves a SAS drive configured for service.</td></tr>
 		<tr><td><b>inservice</b></td><td>read</td><td>It holds data you want to keep. Never writes anything.</td></tr>
 		<tr><td><b>survey</b></td><td>read, sampled</td><td>Quick triage of a shelf: reads one chunk in 64.</td></tr>
 		<tr><td><b>decay</b></td><td>check</td><td>Weeks after a predeploy run: has the written pattern rotted?</td></tr>
-		<tr><td><b>repair</b></td><td>write</td><td>Predeploy, plus rewriting what is still slow and forcing a reallocation of anything unreadable.</td></tr>
 	</tbody>
 </table></div>
 <div class="callout"><p>The default writes, because a surface test is
@@ -274,13 +273,13 @@ sudo hddscan --profile decay /dev/sdb
 
 # give a drive its best chance: write, rewrite what is still slow,
 # force a reallocation of anything unreadable, then re-read the lot
-sudo hddscan --repair --confirm sdb --recovery-time 300 /dev/sdb
+sudo hddscan --confirm sdb --recovery-time 300 /dev/sdb
 
 # a shelf, in the background
 sudo hddscan --confirm sdb --detach /dev/sd{b..z}</code></pre>
 <p><code>--confirm</code> takes the device name as given, or the drive's
-serial. A full pass over a 14 TB drive takes about a day, and
-<code>--repair</code> roughly twice that. On a drive that is already sick, two
+serial. A full pass over a healthy 14 TB drive takes about a day, and
+predeploy makes two. On a drive that is already sick, two
 flags matter more than they look: <code>--recovery-time 300</code> stops the
 drive grinding a second on each bad sector, and <code>--retries 3</code> stops
 the tool grinding twenty attempts on each.</p>
@@ -364,9 +363,9 @@ drive and announced with the command that undoes each one.</p>
 <ul>
 	<li>For the scan: the drive's look-ahead is turned off, so a prefetch cannot
 	mask a marginal sector, and so is its read cache.</li>
-	<li>Predeploy and repair also turn the write cache off for the run, so the
+	<li>Predeploy also turns the write cache off for the run, so the
 	write pass times the platter rather than the drive's memory.</li>
-	<li>Predeploy and repair save <code>--fix-config</code> (auto-reallocation
+	<li>Predeploy saves <code>--fix-config</code> (auto-reallocation
 	on for reads and writes, read cache on) and the drive's own background
 	scan, weekly. <code>--no-fix-config</code> and <code>--bms keep</code> opt
 	out. None of it applies if you override the mode.</li>
@@ -434,9 +433,12 @@ the mode and the passes that go with it.  Default
 &#x27;predeploy&#x27;, so a bare run stops and asks for
 <a href="#opt-confirm"><code>--confirm</code></a> rather than doing anything:
   predeploy  no data on it yet: write every sector
-             and verify it reads back, 1M chunks,
-             write cache off for the run, and
-             <a href="#opt-skip-slow"><code>--skip-slow</code></a>.  Leaves the drive
+             and verify it reads back, re-read it
+             all, rewrite what is still slow and
+             force a reallocation of anything
+             unreadable.  1M chunks, write cache
+             off for the run, and <a href="#opt-skip-slow"><code>--skip-slow</code></a>.
+             Leaves the drive
              configured for service:
              <a href="#opt-fix-config"><code>--fix-config</code></a> and <a href="#opt-bms"><code>--bms</code></a> on, weekly,
              SAVED on SAS drives
@@ -445,8 +447,6 @@ the mode and the passes that go with it.  Default
   survey     quick triage of a shelf: samples the
              surface, read only
   decay      weeks after predeploy: has it rotted?
-  repair     predeploy, plus forcing a reallocation
-             of anything unreadable
 Any explicit flag overrides what the profile set,
 whichever order they appear in.  The drive
 settings a profile carries apply only in its own
@@ -527,18 +527,16 @@ mode: <a href="#opt-mode"><code>--mode</code></a> read on predeploy saves nothin
 <dd>read-only re-verify of a pattern an earlier <a href="#opt-mode"><code>--mode</code></a> write run left behind.  Run it days or weeks later to catch sectors that lost their charge</dd>
 <dt id="opt-confirm"><code>--confirm STRING</code></dt>
 <dd>required for verify/write; must equal the device name (e.g. sdb) or its serial number</dd>
-<dt id="opt-repair"><code>--repair</code></dt>
-<dd>give a drive its best chance, in one flag: overwrite every sector, which is what refreshes a weak one; rewrite anything still slow after that; force a reallocation on anything that will not read at all; then re-read the whole device to prove it held. Implies <a href="#opt-mode"><code>--mode</code></a> write and so DESTROYS ALL DATA and needs <a href="#opt-confirm"><code>--confirm</code></a>.  Also turns the drive&#x27;s read cache off, since a repair verified out of the drive&#x27;s own DRAM is not a repair you verified</dd>
 <dt id="opt-second-pass"><code>--second-pass</code></dt>
 <dd>after <a href="#opt-mode"><code>--mode</code></a> write, re-read the whole device and re-verify the pattern (catches slow data decay)</dd>
 <dt id="opt-skip-slow"><code>--skip-slow</code></dt>
-<dd>when a region is too slow to scan -- most chunks over the last 64 MiB missed their budget, or the scan there, drill-downs and retries included, ran under the <a href="#opt-min-rate"><code>--min-rate</code></a> floor -- stop reading: probe 1 GiB on, doubling to 64 GiB, until one is fast, bisect back to the edge, carry on there.  A chunk whose drill-down costs over 10 s is condemned whole.  What was jumped over is condemned unread; the report says so and <a href="#opt-hide-bad"><code>--hide-bad</code></a> cuts it out. Sequential or reverse order only.  On under predeploy and repair, and dropped there without comment where the order cannot walk</dd>
+<dd>when a region is too slow to scan -- most chunks over the last 64 MiB missed their budget, or the scan there, drill-downs and retries included, ran under the <a href="#opt-min-rate"><code>--min-rate</code></a> floor -- stop reading: probe 1 GiB on, doubling to 64 GiB, until one is fast, bisect back to the edge, carry on there.  A chunk whose drill-down costs over 10 s is condemned whole.  What was jumped over is condemned unread; the report says so and <a href="#opt-hide-bad"><code>--hide-bad</code></a> cuts it out. Sequential or reverse order only.  On under predeploy, and dropped there without comment where the order cannot walk</dd>
 <dt id="opt-no-skip-slow"><code>--no-skip-slow</code></dt>
-<dd>read every region, however slow, under predeploy and repair too</dd>
+<dd>read every region, however slow, under predeploy too</dd>
 <dt id="opt-rewrite-weak"><code>--rewrite-weak</code></dt>
 <dd>rewrite readable-but-slow sectors in place to make the drive refresh or remap them (needs verify/write, or read mode plus this flag for read-modify-write)</dd>
 <dt id="opt-force-remap"><code>--force-remap</code></dt>
-<dd>overwrite UNREADABLE sectors with zeros to force a reallocation.  Destroys the contents of those sectors</dd>
+<dd>overwrite UNREADABLE sectors to force a reallocation, with zeros, or the pattern in write mode, and on SAS ask the drive to reassign them.  Destroys the contents of those sectors.  On under predeploy</dd>
 </dl></section>
 <section class="optgroup" id="g-range-and-sizing">
 <h3>Range and sizing</h3>
@@ -548,7 +546,7 @@ mode: <a href="#opt-mode"><code>--mode</code></a> read on predeploy saves nothin
 <dt id="opt-end"><code>--end SIZE</code></dt>
 <dd>last byte to test (default end of device)</dd>
 <dt id="opt-chunk"><code>--chunk SIZE</code></dt>
-<dd>bulk read size, default 128K, 1M under predeploy and repair</dd>
+<dd>bulk read size, default 128K, 1M under predeploy</dd>
 <dt id="opt-block"><code>--block SIZE</code></dt>
 <dd>drill-down granularity, default 4K</dd>
 <dt id="opt-sample"><code>--sample N</code></dt>
@@ -604,9 +602,9 @@ mode: <a href="#opt-mode"><code>--mode</code></a> read on predeploy saves nothin
 <dt id="opt-apply-settings"><code>--apply-settings</code></dt>
 <dd>apply the settings below to every selected drive and stop, without scanning anything.  Settings are applied before the scan either way, so a drive is configured the moment you ask rather than when a scan happens to reach it</dd>
 <dt id="opt-fix-config"><code>--fix-config</code></dt>
-<dd>apply the configuration this tool recommends for a drive going into service: auto-reallocate on for both reads and writes, read cache on.  Only the parts actually wrong are touched, each is printed, and they are SAVED -- a fix that reverted when the scan ended would not be a fix.  On by default under predeploy and repair</dd>
+<dd>apply the configuration this tool recommends for a drive going into service: auto-reallocate on for both reads and writes, read cache on.  Only the parts actually wrong are touched, each is printed, and they are SAVED -- a fix that reverted when the scan ended would not be a fix.  On by default under predeploy</dd>
 <dt id="opt-no-fix-config"><code>--no-fix-config</code></dt>
-<dd>leave the configuration alone under those profiles</dd>
+<dd>leave the configuration alone under predeploy</dd>
 <dt id="opt-awre"><code>--awre on|off|keep</code></dt>
 <dd>let the drive retire a sector it struggles to write</dd>
 <dt id="opt-arre"><code>--arre on|off|keep</code></dt>
@@ -622,11 +620,11 @@ mode: <a href="#opt-mode"><code>--mode</code></a> read on predeploy saves nothin
 <dt id="opt-persist"><code>--persist</code></dt>
 <dd>save the settings this run changes to the drive so they survive a power cycle, instead of putting them back when the scan ends.  Needs a SAS/SCSI drive and sdparm; anything else is applied for the run only and says so.  Only settings you named are saved -- the look-ahead, read cache and write cache defaults are not, or every scanned drive would be left permanently slower</dd>
 <dt id="opt-write-cache"><code>--write-cache on|off|keep</code></dt>
-<dd>with the cache on a write returns as soon as the drive has it in DRAM, so a write mode times the cache and not the platter; &#x27;off&#x27; makes it honest and much slower.  Also the other half of the ex-array fault where RCD and WCE together give a drive that writes fast and reads like treacle. Restored on exit, and never saved by <a href="#opt-persist"><code>--persist</code></a> unless named here.  Default &#x27;off&#x27; under predeploy and repair, &#x27;keep&#x27; otherwise</dd>
+<dd>with the cache on a write returns as soon as the drive has it in DRAM, so a write mode times the cache and not the platter; &#x27;off&#x27; makes it honest and much slower.  Also the other half of the ex-array fault where RCD and WCE together give a drive that writes fast and reads like treacle. Restored on exit, and never saved by <a href="#opt-persist"><code>--persist</code></a> unless named here.  Default &#x27;off&#x27; under predeploy, &#x27;keep&#x27; otherwise</dd>
 <dt id="opt-bms"><code>--bms on|keep</code></dt>
-<dd>&#x27;on&#x27; tells every selected SAS/SCSI drive to run its own background medium scan: the firmware sweeps the platters whenever the drive is idle, logs what it finds and reallocates the sectors it can still recover.  Unlike every other setting here this one is SAVED ON THE DRIVE and is not undone afterwards; &#x27;sdparm <code>--clear</code>=EN_BMS <code>--save</code> /dev/sdX&#x27; turns it back off.  Default &#x27;on&#x27; under predeploy and repair, &#x27;keep&#x27; otherwise, which touches nothing</dd>
+<dd>&#x27;on&#x27; tells every selected SAS/SCSI drive to run its own background medium scan: the firmware sweeps the platters whenever the drive is idle, logs what it finds and reallocates the sectors it can still recover.  Unlike every other setting here this one is SAVED ON THE DRIVE and is not undone afterwards; &#x27;sdparm <code>--clear</code>=EN_BMS <code>--save</code> /dev/sdX&#x27; turns it back off.  Default &#x27;on&#x27; under predeploy, &#x27;keep&#x27; otherwise, which touches nothing</dd>
 <dt id="opt-bms-interval"><code>--bms-interval HOURS</code></dt>
-<dd>how often that background scan sweeps the media, saved with it (SCSI BMS_I).  Default 168, weekly, under predeploy and repair; otherwise the drive&#x27;s own.  Needs <a href="#opt-bms"><code>--bms</code></a> on</dd>
+<dd>how often that background scan sweeps the media, saved with it (SCSI BMS_I).  Default 168, weekly, under predeploy; otherwise the drive&#x27;s own.  Needs <a href="#opt-bms"><code>--bms</code></a> on</dd>
 <dt id="opt-io-timeout"><code>--io-timeout SEC</code></dt>
 <dd>lower the kernel&#x27;s per-command timeout during the scan so a dying sector fails fast (restored after)</dd>
 <dt id="opt-max-temp"><code>--max-temp C</code></dt>

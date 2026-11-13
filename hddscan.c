@@ -3969,6 +3969,7 @@ static void analyze_block(ctx_t *c, uint64_t off, size_t len, void *buf,
 	status_t st;
 	finding_t *f;
 	int readable_copy = 0;
+	int rewritten = 0, healed = 0;
 	void *keep = NULL;
 
 	if (!lat)
@@ -4024,13 +4025,10 @@ static void analyze_block(ctx_t *c, uint64_t off, size_t len, void *buf,
 	 * read -- drill_chunk() skips the ones that came back in time.  So the
 	 * only question left is whether anything came back at all.
 	 */
-	if (errors == attempts) {
+	if (errors == attempts)
 		st = ST_BAD;
-		if (c->drill_written)
-			c->blocks_unrepaired++;
-	} else {
+	else
 		st = ST_WEAK;
-	}
 
 	f = find_add(c);
 	if (f) {
@@ -4084,7 +4082,16 @@ static void analyze_block(ctx_t *c, uint64_t off, size_t len, void *buf,
 				if (rc == 0)
 					c->sas_reassigned++;
 			}
-			memset(buf, 0, len);
+			/*
+			 * A write pass lays the pattern down here too, as it
+			 * did over the rest of the chunk.  Zeros would make a
+			 * sector this rescued fail the second pass, and every
+			 * later decay run, as wrong data.
+			 */
+			if (c->mode == MODE_WRITE)
+				pattern_fill(buf, len, off, c->seed);
+			else
+				memset(buf, 0, len);
 			do_rewrite = 1;
 			src = buf;
 		}
@@ -4098,6 +4105,7 @@ static void analyze_block(ctx_t *c, uint64_t off, size_t len, void *buf,
 			if (w == (ssize_t)len) {
 				int ok = 1, k;
 
+				rewritten = 1;
 				for (k = 0; k < 3; k++) {
 					uint64_t rus;
 					ssize_t r;
@@ -4108,16 +4116,24 @@ static void analyze_block(ctx_t *c, uint64_t off, size_t len, void *buf,
 					    rus > block_thr_at(c, off))
 						ok = 0;
 				}
-				if (!ok && st == ST_BAD)
-					c->blocks_unrepaired++;
 				if (ok) {
 					if (f)
 						f->fixed_by_rewrite = 1;
 					c->blocks_fixed++;
+					healed = 1;
 				}
 			}
 		}
 	}
+	/*
+	 * Decided once, after every write this block will get: unreadable
+	 * after the write pass laid the pattern over it, or after the remap
+	 * write, and not rescued by the remap write.  Counting it at each
+	 * write counted a block twice, and counted one the remap had just
+	 * healed as unrepaired.
+	 */
+	if (st == ST_BAD && (c->drill_written || rewritten) && !healed)
+		c->blocks_unrepaired++;
 
 	free(keep);
 	free(lat);
@@ -7458,7 +7474,7 @@ no_modes:	;
 	else if (v == 1 && c->blocks_bad && !c->force_remap)
 		out(" Unreadable sectors are not by themselves a failing drive: every drive\n"
 		    " grows some, and writing them is what makes the firmware remap them.\n"
-		    " Run a write pass (--profile predeploy on an empty drive, or --repair)\n"
+		    " Run a write pass (--profile predeploy, on a drive with nothing on it)\n"
 		    " to find out whether this one still can. If they stay unreadable after\n"
 		    " being written, it is failing.\n");
 	else if (v == 1 && c->nskip)
@@ -7996,10 +8012,10 @@ typedef struct {
 	int read_cache_set;     /* --read-cache was named, not defaulted */
 	int rewrite_weak;
 	int force_remap;
+	int force_remap_set;    /* named, not inherited from a profile */
 	int second_pass;
 	int skip_slow;          /* condemn a region too slow to scan, unread */
 	int skip_slow_set;      /* named, not just the profile's default */
-	int repair;             /* the whole repair sequence in one flag */
 	const char *profile;    /* which profile produced these defaults */
 	int retries;
 	double retry_cap_s;
@@ -8062,6 +8078,15 @@ typedef struct {
  * invocation stops and asks for --confirm rather than doing anything: an
  * error, never data loss.  Reach for 'inservice' on a drive that holds
  * anything you want to keep.
+ *
+ * Predeploy also forces a reallocation of anything still unreadable after its
+ * pattern write.  There used to be a 'repair' profile that was predeploy plus
+ * exactly that, which made the default the weaker of two destructive passes
+ * for no gain: the drive holds no data, the extra work only ever touches a
+ * sector that has already failed, and on SAS it is the one place a REASSIGN
+ * BLOCKS is sent when a plain write did not make the firmware move a sector.
+ * 'repair' and --repair are kept as names for predeploy so scripts and old
+ * run records still mean something.
  * ------------------------------------------------------------------ */
 
 typedef struct {
@@ -8101,7 +8126,7 @@ typedef struct {
 static const profile_t g_profiles[] = {
 	{ "predeploy",
 	  "no data on it yet: write every sector and verify it reads back",
-	  MODE_WRITE, 1, 0, 1, 0, 1024u * 1024, 0, 1, 1, 168, 1 },
+	  MODE_WRITE, 1, 1, 1, 0, 1024u * 1024, 0, 1, 1, 168, 1 },
 	{ "inservice",
 	  "it holds data you want to keep: never writes anything",
 	  MODE_READ,  0, 0, 0, 0, 0, -1, 0, 0, 0, 0 },
@@ -8111,9 +8136,6 @@ static const profile_t g_profiles[] = {
 	{ "decay",
 	  "weeks after a predeploy run: has the pattern rotted?",
 	  MODE_CHECK, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0 },
-	{ "repair",
-	  "predeploy, plus forcing a reallocation of anything unreadable",
-	  MODE_WRITE, 1, 1, 1, 0, 1024u * 1024, 0, 1, 1, 168, 1 },
 };
 #define NPROFILES ((int)(sizeof(g_profiles) / sizeof(g_profiles[0])))
 
@@ -8147,9 +8169,12 @@ static void usage(void)
 "                         'predeploy', so a bare run stops and asks for\n"
 "                         --confirm rather than doing anything:\n"
 "                           predeploy  no data on it yet: write every sector\n"
-"                                      and verify it reads back, 1M chunks,\n"
-"                                      write cache off for the run, and\n"
-"                                      --skip-slow.  Leaves the drive\n"
+"                                      and verify it reads back, re-read it\n"
+"                                      all, rewrite what is still slow and\n"
+"                                      force a reallocation of anything\n"
+"                                      unreadable.  1M chunks, write cache\n"
+"                                      off for the run, and --skip-slow.\n"
+"                                      Leaves the drive\n"
 "                                      configured for service:\n"
 "                                      --fix-config and --bms on, weekly,\n"
 "                                      SAVED on SAS drives\n"
@@ -8158,8 +8183,7 @@ static void usage(void)
 "                           survey     quick triage of a shelf: samples the\n"
 "                                      surface, read only\n"
 "                           decay      weeks after predeploy: has it rotted?\n"
-"                           repair     predeploy, plus forcing a reallocation\n"
-"                                      of anything unreadable\n"
+
 "                         Any explicit flag overrides what the profile set,\n"
 "                         whichever order they appear in.  The drive\n"
 "                         settings a profile carries apply only in its own\n"
@@ -8229,15 +8253,7 @@ static void usage(void)
 "                         later to catch sectors that lost their charge\n"
 "  --confirm STRING       required for verify/write; must equal the device\n"
 "                         name (e.g. sdb) or its serial number\n"
-"  --repair               give a drive its best chance, in one flag: overwrite\n"
-"                         every sector, which is what refreshes a weak one;\n"
-"                         rewrite anything still slow after that; force a\n"
-"                         reallocation on anything that will not read at all;\n"
-"                         then re-read the whole device to prove it held.\n"
-"                         Implies --mode write and so DESTROYS ALL DATA and\n"
-"                         needs --confirm.  Also turns the drive's read cache\n"
-"                         off, since a repair verified out of the drive's own\n"
-"                         DRAM is not a repair you verified\n"
+
 "  --second-pass          after --mode write, re-read the whole device and\n"
 "                         re-verify the pattern (catches slow data decay)\n"
 "  --skip-slow            when a region is too slow to scan -- most chunks\n"
@@ -8250,21 +8266,21 @@ static void usage(void)
 "                         whole.  What was jumped over is condemned unread;\n"
 "                         the report says so and --hide-bad cuts it out.\n"
 "                         Sequential or reverse order only.  On under\n"
-"                         predeploy and repair, and dropped there without\n"
-"                         comment where the order cannot walk\n"
-"  --no-skip-slow         read every region, however slow, under predeploy\n"
-"                         and repair too\n"
+"                         predeploy, and dropped there without comment where\n"
+"                         the order cannot walk\n"
+"  --no-skip-slow         read every region, however slow, under predeploy too\n"
 "  --rewrite-weak         rewrite readable-but-slow sectors in place to make\n"
 "                         the drive refresh or remap them (needs verify/write,\n"
 "                         or read mode plus this flag for read-modify-write)\n"
-"  --force-remap          overwrite UNREADABLE sectors with zeros to force a\n"
-"                         reallocation.  Destroys the contents of those sectors\n"
+"  --force-remap          overwrite UNREADABLE sectors to force a reallocation,\n"
+"                         with zeros, or the pattern in write mode, and on SAS\n"
+"                         ask the drive to reassign them.  Destroys the\n"
+"                         contents of those sectors.  On under predeploy\n"
 "\n"
 "Range and sizing\n"
 "  --start SIZE           first byte to test (default 0)\n"
 "  --end SIZE             last byte to test (default end of device)\n"
 "  --chunk SIZE           bulk read size, default 128K, 1M under predeploy\n"
-"                         and repair\n"
 "  --block SIZE           drill-down granularity, default 4K\n"
 "  --sample N             only test every Nth chunk (fast surface survey)\n"
 "  --order ORDER          sequential (default), reverse, or random.  Sequential\n"
@@ -8338,8 +8354,8 @@ static void usage(void)
 "                         parts actually wrong are touched, each is printed,\n"
 "                         and they are SAVED -- a fix that reverted when the\n"
 "                         scan ended would not be a fix.  On by default\n"
-"                         under predeploy and repair\n"
-"  --no-fix-config        leave the configuration alone under those profiles\n"
+"                         under predeploy\n"
+"  --no-fix-config        leave the configuration alone under predeploy\n"
 "  --awre on|off|keep     let the drive retire a sector it struggles to write\n"
 "  --arre on|off|keep     the same on read.  With both off the firmware never\n"
 "                         reallocates, so --rewrite-weak and --force-remap\n"
@@ -8378,8 +8394,8 @@ static void usage(void)
 "                         ex-array fault where RCD and WCE together give a\n"
 "                         drive that writes fast and reads like treacle.\n"
 "                         Restored on exit, and never saved by --persist\n"
-"                         unless named here.  Default 'off' under predeploy\n"
-"                         and repair, 'keep' otherwise\n"
+"                         unless named here.  Default 'off' under predeploy,\n"
+"                         'keep' otherwise\n"
 "  --bms on|keep          'on' tells every selected SAS/SCSI drive to run its\n"
 "                         own background medium scan: the firmware sweeps the\n"
 "                         platters whenever the drive is idle, logs what it\n"
@@ -8387,12 +8403,12 @@ static void usage(void)
 "                         recover.  Unlike every other setting here this one\n"
 "                         is SAVED ON THE DRIVE and is not undone afterwards;\n"
 "                         'sdparm --clear=EN_BMS --save /dev/sdX' turns it\n"
-"                         back off.  Default 'on' under predeploy and repair,\n"
-"                         'keep' otherwise, which touches nothing\n"
+"                         back off.  Default 'on' under predeploy, 'keep'\n"
+"                         otherwise, which touches nothing\n"
 "  --bms-interval HOURS   how often that background scan sweeps the media,\n"
 "                         saved with it (SCSI BMS_I).  Default 168, weekly,\n"
-"                         under predeploy and repair; otherwise the drive's\n"
-"                         own.  Needs --bms on\n"
+"                         under predeploy; otherwise the drive's own.  Needs\n"
+"                         --bms on\n"
 "  --io-timeout SEC       lower the kernel's per-command timeout during the\n"
 "                         scan so a dying sector fails fast (restored after)\n"
 "  --max-temp C           abort if the drive gets this hot (default 58, 0=off)\n"
@@ -10920,8 +10936,8 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 	 * write -- silent, and on the wrong side of every safety check.
 	 *
 	 * mode_sel is that index space, widened: the entries past the scan
-	 * modes are the things that are not one (repair, format, settings,
-	 * hide bad).  The Mode field on the scan screen has its own index,
+	 * modes are the things that are not one (format, settings, hide
+	 * bad).  The Mode field on the scan screen has its own index,
 	 * smsel, into smap, and format and settings are no longer modes at
 	 * all but screens of their own; mode_sel is worked out from the two
 	 * each time round.
@@ -10929,8 +10945,7 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 	static const scan_mode_t mode_v[] = { MODE_READ, MODE_CHECK,
 					      MODE_VERIFY, MODE_WRITE };
 	static const char *mode_c[] = { "read", "check", "verify", "write",
-					"repair", "format", "settings",
-					"hide bad" };
+					"format", "settings", "hide bad" };
 	static const char *act_name[] = { "Scan", "Settings",
 					  "Low level format" };
 	static const char *act_what[] = {
@@ -10938,7 +10953,7 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 		"change drive cache, error recovery, background scan",
 		"erase the drive; change sector size or protection" };
 	int mode_sel = 0, order_sel = (int)o->order;
-	int smap[6], smsel = 0;
+	int smap[5], smsel = 0;
 	int la_sel = o->lookahead == 0 ? 0 : 1;
 	dset_t ds, held;
 	/*
@@ -10983,11 +10998,11 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 	 */
 	{ "How to test", NULL, ON(A_SCAN), "Profile",
 	  "what you are about to do with the drive; sets the rest",
-	  0, 5, { "predeploy", "inservice", "survey", "decay", "repair" },
+	  0, 4, { "predeploy", "inservice", "survey", "decay" },
 	  NULL, 0, 0, 0, &prof_sel },
 	{ NULL, NULL, ON(A_SCAN), "Mode",
-	  "read is safe; write and repair destroy data",
-	  0, 6, { "read", "check", "verify", "write", "repair", "hide bad" },
+	  "read and check are safe; write destroys data",
+	  0, 5, { "read", "check", "verify", "write", "hide bad" },
 	  NULL, 0, 0, 0, &smsel },
 	{ NULL, NULL, ON(A_SCAN), "Chunk size",
 	  "bigger is much faster but raises the bar a sector must clear",
@@ -11062,8 +11077,7 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 	smap[1] = 1;
 	smap[2] = 2;
 	smap[3] = 3;
-	smap[4] = nmode;        /* repair */
-	smap[5] = nmode + 3;    /* hide bad */
+	smap[4] = nmode + 2;    /* hide bad */
 
 	ds.rc = o->read_cache < 0 ? 0 : o->read_cache + 1;
 	ds.wc = o->write_cache < 0 ? 0 : o->write_cache + 1;
@@ -11101,11 +11115,9 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 			fpi_sel = i;
 	ffast_sel = o->fmt_fast ? 1 : 0;
 	prof_was = prof_sel;
-	if (o->repair)
-		mode_sel = nmode;
 	if (o->hide_bad)
-		mode_sel = nmode + 3;
-	for (i = 0; i < 6; i++)
+		mode_sel = nmode + 2;
+	for (i = 0; i < 5; i++)
 		if (smap[i] == mode_sel)
 			smsel = i;
 	/* what was asked for on the command line is where the menu rests */
@@ -11138,9 +11150,7 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 			for (i = 0; i < nmode; i++)
 				if (mode_v[i] == p->mode)
 					mi = i;
-			if (p->force_remap)
-				mi = nmode;     /* the repair entry */
-			for (i = 0; i < 6; i++)
+			for (i = 0; i < 5; i++)
 				if (smap[i] == mi)
 					smsel = i;
 			sample = p->sample ? (long long)p->sample : 0;
@@ -11154,8 +11164,8 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 				if (chunk_v[i] == p->chunk)
 					chunk_sel = i;
 		}
-		mode_sel = act == A_FORMAT ? nmode + 1 :
-			   act == A_SETTINGS ? nmode + 2 : smap[smsel];
+		mode_sel = act == A_FORMAT ? nmode :
+			   act == A_SETTINGS ? nmode + 1 : smap[smsel];
 		if (act == A_SCAN) {
 			/*
 			 * The drive settings follow the profile only while
@@ -11166,8 +11176,7 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 			 * moving it back restores them.
 			 */
 			const profile_t *p = &g_profiles[prof_sel];
-			int in = mode_sel < nmode ? mode_v[mode_sel] == p->mode :
-				 mode_sel == nmode && p->mode == MODE_WRITE;
+			int in = mode_sel < nmode && mode_v[mode_sel] == p->mode;
 
 			if (in_was >= 0 && in != in_was) {
 				ds.wc = in && p->write_cache >= 0 ?
@@ -11375,10 +11384,7 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 			else if (act == A_SETTINGS)
 				printf("   %sapplies the settings and stops, no "
 				       "scan%s", c_yel(), c_off());
-			else if (mode_sel == nmode)
-				printf("   %soverwrites everything and heals%s",
-				       c_red(), c_off());
-			else if (mode_sel == nmode + 3)
+			else if (mode_sel == nmode + 2)
 				printf("   %shides the last scan's damage; data "
 				       "lost%s", c_red(), c_off());
 			else if (mode_sel >= 2)
@@ -11553,10 +11559,9 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 			/*
 			 * The form comes back after every run, so a dispatch
 			 * flag from the previous accept must not leak into
-			 * this one: a leftover repair flag would silently turn
-			 * a freshly chosen read pass into a write pass.
+			 * this one: a leftover flag would silently turn a
+			 * freshly chosen read pass into something else.
 			 */
-			o->repair = 0;
 			o->format = 0;
 			o->apply_only = 0;
 			o->hide_bad = 0;
@@ -11564,9 +11569,7 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 				o->format = 1;
 			else if (act == A_SETTINGS)
 				o->apply_only = 1;
-			else if (mode_sel == nmode)
-				o->repair = 1;
-			else if (mode_sel == nmode + 3)
+			else if (mode_sel == nmode + 2)
 				o->hide_bad = 1;
 			else
 				o->mode = mode_v[mode_sel];
@@ -11581,7 +11584,11 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 			 */
 			o->profile = g_profiles[prof_sel].name;
 			o->rewrite_weak = g_profiles[prof_sel].rewrite_weak;
-			o->force_remap = g_profiles[prof_sel].force_remap;
+			/* and only under the profile's own mode, as on the
+			 * command line: see the note in main() */
+			o->force_remap = mode_sel < nmode &&
+				mode_v[mode_sel] == g_profiles[prof_sel].mode ?
+				g_profiles[prof_sel].force_remap : 0;
 			o->second_pass = g_profiles[prof_sel].second_pass;
 			o->skip_slow = skip_sel;
 			/* moved off the profile's own value is a choice */
@@ -13847,7 +13854,7 @@ static void rescan_opts(opts_t *o)
 	 * not pass the flag up must not turn this into a refusal */
 	o->include_ssd = 1;
 	o->hide_bad = o->rescan = 0;
-	o->repair = o->format = o->apply_only = 0;
+	o->format = o->apply_only = 0;
 	o->rescan_ok = 1;
 }
 
@@ -15123,9 +15130,18 @@ int main(int argc, char **argv)
 	 * the two appear in on the command line.
 	 */
 	o.profile = "predeploy";
-	for (i = 1; i < argc; i++)
+	for (i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--profile") && i + 1 < argc)
 			o.profile = argv[++i];
+		else if (!strcmp(argv[i], "--repair"))
+			o.profile = "repair";
+	}
+	/* the profile predeploy absorbed; see the note above g_profiles */
+	if (!strcmp(o.profile, "repair")) {
+		msg(PROG ": repair is part of predeploy now, which forces a "
+		    "reallocation too; using --profile predeploy\n");
+		o.profile = "predeploy";
+	}
 	{
 		const profile_t *p = profile_by_name(o.profile);
 
@@ -15226,10 +15242,11 @@ int main(int argc, char **argv)
 			o.rewrite_weak = 1;
 		} else if (!strcmp(a, "--force-remap")) {
 			o.force_remap = 1;
+			o.force_remap_set = 1;
 		} else if (!strcmp(a, "--profile")) {
 			(void)NEXT();   /* already resolved in the pre-pass */
 		} else if (!strcmp(a, "--repair")) {
-			o.repair = 1;
+			/* already resolved in the pre-pass, as predeploy */
 		} else if (!strcmp(a, "--second-pass")) {
 			o.second_pass = 1;
 		} else if (!strcmp(a, "--skip-slow")) {
@@ -15472,6 +15489,14 @@ int main(int argc, char **argv)
 	{
 		const profile_t *p = profile_by_name(o.profile);
 
+		/*
+		 * Forcing a remap destroys what an unreadable sector held.
+		 * Predeploy does it because its write pass has destroyed
+		 * everything anyway; a read pass under it may be a drive in
+		 * service, and loses it unless asked for by name.
+		 */
+		if (p && o.mode != p->mode && !o.force_remap_set)
+			o.force_remap = 0;
 		if (p && o.mode == p->mode && !o.apply_only && !o.format) {
 			if (!o.write_cache_set)
 				o.write_cache = p->write_cache;
@@ -15811,26 +15836,6 @@ tui_again:
 		free(all);
 		if (!ntargets)
 			die("no free rotational disks found (see --list)");
-	}
-
-	/*
-	 * --repair is the whole sequence a drive needs to be given its best
-	 * chance, in one flag: overwrite every sector (which is what refreshes
-	 * a weak one), rewrite anything still slow afterwards, force a
-	 * reallocation on anything that will not read at all, then re-read the
-	 * entire device to prove the repair held.
-	 *
-	 * It also turns the drive's read cache off, because a repair you
-	 * verified out of the drive's DRAM is not a repair you verified.
-	 * Everything here stays overridable: a later --read-cache keep wins.
-	 */
-	if (o.repair) {
-		o.mode = MODE_WRITE;
-		o.rewrite_weak = 1;
-		o.force_remap = 1;
-		o.second_pass = 1;
-		if (o.read_cache < 0)
-			o.read_cache = 0;
 	}
 
 	/*

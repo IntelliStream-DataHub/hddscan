@@ -456,14 +456,18 @@ def main():
         check("decay reads every region however slow",
               s.wait(lambda: s.value_of("Skip slow regions") == "no"),
               "got %r" % s.value_of("Skip slow regions"))
-        check("repair skips regions slow as a whole",
-              s.set_choice("Profile", "repair")
-              and s.wait(lambda: s.value_of("Skip slow regions") == "yes"),
-              "got %r" % s.value_of("Skip slow regions"))
-        check("leaving repair for predeploy keeps it on",
+        check("predeploy skips regions slow as a whole",
               s.set_choice("Profile", "predeploy")
               and s.wait(lambda: s.value_of("Skip slow regions") == "yes"),
               "got %r" % s.value_of("Skip slow regions"))
+        # repair was predeploy plus a forced remap, and predeploy does that
+        # itself now: the form must not offer it as a profile or a mode
+        check("the form offers no repair profile",
+              not s.set_choice("Profile", "repair"),
+              "Profile %r" % s.value_of("Profile"))
+        check("nor a repair mode",
+              not s.set_choice("Mode", "repair"),
+              "Mode %r" % s.value_of("Mode"))
         check("and leaving predeploy for inservice turns it off",
               s.set_choice("Profile", "inservice")
               and s.wait(lambda: s.value_of("Skip slow regions") == "no"),
@@ -692,7 +696,6 @@ def main():
 
         for mode, action, word, warn in (
                 ("write", "scan", "write", "writes to the drive"),
-                ("repair", "scan", "repair", "overwrites everything"),
                 ("format", "format", "format", "ERASES the drive completely"),
                 ("hide bad", "scan", "hide bad", "hides the last scan's damage")):
             s = Session(["-i", "--no-color", "--dry-run", "--outdir", tmp, a],
@@ -973,29 +976,32 @@ def main():
         print("== a run's dispatch flags do not leak into the next ==")
 
         # The form comes back after every run, so an accept must not inherit
-        # the previous accept's repair/format/apply-settings flag.  A leftover
-        # repair flag would silently turn a freshly chosen read pass into a
-        # write pass -- the exact failure is a read that modifies the image.
+        # the previous accept's dispatch flag or the profile's write-only
+        # extras.  It was a leftover --repair flag once, which silently turned
+        # a freshly chosen read pass into a write pass -- the exact failure is
+        # a read that modifies the image.  The repair mode is gone; the write
+        # pass under predeploy carries the same extras, the forced remap among
+        # them, so it is what the read pass has to shed now.
         import hashlib
         lk = img(tmp, "leak.bin", 8)
         s = Session(["-i", "--no-color", "--outdir", tmp, lk], open="scan")
         s.wait(lambda: s.on_screen("Profile"), 6.0)
-        s.set_choice("Mode", "repair")
+        s.set_choice("Mode", "write")
         s.send(b"s", 0.5)
         s.wait(lambda: s.on_screen("press y"), 3.0)
         s.send(b"y", 0.5)
-        check("the repair run reaches its summary",
+        check("the write run reaches its summary",
               s.wait(lambda: s.on_screen("finished"), 40.0))
         h1 = hashlib.md5(open(lk, "rb").read()).hexdigest()
         s.send(b"n", 0.6)
         s.open_form("scan")
         s.set_choice("Mode", "read")
         s.send(b"s", 0.5)
-        check("a read pass after a repair run needs no write confirmation",
+        check("a read pass after a write run needs no write confirmation",
               not s.wait(lambda: s.on_screen("press y"), 1.5))
         s.wait(lambda: s.on_screen("finished"), 20.0)
         h2 = hashlib.md5(open(lk, "rb").read()).hexdigest()
-        check("a read pass after a repair run does not write to the drive",
+        check("a read pass after a write run does not write to the drive",
               h1 == h2)
         s.send(b"q", 0.5)
         s.pump(1.0)
