@@ -143,6 +143,14 @@ static void msg(const char *fmt, ...)
 		if (g_msg_count < MSG_RING)
 			g_msg_count++;
 	} else {
+		/*
+		 * stdout is block-buffered into a pipe and stderr is not, so
+		 * without this a message lands wherever the report's buffer
+		 * happens to end: in `hddscan ... 2>&1 | tee` it split a line
+		 * of the report in two, at a place that moved with the length
+		 * of the paths printed before it.
+		 */
+		fflush(stdout);
 		va_start(ap, fmt);
 		vfprintf(stderr, fmt, ap);
 		va_end(ap);
@@ -158,6 +166,7 @@ static void die(const char *fmt, ...)
 {
 	va_list ap;
 
+	fflush(stdout);         /* see msg() */
 	fprintf(stderr, PROG ": ");
 	va_start(ap, fmt);
 	vfprintf(stderr, fmt, ap);
@@ -4836,6 +4845,7 @@ static void progress(ctx_t *c, int final)
 			snprintf(lw, sizeof(lw), "  skip: probing ahead at %s",
 				 human_size(c->probe_off, b3, sizeof(b3)));
 	}
+	fflush(stdout);         /* see msg() */
 	fprintf(stderr, "\r%s  %5.1f%%  %s/s%s  bad:%" PRIu64 " weak:%" PRIu64
 		"%s  elapsed %s  eta %s   ",
 		c->dev->name, pct,
@@ -12423,6 +12433,7 @@ static void dmbb_die(const char *fmt, ...)
 {
 	va_list ap;
 
+	fflush(stdout);         /* see msg() */
 	fprintf(stderr, DMBB_PROG ": ");
 	va_start(ap, fmt);
 	vfprintf(stderr, fmt, ap);
@@ -12435,6 +12446,7 @@ static void dmbb_msg(const char *fmt, ...)
 {
 	va_list ap;
 
+	fflush(stdout);         /* see msg() */
 	va_start(ap, fmt);
 	vfprintf(stderr, fmt, ap);
 	va_end(ap);

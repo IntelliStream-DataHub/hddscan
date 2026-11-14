@@ -926,6 +926,11 @@ assert_has "in the report too" "$out" "sectors with wrong data              7"
 assert_has "which gives a run its length" "$out" "3 blocks"
 assert_eq "and the badblocks list names every one of them" \
 	"$(wc -l < "$TMP/cor.bb")" "28"
+# REGRESSION: stdout is block-buffered into a pipe and stderr is not, so the
+# "wrote" message landed at the report's 4 KiB buffer boundary -- mid-line,
+# and on one machine in the middle of the line asserted on just above.
+assert_eq "a message on stderr never lands inside a line of the report" \
+	"$(grep -c '.hddscan: ' <<<"$out")" "0"
 rm -f "$f"
 
 echo "== --hide-and-rescan: the second pass goes through the map =="
