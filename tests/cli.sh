@@ -9,7 +9,10 @@ set -u
 
 HDDSCAN=${HDDSCAN:-./hddscan}
 PASS=0; FAIL=0; SKIP=0
-TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+# /tmp, not $TMPDIR: an image is known by its whole path, which may be at most
+# 63 characters, and a session's own TMPDIR can be long enough on its own to
+# push every image here past that.
+TMP=$(mktemp -d /tmp/hds.XXXXXX); trap 'rm -rf "$TMP"' EXIT
 
 # Every scan is recorded as a run, so the suite gets a store of its own: the
 # tests must not see the machine's real runs, and must not leave any of their
@@ -357,6 +360,15 @@ done
 # a typo silently reconfigured the drive instead of failing.
 assert_has "a non-numeric value is named in the error" \
 	"$(run --recovery-time abc "$f" 2>&1)" "takes a number from"
+# REGRESSION: an image path longer than the name field was cut to fit, so
+# --confirm was matched against, and the report named after, a path nobody
+# gave -- one that could name a different file
+long="$TMP/$(printf 'l%.0s' $(seq 1 70)).bin"
+truncate -s 8M "$long"
+assert_has "an image path too long to hold is refused, not shortened" \
+	"$(run "$long" 2>&1)" "an image path can be at most 63 characters"
+assert_eq "and the refusal exits 2" "$(run "$long" >/dev/null 2>&1; echo $?)" "2"
+rm -f "$long"
 
 echo "== advice the tool prints must actually work =="
 
@@ -1186,8 +1198,11 @@ assert_has "--status with an empty store says so, and where it looked" \
 	"$(run --state-dir "$TMP/empty" --status)" "nothing has been run"
 
 # Sparse images: a scan of one is real work that takes long enough to be
-# caught in the act, without writing terabytes.
-truncate -s 200G "$TMP/sp1.bin" "$TMP/sp2.bin" "$TMP/sp3.bin"
+# caught in the act, without writing terabytes.  Not as long as it once was:
+# a sparse read runs at page-cache speed, 25 GB/s on a recent machine, and
+# 200G each finished in seconds -- before the stop below, leaving nothing to
+# call stopped.  4T costs no more disk and buys minutes.
+truncate -s 4T "$TMP/sp1.bin" "$TMP/sp2.bin" "$TMP/sp3.bin"
 out=$(runp --profile inservice --detach --max-parallel 2 \
 	"$TMP/sp1.bin" "$TMP/sp2.bin" "$TMP/sp3.bin" 2>&1)
 assert_has "--detach prints the run id and returns" "$out" "started in the background"
@@ -1196,6 +1211,14 @@ if [ -z "$rid" ]; then
 	bad "a detached run gets an id" "$out"
 else
 	ok "a detached run gets an id"
+	# --detach returns once the run exists, not once its supervisor has
+	# started a worker; until then the run says starting
+	started=0
+	for _ in $(seq 1 120); do
+		case "$(run --status "$rid")" in *scanning*) started=1; break;; esac
+		sleep 0.25
+	done
+	assert_eq "a detached run starts scanning" "$started" "1"
 	st=$(run --status)
 	assert_has "--status lists the run" "$st" "$rid"
 	assert_has "--status says it is running" "$st" "running"
@@ -1225,11 +1248,19 @@ else
 
 	assert_has "--stop names the run it stopped" \
 		"$(run --stop "$rid")" "stopping run $rid"
-	# the stop has to reach every worker, so give them a moment to write
-	# their last record
-	for _ in 1 2 3 4 5 6 7 8 9 10; do
-		case "$(run --status)" in *running*) sleep 0.5;; *) break;; esac
-	done
+	# the stop has to reach every worker, and each writes its report before
+	# its last record, so wait for the run to end -- not merely for it to
+	# stop saying running.  A live run with nothing being read said
+	# "starting", which ended this wait early on a loaded machine; the
+	# assertions after it, --forget most of all, need the run over.
+	run_ended() {
+		case "$(run --status "$rid")" in
+		*" finished "*|*" interrupted "*) return 0;; *) return 1;;
+		esac
+	}
+	ended=0
+	for _ in $(seq 1 120); do run_ended && { ended=1; break; }; sleep 0.25; done
+	assert_eq "a stopped run ends" "$ended" "1"
 	st=$(run --status)
 	assert_hasnt "a stopped run is no longer running" "$st" "running"
 	assert_has "a stopped run says how many drives were stopped" "$st" "stopped"
