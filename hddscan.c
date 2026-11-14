@@ -9558,6 +9558,18 @@ static int resolve_target(const char *arg, device_t *d)
 		return -1;
 	}
 	if (S_ISREG(st.st_mode)) {
+		/*
+		 * An image is known by the path it was given, and a path cut
+		 * to fit is a different path: --confirm was matched against
+		 * the cut name, and the report was named after it.  Refuse
+		 * rather than act on a file nobody named.
+		 */
+		if (strlen(arg) >= sizeof(d->name)) {
+			msg(PROG ": %s: an image path can be at most %d "
+			    "characters; give a shorter one (a symlink will "
+			    "do)\n", arg, (int)sizeof(d->name) - 1);
+			return -1;
+		}
 		d->is_file = 1;
 		snprintf(d->name, sizeof(d->name), "%s", arg);
 		snprintf(d->path, sizeof(d->path), "%s", arg);
@@ -10657,6 +10669,30 @@ static void forward_stop(job_t *jobs, int n)
 			continue;
 		jobs[i].stopped = 1;
 		kill(jobs[i].pid, SIGINT);
+	}
+}
+
+/*
+ * Wait for the next worker to end, passing a stop on while waiting.  A
+ * blocking waitpid() counted on the SIGINT interrupting it, and one that
+ * landed between the caller's g_stop check and the call went unseen until a
+ * worker ended on its own -- for a big drive, hours, with every reader
+ * saying the run was being stopped.  Five looks a second cost nothing next
+ * to a scan.  Returns what waitpid() does; -1 once there is nothing left.
+ */
+static pid_t reap_wait(job_t *jobs, int n, int *st)
+{
+	struct timespec ts = { 0, 200000000L };
+	pid_t p;
+
+	for (;;) {
+		if (g_stop)
+			forward_stop(jobs, n);
+		p = waitpid(-1, st, WNOHANG);
+		if (p > 0 || (p < 0 && errno != EINTR))
+			return p;
+		if (!p)
+			nanosleep(&ts, NULL);
 	}
 }
 
@@ -15023,16 +15059,10 @@ static int format_run(const run_t *r, job_t *jobs, device_t *t, int n,
 	}
 	while (live > 0) {
 		int st;
-		pid_t p = waitpid(-1, &st, 0);
+		pid_t p = reap_wait(jobs, n, &st);
 
-		if (p < 0) {
-			if (errno == EINTR) {
-				if (g_stop)
-					forward_stop(jobs, n);
-				continue;
-			}
+		if (p < 0)
 			break;
-		}
 		for (i = 0; i < n; i++) {
 			int code;
 
@@ -15292,15 +15322,9 @@ static int scan_run(run_t *r, job_t *jobs, device_t *t, int n,
 			}
 			break;
 		}
-		p = waitpid(-1, &st, 0);
-		if (p < 0) {
-			if (errno == EINTR) {
-				if (g_stop)
-					forward_stop(jobs, total);
-				continue;
-			}
+		p = reap_wait(jobs, total, &st);
+		if (p < 0)
 			break;
-		}
 		for (i = 0; i < total; i++) {
 			int code;
 
@@ -15569,10 +15593,22 @@ static int run_interrupted(const run_t *r, const tally_t *t)
 	return !r->live && (t->running || t->queued || t->orphaned);
 }
 
+/*
+ * A live run with no drive being read is either about to start one or done
+ * with all of them and about to end -- after a stop, the moment between the
+ * last worker's record and the supervisor's own.  Calling that "starting"
+ * told a script waiting for the stop to land that it had, and its --forget
+ * was then refused.
+ */
 static const char *run_state_word(const run_t *r, const tally_t *t)
 {
-	if (r->live)
-		return t->running ? "running" : "starting";
+	if (r->live) {
+		if (t->running)
+			return "running";
+		if (!t->done && !t->orphaned)
+			return "starting";
+		return t->queued ? "running" : "finishing";
+	}
 	if (run_interrupted(r, t))
 		return "interrupted";
 	return "finished";
