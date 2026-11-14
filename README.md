@@ -62,14 +62,13 @@ depends entirely on what you are about to do with it:
 
 | profile | mode | for |
 |---|---|---|
-| **predeploy** *(default)* | write | No data on it yet. Writes every sector and verifies it reads back, skipping regions slow as a whole (`--skip-slow`), then leaves the drive configured for service. |
+| **predeploy** *(default)* | write | No data on it yet. Writes every sector and verifies it reads back, forces a reallocation of anything that still will not read, re-reads the whole device, skips regions slow as a whole (`--skip-slow`), then leaves the drive configured for service. |
 | **inservice** | read | It holds data you want to keep. Never writes anything. |
 | **survey** | read, sampled | Quick triage of a shelf. |
 | **decay** | check | Weeks after a predeploy run: has the pattern rotted? |
-| **repair** | write | predeploy, plus forcing a reallocation of anything unreadable. |
 
 A drive being prepared is the one moment someone is deliberately configuring
-it, so predeploy (and repair) also **save** the configuration it should run
+it, so predeploy also **saves** the configuration it should run
 with on a SAS drive: auto-reallocation on, read cache on (`--fix-config`), and
 the drive's own background scan on, weekly (`--bms on --bms-interval 168`).
 Each change is printed with the command that undoes it; `--no-fix-config` and
@@ -106,6 +105,20 @@ confirm with `y`. Either way it then asks whether to run a write-and-verify
 pass over the new device, which is what `--rescan` does on the command line.
 If that pass finds more damage, hiding it again adds it to the same map rather
 than stacking a second one on top. See `DESIGN.md` for how the map works.
+
+Every pass also leaves a line in the drive's own history,
+`/var/lib/hddscan/drives/<model>_<serial>.jsonl`, whichever run it was in and
+whatever the drive is called today: that pass's counters, latency and SMART
+counters, its verdict, and every bad, weak and corrupt block it found, with
+LBAs. `jq -c '.blocks[] | select(.kind == "weak")'` lists the weak ranges of
+every pass the drive has had.
+
+A drive going into service can have both done as part of its predeploy run:
+`--hide-and-rescan`, or **If damage is found → hide it** on the form. If the
+write pass finds damage, bad, weak or skipped, the second pass is a write and
+verify of the device with that damage cut out, run as a job of its own,
+instead of a re-read of the raw drive. A drive with no damage is re-read as
+usual. It needs root, since the map is activated with device-mapper.
 
 ## Runs keep going without you
 
@@ -154,11 +167,11 @@ sudo hddscan --profile decay /dev/sdb
 
 # give a drive its best chance: write, rewrite what is still slow,
 # force a reallocation of anything unreadable, then re-read the lot
-sudo hddscan --repair --confirm sdb --chunk 4M --recovery-time 300 /dev/sdb
+sudo hddscan --confirm sdb --chunk 4M --recovery-time 300 /dev/sdb
 ```
 
-A full pass over a 14 TB drive takes about a day, and `--repair` roughly twice
-that. Use `--state` with `--resume` on anything that long.
+A full pass over a healthy 14 TB drive takes about a day, and predeploy makes
+two. Use `--state` with `--resume` on anything that long.
 
 Two flags matter more than they look on a drive that is already sick:
 
@@ -175,7 +188,7 @@ A drive can also be slow across whole regions rather than in single sectors:
 every chunk there misses its budget, nearly every sector inside comes back in
 time, and the scan crawls while its WEAK count stands still. Or only a few
 chunks miss it, each so full of weak sectors that retrying them takes minutes.
-`--skip-slow` (on under predeploy and repair) stops reading a region that is too slow to
+`--skip-slow` (on under predeploy) stops reading a region that is too slow to
 scan either way: it probes 1 GiB on, then doubling steps, until the drive is fast again,
 bisects back to the edge, and carries on there. What it jumped over is
 condemned unread, and the report says so plainly. The dashboard's **SKIP**

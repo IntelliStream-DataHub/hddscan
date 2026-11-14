@@ -462,6 +462,12 @@ typedef struct {
 	int lat_idle;           /* no read at all finished inside the window */
 	char report[PATH_MAX];
 	char note[160];         /* the last thing this job had to say */
+	/*
+	 * --hide-and-rescan: the device this drive's damage was hidden
+	 * behind, for the supervisor to test next.  The worker that owned the
+	 * drive writes it; the supervisor only reads it.
+	 */
+	char map[PATH_MAX];
 } jrec_t;
 
 typedef struct {
@@ -680,6 +686,8 @@ static void jrec_put(const jrec_t *j)
 		fprintf(f, "report %s\n", j->report);
 	if (j->note[0])
 		fprintf(f, "note %s\n", j->note);
+	if (j->map[0])
+		fprintf(f, "map %s\n", j->map);
 	fclose(f);
 	rename(tmp, j->file);
 }
@@ -723,6 +731,7 @@ static int jrec_get(const char *path, jrec_t *j)
 		JSTR("serial", j->serial)
 		JSTR("report", j->report)
 		JSTR("note", j->note)
+		JSTR("map", j->map)
 #undef JSTR
 		if (!strcmp(k, "size"))
 			j->size = strtoull(v, NULL, 10);
@@ -1234,7 +1243,7 @@ static const uint64_t bucket_hi[NBUCKETS] = {
 	1000000, 2000000, 5000000, 10000000, 30000000, UINT64_MAX
 };
 
-typedef struct {
+typedef struct lat_s {
 	uint64_t count;
 	uint64_t sum_us;
 	uint64_t min_us;
@@ -1251,6 +1260,11 @@ typedef struct {
 	 * one that omits the number.
 	 */
 	uint64_t over[NTIERS];
+	/*
+	 * Fed every sample this one is, so a pass can have statistics of its
+	 * own while the report keeps the whole scan's: see the drive history.
+	 */
+	struct lat_s *shadow;
 } lat_t;
 
 static void lat_init(lat_t *l)
@@ -1263,6 +1277,8 @@ static void lat_add(lat_t *l, uint64_t us)
 {
 	int i;
 
+	if (l->shadow)
+		lat_add(l->shadow, us);
 	l->count++;
 	for (i = 0; i < NTIERS; i++)
 		if (us > lat_tiers[i])
@@ -1425,6 +1441,13 @@ typedef struct {
 	int is_root_disk;
 	int no_access;          /* could not even open it: almost always "not root" */
 	int no_capacity;        /* attached with no capacity: needs a format */
+	/*
+	 * The drive history this device's passes are written to, when it is
+	 * not this device's own: a map's test belongs in the file of the
+	 * drive under it, named here.  over is that drive's name.
+	 */
+	char uid[200];
+	char over[64];
 } device_t;
 
 /*
@@ -2747,6 +2770,18 @@ static uint64_t gcd_u64(uint64_t a, uint64_t b)
 	return a;
 }
 
+/*
+ * Where the counters stood when a pass began, so the drive history can say
+ * what that pass alone found.  The report is about the whole scan and keeps
+ * the running totals; a pass is the difference.
+ */
+typedef struct {
+	uint64_t t_us, bytes, skip_bytes, chunks, chunks_slow, writes;
+	uint64_t writes_slow, drilled, weak, bad, corrupt, healed, unrepaired;
+	uint64_t reassigned, hard, align, prot;
+	int nfind, nskip;
+} passsnap_t;
+
 typedef struct {
 	device_t *dev;
 	int fd;
@@ -2849,6 +2884,9 @@ typedef struct {
 	lat_t chunk_lat;
 	lat_t block_lat;      /* per-4K reads, drill-down + retries */
 	lat_t write_lat;
+	/* the same, for the current pass alone: the drive history */
+	lat_t pass_chunk, pass_block, pass_write;
+	passsnap_t ps;
 
 	band_t bands[N_BANDS];
 	topslow_t top[TOP_SLOW];
@@ -3969,6 +4007,7 @@ static void analyze_block(ctx_t *c, uint64_t off, size_t len, void *buf,
 	status_t st;
 	finding_t *f;
 	int readable_copy = 0;
+	int rewritten = 0, healed = 0;
 	void *keep = NULL;
 
 	if (!lat)
@@ -4024,13 +4063,10 @@ static void analyze_block(ctx_t *c, uint64_t off, size_t len, void *buf,
 	 * read -- drill_chunk() skips the ones that came back in time.  So the
 	 * only question left is whether anything came back at all.
 	 */
-	if (errors == attempts) {
+	if (errors == attempts)
 		st = ST_BAD;
-		if (c->drill_written)
-			c->blocks_unrepaired++;
-	} else {
+	else
 		st = ST_WEAK;
-	}
 
 	f = find_add(c);
 	if (f) {
@@ -4084,7 +4120,16 @@ static void analyze_block(ctx_t *c, uint64_t off, size_t len, void *buf,
 				if (rc == 0)
 					c->sas_reassigned++;
 			}
-			memset(buf, 0, len);
+			/*
+			 * A write pass lays the pattern down here too, as it
+			 * did over the rest of the chunk.  Zeros would make a
+			 * sector this rescued fail the second pass, and every
+			 * later decay run, as wrong data.
+			 */
+			if (c->mode == MODE_WRITE)
+				pattern_fill(buf, len, off, c->seed);
+			else
+				memset(buf, 0, len);
 			do_rewrite = 1;
 			src = buf;
 		}
@@ -4098,6 +4143,7 @@ static void analyze_block(ctx_t *c, uint64_t off, size_t len, void *buf,
 			if (w == (ssize_t)len) {
 				int ok = 1, k;
 
+				rewritten = 1;
 				for (k = 0; k < 3; k++) {
 					uint64_t rus;
 					ssize_t r;
@@ -4108,16 +4154,24 @@ static void analyze_block(ctx_t *c, uint64_t off, size_t len, void *buf,
 					    rus > block_thr_at(c, off))
 						ok = 0;
 				}
-				if (!ok && st == ST_BAD)
-					c->blocks_unrepaired++;
 				if (ok) {
 					if (f)
 						f->fixed_by_rewrite = 1;
 					c->blocks_fixed++;
+					healed = 1;
 				}
 			}
 		}
 	}
+	/*
+	 * Decided once, after every write this block will get: unreadable
+	 * after the write pass laid the pattern over it, or after the remap
+	 * write, and not rescued by the remap write.  Counting it at each
+	 * write counted a block twice, and counted one the remap had just
+	 * healed as unrepaired.
+	 */
+	if (st == ST_BAD && (c->drill_written || rewritten) && !healed)
+		c->blocks_unrepaired++;
 
 	free(keep);
 	free(lat);
@@ -6898,6 +6952,8 @@ static void fs_plan(const ctx_t *c)
 	    "   covers damage that had already appeared by the time it was made.\n");
 }
 
+static int hist_path(const device_t *d, char *out, size_t n);
+
 static void report(ctx_t *c)
 {
 	device_t *d = c->dev;
@@ -6935,6 +6991,12 @@ static void report(ctx_t *c)
 	}
 	if (c->profile)
 		out("  Profile          %s\n", c->profile);
+	{
+		char hp[STORE_MAX + 300];
+
+		if (hist_path(c->dev, hp, sizeof(hp)) == 0)
+			out("  History          %s\n", hp);
+	}
 	out("  Mode             %s\n", mode_name(c->mode));
 	out("  Range            %s .. %s (%s)\n",
 	    human_size(c->start, b1, sizeof(b1)),
@@ -7458,7 +7520,7 @@ no_modes:	;
 	else if (v == 1 && c->blocks_bad && !c->force_remap)
 		out(" Unreadable sectors are not by themselves a failing drive: every drive\n"
 		    " grows some, and writing them is what makes the firmware remap them.\n"
-		    " Run a write pass (--profile predeploy on an empty drive, or --repair)\n"
+		    " Run a write pass (--profile predeploy, on a drive with nothing on it)\n"
 		    " to find out whether this one still can. If they stay unreadable after\n"
 		    " being written, it is failing.\n");
 	else if (v == 1 && c->nskip)
@@ -7899,6 +7961,339 @@ static void write_prometheus(ctx_t *c, const char *path)
 		msg(PROG ": wrote %s\n", path);
 }
 
+/* ------------------------------------------------------------------ *
+ * the drive history
+ *
+ * A report belongs to a run and is named after the device, and sdb today is
+ * sdc after a reboot.  The history belongs to the drive: one file per drive,
+ * named by model and serial -- the identity --hide-bad already trusts to find
+ * a drive again -- with a line appended after every pass.  Each line is
+ * what that pass alone found: its counters, its latency, the drive's SMART
+ * counters as it ended, and every block it condemned, so a drive's decay
+ * can be followed from one pass to the next without the run that found it.
+ *
+ * JSON Lines, because a pass is appended without reading or rewriting what
+ * is there, and because a reader needs nothing but jq.  A line is built in
+ * memory and written whole with O_APPEND, then synced, so a crash leaves the
+ * file ending at the last complete pass rather than half way through one.
+ * ------------------------------------------------------------------ */
+
+/* anything that is not plainly safe in a file name becomes '_' */
+static void id_slug(const char *s, char *out, size_t n)
+{
+	size_t i;
+
+	for (i = 0; i + 1 < n && s[i]; i++)
+		out[i] = (isalnum((unsigned char)s[i]) || s[i] == '.' ||
+			  s[i] == '-') ? s[i] : '_';
+	out[i] = 0;
+}
+
+/*
+ * The name a drive's history goes by.  Model and serial, as the by-id names
+ * are made: a serial is unique only within a vendor.  An image is its whole
+ * path, since two images of one name are two drives.  A drive with no
+ * serial falls back to its kernel name and says so in the file name, since
+ * that is not stable across a reboot.
+ */
+static void dev_uid(const device_t *d, char *out, size_t n)
+{
+	char a[96], b[96], p[PATH_MAX];
+
+	if (d->uid[0]) {
+		snprintf(out, n, "%s", d->uid);
+		return;
+	}
+	if (d->is_file) {
+		char big[160];
+
+		if (!realpath(d->path, p))
+			snprintf(p, sizeof(p), "%s", d->path);
+		id_slug(p, big, sizeof(big));
+		snprintf(out, n, "image%s", big);
+		return;
+	}
+	if (d->serial[0]) {
+		id_slug(d->model[0] ? d->model : "drive", a, sizeof(a));
+		id_slug(d->serial, b, sizeof(b));
+		snprintf(out, n, "%s_%s", a, b);
+		return;
+	}
+	id_slug(d->name, a, sizeof(a));
+	snprintf(out, n, "noserial_%s", a);
+}
+
+static int hist_path(const device_t *d, char *out, size_t n)
+{
+	char uid[200], dir[STORE_MAX + 16];
+
+	dev_uid(d, uid, sizeof(uid));
+	if (snprintf(dir, sizeof(dir), "%s/drives", store_root()) >=
+	    (int)sizeof(dir) ||
+	    snprintf(out, n, "%s/%s.jsonl", dir, uid) >= (int)n)
+		return -1;
+	return mkpath(dir);
+}
+
+/* a pass starts: remember the counters, and start its own latency */
+static void hist_begin(ctx_t *c)
+{
+	passsnap_t *p = &c->ps;
+
+	p->t_us = now_us();
+	p->bytes = c->bytes_done;
+	p->skip_bytes = c->skip_bytes;
+	p->chunks = c->chunks_read;
+	p->chunks_slow = c->chunks_slow;
+	p->writes = c->writes_done;
+	p->writes_slow = c->writes_slow;
+	p->drilled = c->blocks_drilled;
+	p->weak = weak_total(c);
+	p->bad = c->blocks_bad;
+	p->corrupt = c->blocks_corrupt;
+	p->healed = c->blocks_fixed;
+	p->unrepaired = c->blocks_unrepaired;
+	p->reassigned = c->sas_reassigned;
+	p->hard = c->hard_errors;
+	p->align = c->align_errors;
+	p->prot = c->prot_errors;
+	p->nfind = c->nfind;
+	p->nskip = c->nskip;
+	lat_init(&c->pass_chunk);
+	lat_init(&c->pass_block);
+	lat_init(&c->pass_write);
+	c->chunk_lat.shadow = &c->pass_chunk;
+	c->block_lat.shadow = &c->pass_block;
+	c->write_lat.shadow = &c->pass_write;
+}
+
+static void hist_lat(FILE *m, const char *name, const lat_t *l, int last)
+{
+	fprintf(m, "\"%s\":", name);
+	if (!l->count)
+		fprintf(m, "null");
+	else
+		fprintf(m, "{\"n\":%" PRIu64 ",\"min\":%.3f,\"p50\":%.3f,"
+			"\"p99\":%.3f,\"avg\":%.3f,\"max\":%.3f}", l->count,
+			(double)l->min_us / 1000.0, lat_pct(l, 50) / 1000.0,
+			lat_pct(l, 99) / 1000.0,
+			(double)l->sum_us / (double)l->count / 1000.0,
+			(double)l->max_us / 1000.0);
+	fputs(last ? "" : ",", m);
+}
+
+static int find_cmp_off(const void *a, const void *b)
+{
+	const finding_t *x = a, *y = b;
+
+	return x->offset < y->offset ? -1 : x->offset > y->offset;
+}
+
+/*
+ * Every block this pass condemned, merged into ranges of one kind so a
+ * drive with a million weak sectors in a few bands is a few thousand lines
+ * of JSON rather than a million.  count is how many drilled blocks a range
+ * merged, worst_ms the slowest any of them took.  A block a rewrite healed
+ * is kept apart from one it did not.
+ */
+static void hist_blocks(FILE *m, const ctx_t *c, int from)
+{
+	finding_t *v;
+	int n = 0, i, first = 1;
+	uint64_t lbs = c->dev->logical_bs > 0 ? (uint64_t)c->dev->logical_bs :
+						 512;
+
+	fputs("\"blocks\":[", m);
+	v = malloc((size_t)(c->nfind - from + 1) * sizeof(*v));
+	if (!v) {
+		fputs("]", m);
+		return;
+	}
+	for (i = from; i < c->nfind; i++)
+		if (c->find[i].status != ST_OK)
+			v[n++] = c->find[i];
+	qsort(v, (size_t)n, sizeof(*v), find_cmp_off);
+	for (i = 0; i < n;) {
+		uint64_t off = v[i].offset;
+		uint64_t end = off + (v[i].len ? v[i].len : c->block);
+		uint64_t worst = v[i].max_us, cnt = 1;
+		int k = i + 1;
+
+		while (k < n && v[k].status == v[i].status &&
+		       v[k].fixed_by_rewrite == v[i].fixed_by_rewrite &&
+		       v[k].offset <= end) {
+			uint64_t e = v[k].offset + (v[k].len ? v[k].len :
+							c->block);
+
+			if (e > end)
+				end = e;
+			if (v[k].max_us > worst)
+				worst = v[k].max_us;
+			cnt++;
+			k++;
+		}
+		fprintf(m, "%s{\"offset\":%" PRIu64 ",\"length\":%" PRIu64
+			",\"lba\":%" PRIu64 ",\"lbas\":%" PRIu64
+			",\"kind\":\"%s\",\"count\":%" PRIu64
+			",\"worst_ms\":%.3f,\"healed\":%s}", first ? "" : ",",
+			off, end - off, off / lbs, (end - off + lbs - 1) / lbs,
+			status_name(v[i].status), cnt, (double)worst / 1000.0,
+			v[i].fixed_by_rewrite ? "true" : "false");
+		first = 0;
+		i = k;
+	}
+	fputs("]", m);
+	free(v);
+}
+
+/*
+ * Append what this pass found to the drive's history.  sm is the SMART read
+ * as the pass ended; the verdict is the scan's as it stands then, with sm as
+ * its "after", which for the last pass is exactly the report's.
+ */
+static void hist_append(ctx_t *c, const char *profile, int resumed,
+			int pass, int complete, const smart_t *sm)
+{
+	const passsnap_t *p = &c->ps;
+	const device_t *d = c->dev;
+	char path[STORE_MAX + 300], uid[200], wwn[128] = "", ts[40];
+	char *buf = NULL;
+	size_t len = 0, done = 0;
+	smart_t keep = c->smart_after;
+	const char *why = "";
+	double secs = (double)(now_us() - p->t_us) / 1e6;
+	uint64_t bytes = c->bytes_done - p->bytes;
+	time_t now = time(NULL);
+	struct tm tmv;
+	FILE *m;
+	int fd, v, i, first;
+
+	if (hist_path(d, path, sizeof(path)) < 0)
+		return;
+	dev_uid(d, uid, sizeof(uid));
+	if (!d->is_file && !d->over[0]) {
+		char wp[PATH_MAX];
+		FILE *w;
+
+		snprintf(wp, sizeof(wp), "/sys/block/%s/device/wwid", d->name);
+		if ((w = fopen(wp, "re"))) {
+			if (fgets(wwn, sizeof(wwn), w))
+				wwn[strcspn(wwn, "\r\n")] = 0;
+			fclose(w);
+		}
+	}
+	localtime_r(&now, &tmv);
+	strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S%z", &tmv);
+	if (sm)
+		c->smart_after = *sm;
+	v = verdict_of(c, &why);
+	c->smart_after = keep;
+
+	m = open_memstream(&buf, &len);
+	if (!m)
+		return;
+	fprintf(m, "{\"v\":1,\"time\":\"%s\",\"epoch\":%lld,\"id\":\"", ts,
+		(long long)now);
+	json_escape(m, uid);
+	fprintf(m, "\",\"run\":\"");
+	json_escape(m, g_own_run);
+	fprintf(m, "\",\"target\":\"%s\",\"device\":\"", d->over[0] ? "map" :
+		"drive");
+	json_escape(m, d->path);
+	if (d->over[0]) {
+		fprintf(m, "\",\"over\":\"");
+		json_escape(m, d->over);
+	}
+	fprintf(m, "\",\"model\":\"");
+	json_escape(m, d->model);
+	fprintf(m, "\",\"serial\":\"");
+	json_escape(m, d->serial);
+	fprintf(m, "\",\"wwn\":\"");
+	json_escape(m, wwn);
+	fprintf(m, "\",\"size\":%" PRIu64 ",\"logical_block_size\":%d,"
+		"\"profile\":\"", d->size, d->logical_bs);
+	json_escape(m, profile ? profile : "");
+	fprintf(m, "\",\"mode\":\"%s\",\"pass\":%d,\"complete\":%s,"
+		"\"resumed\":%s,",
+		c->mode == MODE_READ ? "read" : c->mode == MODE_VERIFY ?
+		"verify" : c->mode == MODE_CHECK ? "check" : "write", pass,
+		complete ? "true" : "false", resumed ? "true" : "false");
+	if (c->abort_reason[0]) {
+		fprintf(m, "\"abort_reason\":\"");
+		json_escape(m, c->abort_reason);
+		fprintf(m, "\",");
+	}
+	fprintf(m, "\"start\":%" PRIu64 ",\"end\":%" PRIu64 ",\"bytes\":%"
+		PRIu64 ",\"skipped_bytes\":%" PRIu64 ",\"elapsed_s\":%.1f,"
+		"\"rate_mib_s\":%.2f,", c->start, c->end, bytes,
+		c->skip_bytes - p->skip_bytes, secs,
+		secs > 0 ? (double)bytes / secs / 1048576.0 : 0.0);
+	fprintf(m, "\"counts\":{\"chunks\":%" PRIu64 ",\"chunks_over_budget\":%"
+		PRIu64 ",\"writes\":%" PRIu64 ",\"writes_over_budget\":%" PRIu64
+		",\"sectors_drilled\":%" PRIu64 ",\"weak\":%" PRIu64 ",\"bad\":%"
+		PRIu64 ",\"corrupt\":%" PRIu64 ",\"healed\":%" PRIu64
+		",\"unrepaired\":%" PRIu64 ",\"reassigned\":%" PRIu64
+		",\"hard_errors\":%" PRIu64 ",\"align_errors\":%" PRIu64
+		",\"prot_errors\":%" PRIu64 "},",
+		c->chunks_read - p->chunks, c->chunks_slow - p->chunks_slow,
+		c->writes_done - p->writes, c->writes_slow - p->writes_slow,
+		c->blocks_drilled - p->drilled, weak_total(c) - p->weak,
+		c->blocks_bad - p->bad, c->blocks_corrupt - p->corrupt,
+		c->blocks_fixed - p->healed,
+		c->blocks_unrepaired - p->unrepaired,
+		c->sas_reassigned - p->reassigned, c->hard_errors - p->hard,
+		c->align_errors - p->align, c->prot_errors - p->prot);
+	fputs("\"latency_ms\":{", m);
+	hist_lat(m, "read", &c->pass_chunk, 0);
+	hist_lat(m, "write", &c->pass_write, 0);
+	hist_lat(m, "sector", &c->pass_block, 1);
+	fputs("},", m);
+	if (sm && sm->have) {
+		fprintf(m, "\"smart\":{\"health\":\"");
+		json_escape(m, sm->health);
+		fprintf(m, "\",\"power_on_hours\":%lld,\"reallocated\":%lld,"
+			"\"pending\":%lld,\"offline_uncorrectable\":%lld,"
+			"\"reported_uncorrectable\":%lld,\"grown_defects\":%lld,"
+			"\"temperature_c\":%lld},", sm->power_on_hours,
+			sm->realloc_ct, sm->pending, sm->offline_uncorr,
+			sm->reported_uncorr, sm->grown, sm->temp_c);
+	}
+	fprintf(m, "\"verdict\":\"%s\",\"verdict_reason\":\"",
+		v == 0 ? "healthy" : v == 1 ? "suspect" : "failing");
+	json_escape(m, why);
+	fputs("\",", m);
+	hist_blocks(m, c, p->nfind);
+	fputs(",\"slow_regions\":[", m);
+	for (i = p->nskip, first = 1; i < c->nskip; i++, first = 0)
+		fprintf(m, "%s{\"offset\":%" PRIu64 ",\"length\":%" PRIu64
+			",\"unread\":%" PRIu64 "}", first ? "" : ",",
+			c->skips[i].off, c->skips[i].len, c->skips[i].unread);
+	fputs("]}\n", m);
+	if (fclose(m) != 0 || !buf) {
+		free(buf);
+		return;
+	}
+	fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+	if (fd < 0) {
+		msg(PROG ": cannot write the drive history %s: %s\n", path,
+		    strerror(errno));
+		free(buf);
+		return;
+	}
+	while (done < len) {
+		ssize_t w = write(fd, buf + done, len - done);
+
+		if (w < 0 && errno == EINTR)
+			continue;
+		if (w <= 0)
+			break;
+		done += (size_t)w;
+	}
+	fsync(fd);
+	close(fd);
+	free(buf);
+}
+
 static void write_csv(ctx_t *c, const char *path)
 {
 	FILE *f = fopen(path, "we");
@@ -7979,6 +8374,8 @@ typedef struct {
 	int fix_config_set;     /* named on the command line, either way */
 	int hide_bad;           /* hand the last scan's damage to dm-badblocks */
 	int rescan;             /* and then test the device that made */
+	int hide_rescan;        /* --hide-and-rescan: the second pass goes
+				 * through a map of what the first found */
 	int rescan_ok;          /* the targets are what --hide-bad just made:
 				 * its --confirm covered writing to them */
 	int apply_only;         /* apply the settings and stop, do not scan */
@@ -7996,10 +8393,10 @@ typedef struct {
 	int read_cache_set;     /* --read-cache was named, not defaulted */
 	int rewrite_weak;
 	int force_remap;
+	int force_remap_set;    /* named, not inherited from a profile */
 	int second_pass;
 	int skip_slow;          /* condemn a region too slow to scan, unread */
 	int skip_slow_set;      /* named, not just the profile's default */
-	int repair;             /* the whole repair sequence in one flag */
 	const char *profile;    /* which profile produced these defaults */
 	int retries;
 	double retry_cap_s;
@@ -8062,6 +8459,15 @@ typedef struct {
  * invocation stops and asks for --confirm rather than doing anything: an
  * error, never data loss.  Reach for 'inservice' on a drive that holds
  * anything you want to keep.
+ *
+ * Predeploy also forces a reallocation of anything still unreadable after its
+ * pattern write.  There used to be a 'repair' profile that was predeploy plus
+ * exactly that, which made the default the weaker of two destructive passes
+ * for no gain: the drive holds no data, the extra work only ever touches a
+ * sector that has already failed, and on SAS it is the one place a REASSIGN
+ * BLOCKS is sent when a plain write did not make the firmware move a sector.
+ * 'repair' and --repair are kept as names for predeploy so scripts and old
+ * run records still mean something.
  * ------------------------------------------------------------------ */
 
 typedef struct {
@@ -8101,7 +8507,7 @@ typedef struct {
 static const profile_t g_profiles[] = {
 	{ "predeploy",
 	  "no data on it yet: write every sector and verify it reads back",
-	  MODE_WRITE, 1, 0, 1, 0, 1024u * 1024, 0, 1, 1, 168, 1 },
+	  MODE_WRITE, 1, 1, 1, 0, 1024u * 1024, 0, 1, 1, 168, 1 },
 	{ "inservice",
 	  "it holds data you want to keep: never writes anything",
 	  MODE_READ,  0, 0, 0, 0, 0, -1, 0, 0, 0, 0 },
@@ -8111,9 +8517,6 @@ static const profile_t g_profiles[] = {
 	{ "decay",
 	  "weeks after a predeploy run: has the pattern rotted?",
 	  MODE_CHECK, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0 },
-	{ "repair",
-	  "predeploy, plus forcing a reallocation of anything unreadable",
-	  MODE_WRITE, 1, 1, 1, 0, 1024u * 1024, 0, 1, 1, 168, 1 },
 };
 #define NPROFILES ((int)(sizeof(g_profiles) / sizeof(g_profiles[0])))
 
@@ -8147,9 +8550,12 @@ static void usage(void)
 "                         'predeploy', so a bare run stops and asks for\n"
 "                         --confirm rather than doing anything:\n"
 "                           predeploy  no data on it yet: write every sector\n"
-"                                      and verify it reads back, 1M chunks,\n"
-"                                      write cache off for the run, and\n"
-"                                      --skip-slow.  Leaves the drive\n"
+"                                      and verify it reads back, re-read it\n"
+"                                      all, rewrite what is still slow and\n"
+"                                      force a reallocation of anything\n"
+"                                      unreadable.  1M chunks, write cache\n"
+"                                      off for the run, and --skip-slow.\n"
+"                                      Leaves the drive\n"
 "                                      configured for service:\n"
 "                                      --fix-config and --bms on, weekly,\n"
 "                                      SAVED on SAS drives\n"
@@ -8158,8 +8564,7 @@ static void usage(void)
 "                           survey     quick triage of a shelf: samples the\n"
 "                                      surface, read only\n"
 "                           decay      weeks after predeploy: has it rotted?\n"
-"                           repair     predeploy, plus forcing a reallocation\n"
-"                                      of anything unreadable\n"
+
 "                         Any explicit flag overrides what the profile set,\n"
 "                         whichever order they appear in.  The drive\n"
 "                         settings a profile carries apply only in its own\n"
@@ -8229,15 +8634,7 @@ static void usage(void)
 "                         later to catch sectors that lost their charge\n"
 "  --confirm STRING       required for verify/write; must equal the device\n"
 "                         name (e.g. sdb) or its serial number\n"
-"  --repair               give a drive its best chance, in one flag: overwrite\n"
-"                         every sector, which is what refreshes a weak one;\n"
-"                         rewrite anything still slow after that; force a\n"
-"                         reallocation on anything that will not read at all;\n"
-"                         then re-read the whole device to prove it held.\n"
-"                         Implies --mode write and so DESTROYS ALL DATA and\n"
-"                         needs --confirm.  Also turns the drive's read cache\n"
-"                         off, since a repair verified out of the drive's own\n"
-"                         DRAM is not a repair you verified\n"
+
 "  --second-pass          after --mode write, re-read the whole device and\n"
 "                         re-verify the pattern (catches slow data decay)\n"
 "  --skip-slow            when a region is too slow to scan -- most chunks\n"
@@ -8250,21 +8647,21 @@ static void usage(void)
 "                         whole.  What was jumped over is condemned unread;\n"
 "                         the report says so and --hide-bad cuts it out.\n"
 "                         Sequential or reverse order only.  On under\n"
-"                         predeploy and repair, and dropped there without\n"
-"                         comment where the order cannot walk\n"
-"  --no-skip-slow         read every region, however slow, under predeploy\n"
-"                         and repair too\n"
+"                         predeploy, and dropped there without comment where\n"
+"                         the order cannot walk\n"
+"  --no-skip-slow         read every region, however slow, under predeploy too\n"
 "  --rewrite-weak         rewrite readable-but-slow sectors in place to make\n"
 "                         the drive refresh or remap them (needs verify/write,\n"
 "                         or read mode plus this flag for read-modify-write)\n"
-"  --force-remap          overwrite UNREADABLE sectors with zeros to force a\n"
-"                         reallocation.  Destroys the contents of those sectors\n"
+"  --force-remap          overwrite UNREADABLE sectors to force a reallocation,\n"
+"                         with zeros, or the pattern in write mode, and on SAS\n"
+"                         ask the drive to reassign them.  Destroys the\n"
+"                         contents of those sectors.  On under predeploy\n"
 "\n"
 "Range and sizing\n"
 "  --start SIZE           first byte to test (default 0)\n"
 "  --end SIZE             last byte to test (default end of device)\n"
 "  --chunk SIZE           bulk read size, default 128K, 1M under predeploy\n"
-"                         and repair\n"
 "  --block SIZE           drill-down granularity, default 4K\n"
 "  --sample N             only test every Nth chunk (fast surface survey)\n"
 "  --order ORDER          sequential (default), reverse, or random.  Sequential\n"
@@ -8338,8 +8735,8 @@ static void usage(void)
 "                         parts actually wrong are touched, each is printed,\n"
 "                         and they are SAVED -- a fix that reverted when the\n"
 "                         scan ended would not be a fix.  On by default\n"
-"                         under predeploy and repair\n"
-"  --no-fix-config        leave the configuration alone under those profiles\n"
+"                         under predeploy\n"
+"  --no-fix-config        leave the configuration alone under predeploy\n"
 "  --awre on|off|keep     let the drive retire a sector it struggles to write\n"
 "  --arre on|off|keep     the same on read.  With both off the firmware never\n"
 "                         reallocates, so --rewrite-weak and --force-remap\n"
@@ -8378,8 +8775,8 @@ static void usage(void)
 "                         ex-array fault where RCD and WCE together give a\n"
 "                         drive that writes fast and reads like treacle.\n"
 "                         Restored on exit, and never saved by --persist\n"
-"                         unless named here.  Default 'off' under predeploy\n"
-"                         and repair, 'keep' otherwise\n"
+"                         unless named here.  Default 'off' under predeploy,\n"
+"                         'keep' otherwise\n"
 "  --bms on|keep          'on' tells every selected SAS/SCSI drive to run its\n"
 "                         own background medium scan: the firmware sweeps the\n"
 "                         platters whenever the drive is idle, logs what it\n"
@@ -8387,12 +8784,12 @@ static void usage(void)
 "                         recover.  Unlike every other setting here this one\n"
 "                         is SAVED ON THE DRIVE and is not undone afterwards;\n"
 "                         'sdparm --clear=EN_BMS --save /dev/sdX' turns it\n"
-"                         back off.  Default 'on' under predeploy and repair,\n"
-"                         'keep' otherwise, which touches nothing\n"
+"                         back off.  Default 'on' under predeploy, 'keep'\n"
+"                         otherwise, which touches nothing\n"
 "  --bms-interval HOURS   how often that background scan sweeps the media,\n"
 "                         saved with it (SCSI BMS_I).  Default 168, weekly,\n"
-"                         under predeploy and repair; otherwise the drive's\n"
-"                         own.  Needs --bms on\n"
+"                         under predeploy; otherwise the drive's own.  Needs\n"
+"                         --bms on\n"
 "  --io-timeout SEC       lower the kernel's per-command timeout during the\n"
 "                         scan so a dying sector fails fast (restored after)\n"
 "  --max-temp C           abort if the drive gets this hot (default 58, 0=off)\n"
@@ -8428,6 +8825,13 @@ static void usage(void)
 "                         of the new device: proves what is left is sound and\n"
 "                         that data written through the map reads back.  The\n"
 "                         form asks before doing this after hiding\n"
+"  --hide-and-rescan      both, as part of a write pass: if it finds damage\n"
+"                         anywhere -- bad, weak or skipped -- hide it straight\n"
+"                         away and make the second pass a write and verify of\n"
+"                         /dev/mapper/bb-<serial>, as a job of its own in the\n"
+"                         run, instead of a re-read of the raw drive.  A drive\n"
+"                         with no damage gets its re-read as usual.  Needs\n"
+"                         --mode write over the whole drive, and root\n"
 "  --prometheus FILE      write metrics for node_exporter's textfile collector\n"
 "  --journal FILE         crash journal for --mode verify: the original bytes\n"
 "                         are fsynced here before the pattern is written, so a\n"
@@ -8550,6 +8954,35 @@ static int open_device(device_t *d, scan_mode_t mode, int writable, int force,
 	return fd;
 }
 
+/*
+ * --hide-and-rescan: set by scan_device() when the write pass is done, found
+ * damage and covered the whole drive, so the process that owns the drive
+ * hides that damage next instead of re-reading the raw drive.
+ */
+static int g_hide_next;
+
+/*
+ * Is what the first pass found a list --hide-bad would take?  The same
+ * test it applies to the checkpoint (invariant 15): the whole drive, start to
+ * end, not sampled, not cut short -- and something on it to hide.  Every
+ * finding that is not OK goes into the list, weak sectors included, and so
+ * does every region --skip-slow condemned.
+ */
+static int hide_ready(const ctx_t *c)
+{
+	int i;
+
+	if (c->start || c->end != c->dev->size || c->sample > 1 ||
+	    c->abort_reason[0])
+		return 0;
+	if (c->nskip)
+		return 1;
+	for (i = 0; i < c->nfind; i++)
+		if (c->find[i].status != ST_OK)
+			return 1;
+	return 0;
+}
+
 static int scan_device(device_t *d, const opts_t *o, const char *json_path,
 		       const char *csv_path, const char *bb_path,
 		       const char *prom_path)
@@ -8560,7 +8993,7 @@ static int scan_device(device_t *d, const opts_t *o, const char *json_path,
 	uint64_t slow_off = 0, slow_was = 0, slow_now = 0;
 	calib_t cal;
 	const char *why;
-	int v;
+	int v, passes = 1;
 	int save_la;
 
 	memset(&c, 0, sizeof(c));
@@ -8931,9 +9364,36 @@ static int scan_device(device_t *d, const opts_t *o, const char *json_path,
 	c.t_start_us = now_us();
 	c.bytes_at_start = c.bytes_done;
 	c.rate_floor = rate_floor_of(&c, o->min_rate);
+	hist_begin(&c);
 	scan_loop(&c, c.mode == MODE_CHECK);
 
-	if (c.second_pass && c.mode == MODE_WRITE && !g_stop) {
+	g_hide_next = 0;
+	if (o->hide_rescan && c.mode == MODE_WRITE && !g_stop &&
+	    hide_ready(&c)) {
+		/*
+		 * The re-read would spend a day confirming damage the map is
+		 * about to cut out, and say nothing about the device that
+		 * will actually hold data.  Writing and verifying that device
+		 * is the second pass worth having: it proves the map puts
+		 * every byte where it is found again, over exactly the
+		 * surface that is left.
+		 */
+		out("\n  second pass: not over this drive.  Its damage is "
+		    "hidden next, and the\n  device that leaves is written "
+		    "and verified instead\n");
+		g_hide_next = 1;
+	} else if (c.second_pass && c.mode == MODE_WRITE && !g_stop) {
+		smart_t mid;
+
+		/* the first pass is over: it goes into the history now, with
+		 * the drive's counters as they stand between the two */
+		memset(&mid, 0, sizeof(mid));
+		if (!o->no_smart)
+			smart_read(d, &mid);
+		hist_append(&c, o->profile, o->resume, 1, !c.abort_reason[0],
+			    &mid);
+		hist_begin(&c);
+		passes = 2;
 		out("\n  second pass: re-reading and verifying the pattern\n");
 		c.pos = c.start;
 		c.step = 0;
@@ -8980,6 +9440,10 @@ static int scan_device(device_t *d, const opts_t *o, const char *json_path,
 	c.fd = -1;
 	kmsg_close(&c);
 
+	/* last, so its verdict is the one the report is about to give */
+	hist_append(&c, o->profile, o->resume && passes == 1, passes,
+		    !g_stop && !c.abort_reason[0],
+		    o->no_smart ? NULL : &c.smart_after);
 	report(&c);
 	if (json_path)
 		write_json(&c, json_path);
@@ -10158,6 +10622,10 @@ static int hide_bad(device_t *t, int n, const opts_t *o, mapname_t *made);
 static void hide_name(const device_t *d, char *name, size_t len);
 static int hide_under(const device_t *d, char *under, size_t ulen,
 		      char *name, size_t nlen);
+static int hide_after_scan(const device_t *d, const char *ckpt, char *next,
+			   size_t len);
+static int map_target(const char *path, const char *over, device_t *d);
+static void rescan_opts(opts_t *o);
 /* a device the summary just made, for the form to test next: --rescan */
 static mapname_t g_rescan;
 static char g_rescan_over[64];
@@ -10172,8 +10640,9 @@ static int summary_can_hide(const run_t *r, const jrec_t *x)
 {
 	char ck[STORE_MAX + 128];
 
+	/* --hide-and-rescan already did, and the map's own test is a row */
 	if (strcmp(r->kind, "scan") || x->state != JS_DONE ||
-	    !(x->bad + x->weak + x->skipped))
+	    !(x->bad + x->weak + x->skipped) || x->map[0])
 		return 0;
 	if (snprintf(ck, sizeof(ck), "%s/%s.ckpt", r->dir, x->slug) >=
 	    (int)sizeof(ck))
@@ -10920,8 +11389,8 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 	 * write -- silent, and on the wrong side of every safety check.
 	 *
 	 * mode_sel is that index space, widened: the entries past the scan
-	 * modes are the things that are not one (repair, format, settings,
-	 * hide bad).  The Mode field on the scan screen has its own index,
+	 * modes are the things that are not one (format, settings, hide
+	 * bad).  The Mode field on the scan screen has its own index,
 	 * smsel, into smap, and format and settings are no longer modes at
 	 * all but screens of their own; mode_sel is worked out from the two
 	 * each time round.
@@ -10929,8 +11398,7 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 	static const scan_mode_t mode_v[] = { MODE_READ, MODE_CHECK,
 					      MODE_VERIFY, MODE_WRITE };
 	static const char *mode_c[] = { "read", "check", "verify", "write",
-					"repair", "format", "settings",
-					"hide bad" };
+					"format", "settings", "hide bad" };
 	static const char *act_name[] = { "Scan", "Settings",
 					  "Low level format" };
 	static const char *act_what[] = {
@@ -10938,7 +11406,7 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 		"change drive cache, error recovery, background scan",
 		"erase the drive; change sector size or protection" };
 	int mode_sel = 0, order_sel = (int)o->order;
-	int smap[6], smsel = 0;
+	int smap[5], smsel = 0;
 	int la_sel = o->lookahead == 0 ? 0 : 1;
 	dset_t ds, held;
 	/*
@@ -10964,6 +11432,7 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 	static const int fpi_v[] = { -1, 0, 1, 2 };
 	int fbs_sel = 0, fpi_sel = 0, ffast_sel = 0;
 	int skip_sel = o->skip_slow ? 1 : 0;
+	int hide_sel = o->hide_rescan ? 1 : 0;
 	int la_init = la_sel;   /* to tell "chose off" from "left at off" */
 	int in_was = -1;        /* Mode was the profile's own last time round */
 	long long retries = o->retries, segment_mb = (long long)(o->segment >> 20);
@@ -10983,11 +11452,11 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 	 */
 	{ "How to test", NULL, ON(A_SCAN), "Profile",
 	  "what you are about to do with the drive; sets the rest",
-	  0, 5, { "predeploy", "inservice", "survey", "decay", "repair" },
+	  0, 4, { "predeploy", "inservice", "survey", "decay" },
 	  NULL, 0, 0, 0, &prof_sel },
 	{ NULL, NULL, ON(A_SCAN), "Mode",
-	  "read is safe; write and repair destroy data",
-	  0, 6, { "read", "check", "verify", "write", "repair", "hide bad" },
+	  "read and check are safe; write destroys data",
+	  0, 5, { "read", "check", "verify", "write", "hide bad" },
 	  NULL, 0, 0, 0, &smsel },
 	{ NULL, NULL, ON(A_SCAN), "Chunk size",
 	  "bigger is much faster but raises the bar a sector must clear",
@@ -10999,6 +11468,15 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 	{ NULL, NULL, ON(A_SCAN), "Skip slow regions",
 	  "jump regions too slow to scan; they are condemned",
 	  0, 2, { "no", "yes" }, NULL, 0, 0, 0, &skip_sel },
+	/*
+	 * A choice made here, before the run, and not a question asked
+	 * after the first pass: the run belongs to a supervisor with no
+	 * terminal, and a drive waiting days for someone to look would be
+	 * the slowest scan there is.
+	 */
+	{ NULL, NULL, ON(A_SCAN), "If damage is found",
+	  "write mode: hide it, then test what is left",
+	  0, 2, { "re-read", "hide it" }, NULL, 0, 0, 0, &hide_sel },
 	{ NULL, NULL, ON(A_SCAN), "Retries per sector",
 	  "re-reads before judging a suspect sector",
 	  1, 0, { 0 }, &retries, 0, 1000, 5, NULL },
@@ -11062,8 +11540,7 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 	smap[1] = 1;
 	smap[2] = 2;
 	smap[3] = 3;
-	smap[4] = nmode;        /* repair */
-	smap[5] = nmode + 3;    /* hide bad */
+	smap[4] = nmode + 2;    /* hide bad */
 
 	ds.rc = o->read_cache < 0 ? 0 : o->read_cache + 1;
 	ds.wc = o->write_cache < 0 ? 0 : o->write_cache + 1;
@@ -11101,11 +11578,9 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 			fpi_sel = i;
 	ffast_sel = o->fmt_fast ? 1 : 0;
 	prof_was = prof_sel;
-	if (o->repair)
-		mode_sel = nmode;
 	if (o->hide_bad)
-		mode_sel = nmode + 3;
-	for (i = 0; i < 6; i++)
+		mode_sel = nmode + 2;
+	for (i = 0; i < 5; i++)
 		if (smap[i] == mode_sel)
 			smsel = i;
 	/* what was asked for on the command line is where the menu rests */
@@ -11138,9 +11613,7 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 			for (i = 0; i < nmode; i++)
 				if (mode_v[i] == p->mode)
 					mi = i;
-			if (p->force_remap)
-				mi = nmode;     /* the repair entry */
-			for (i = 0; i < 6; i++)
+			for (i = 0; i < 5; i++)
 				if (smap[i] == mi)
 					smsel = i;
 			sample = p->sample ? (long long)p->sample : 0;
@@ -11154,8 +11627,8 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 				if (chunk_v[i] == p->chunk)
 					chunk_sel = i;
 		}
-		mode_sel = act == A_FORMAT ? nmode + 1 :
-			   act == A_SETTINGS ? nmode + 2 : smap[smsel];
+		mode_sel = act == A_FORMAT ? nmode :
+			   act == A_SETTINGS ? nmode + 1 : smap[smsel];
 		if (act == A_SCAN) {
 			/*
 			 * The drive settings follow the profile only while
@@ -11166,8 +11639,7 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 			 * moving it back restores them.
 			 */
 			const profile_t *p = &g_profiles[prof_sel];
-			int in = mode_sel < nmode ? mode_v[mode_sel] == p->mode :
-				 mode_sel == nmode && p->mode == MODE_WRITE;
+			int in = mode_sel < nmode && mode_v[mode_sel] == p->mode;
 
 			if (in_was >= 0 && in != in_was) {
 				ds.wc = in && p->write_cache >= 0 ?
@@ -11375,10 +11847,7 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 			else if (act == A_SETTINGS)
 				printf("   %sapplies the settings and stops, no "
 				       "scan%s", c_yel(), c_off());
-			else if (mode_sel == nmode)
-				printf("   %soverwrites everything and heals%s",
-				       c_red(), c_off());
-			else if (mode_sel == nmode + 3)
+			else if (mode_sel == nmode + 2)
 				printf("   %shides the last scan's damage; data "
 				       "lost%s", c_red(), c_off());
 			else if (mode_sel >= 2)
@@ -11553,10 +12022,9 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 			/*
 			 * The form comes back after every run, so a dispatch
 			 * flag from the previous accept must not leak into
-			 * this one: a leftover repair flag would silently turn
-			 * a freshly chosen read pass into a write pass.
+			 * this one: a leftover flag would silently turn a
+			 * freshly chosen read pass into something else.
 			 */
-			o->repair = 0;
 			o->format = 0;
 			o->apply_only = 0;
 			o->hide_bad = 0;
@@ -11564,9 +12032,7 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 				o->format = 1;
 			else if (act == A_SETTINGS)
 				o->apply_only = 1;
-			else if (mode_sel == nmode)
-				o->repair = 1;
-			else if (mode_sel == nmode + 3)
+			else if (mode_sel == nmode + 2)
 				o->hide_bad = 1;
 			else
 				o->mode = mode_v[mode_sel];
@@ -11581,9 +12047,16 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 			 */
 			o->profile = g_profiles[prof_sel].name;
 			o->rewrite_weak = g_profiles[prof_sel].rewrite_weak;
-			o->force_remap = g_profiles[prof_sel].force_remap;
+			/* and only under the profile's own mode, as on the
+			 * command line: see the note in main() */
+			o->force_remap = mode_sel < nmode &&
+				mode_v[mode_sel] == g_profiles[prof_sel].mode ?
+				g_profiles[prof_sel].force_remap : 0;
 			o->second_pass = g_profiles[prof_sel].second_pass;
 			o->skip_slow = skip_sel;
+			/* only where the command line would take it */
+			o->hide_rescan = hide_sel && mode_sel < nmode &&
+				mode_v[mode_sel] == MODE_WRITE && sample <= 1;
 			/* moved off the profile's own value is a choice */
 			o->skip_slow_set =
 				skip_sel != g_profiles[prof_sel].skip_slow;
@@ -11673,6 +12146,8 @@ static void spawn_job(job_t *jobs, int n, int idx, const opts_t *o,
 	job_t *j = &jobs[idx];
 	pid_t pid;
 
+	/* a worker that flushes stdio must not write the log a second time */
+	fflush(NULL);
 	pid = fork();
 	if (pid < 0)
 		die("fork: %s", strerror(errno));
@@ -11732,6 +12207,36 @@ static void spawn_job(job_t *jobs, int n, int idx, const opts_t *o,
 				 derive_path(o->badblocks, j->dev->name, 1, bb, sizeof(bb)),
 				 derive_path(o->prometheus, j->dev->name, 1, pb,
 					     sizeof(pb)));
+		/*
+		 * Still the only process that has had the drive, and the one
+		 * whose report says what was done to it: so the hide happens
+		 * here, and the supervisor only learns where the device is.
+		 */
+		if (g_hide_next && st != 130) {
+			char next[PATH_MAX];
+			int hr;
+
+			snprintf(g_job.note, sizeof(g_job.note),
+				 "hiding the damage");
+			job_flush(JS_RUNNING);
+			hr = hide_after_scan(j->dev, wo.state, next,
+					     sizeof(next));
+			if (!hr) {
+				snprintf(g_job.map, sizeof(g_job.map), "%s",
+					 next);
+				snprintf(g_job.note, sizeof(g_job.note),
+					 "damage hidden; the rest is tested "
+					 "as %.100s", next);
+			} else if (hr > 0) {
+				snprintf(g_job.note, sizeof(g_job.note),
+					 "map written on the image; nothing "
+					 "activates it without a loop device");
+			} else {
+				snprintf(g_job.note, sizeof(g_job.note),
+					 "damage not hidden, and no second "
+					 "pass ran; see the report");
+			}
+		}
 		if (g_log)
 			fclose(g_log);
 		g_job.verdict = st;
@@ -13806,19 +14311,147 @@ static int hide_bad(device_t *t, int n, const opts_t *o, mapname_t *made)
  * found the damage.
  */
 
-static int rescan_target(const char *name, const char *over, device_t *d)
+/* the device at path, which is a map over the drive called over */
+static int map_target(const char *path, const char *over, device_t *d)
 {
-	char link[PATH_MAX], real[PATH_MAX];
+	char real[PATH_MAX];
+	const char *base = strrchr(path, '/');
+	struct stat sb;
 
-	snprintf(link, sizeof(link), "/dev/mapper/%s", name);
-	if (!realpath(link, real)) {
-		msg(PROG ": %s: %s; nothing to rescan\n", link, strerror(errno));
+	/* /dev/mapper/x is a link to the dm-N the kernel knows it by; an
+	 * image standing in for one keeps the name it was given */
+	if (!realpath(path, real)) {
+		msg(PROG ": %s: %s; nothing to rescan\n", path, strerror(errno));
 		return -1;
 	}
-	if (resolve_target(real, d) < 0)
+	if (resolve_target(!stat(real, &sb) && S_ISREG(sb.st_mode) ? path :
+			   real, d) < 0)
 		return -1;
-	snprintf(d->model, sizeof(d->model), "%.*s over %.*s", 38, name, 30,
-		 over);
+	snprintf(d->model, sizeof(d->model), "%.*s over %.*s", 38,
+		 base ? base + 1 : path, 30, over);
+	return 0;
+}
+
+static int rescan_target(const char *name, const char *over, device_t *d)
+{
+	char link[PATH_MAX];
+	device_t u;
+
+	snprintf(link, sizeof(link), "/dev/mapper/%s", name);
+	if (map_target(link, over, d) < 0)
+		return -1;
+	/* its passes go into the history of the drive underneath */
+	if (resolve_target(over, &u) == 0) {
+		dev_uid(&u, d->uid, sizeof(d->uid));
+		snprintf(d->over, sizeof(d->over), "%s", u.name);
+	}
+	return 0;
+}
+
+/*
+ * --hide-and-rescan: the write pass found damage, so the second pass is a
+ * write and verify of the device with that damage cut out rather than a
+ * re-read of the raw drive.  This makes the device.  It runs in the process
+ * that owned the drive for the scan, which has closed it by now: the map's
+ * writes and the table's claim on the drive both need it free, and nothing
+ * else may have it in between (invariant 5).
+ *
+ * The list is this scan's own checkpoint, judged whole the way --hide-bad
+ * judges any other (invariant 15).  The map code dies on whatever it refuses
+ * -- a drive that already has a map, damage where the map itself would
+ * live -- and that must cost the hide, not the verdict this process is about
+ * to record.  So it runs in a child, with the run's restore list disarmed
+ * there: the drive settings are the run's to put back when the run ends
+ * (invariant 12), not a child's to put back on its way out.  What it says
+ * goes into the drive's report.
+ *
+ * Fills next with the device to test and returns 0, or says why not and
+ * returns -1, or 1 for an image, where the map is written and nothing can
+ * activate it
+ * without a loop device.  HDDSCAN_MAP_IMAGE names a file the suite stands in
+ * for the activated map, which is the only way the rest of the chain can be
+ * reached without root.
+ */
+static int hide_after_scan(const device_t *d, const char *ckpt, char *next,
+			   size_t len)
+{
+	char list[STORE_MAX + 128], name[DMBB_NAME_MAX_LEN + 1];
+	const char *stand = getenv("HDDSCAN_MAP_IMAGE");
+	dmbb_opts_t dop;
+	pid_t pid;
+	int st = 0;
+
+	next[0] = 0;
+	if (!ckpt || !ckpt_whole(ckpt, d->size)) {
+		out("\n  %s: this scan's checkpoint does not cover the whole "
+		    "drive, so its list\n  could leave damage in the middle "
+		    "of the device; nothing was hidden\n", d->name);
+		return -1;
+	}
+	if (snprintf(list, sizeof(list), "%.*s.dmbb",
+		     (int)(strlen(ckpt) - 5), ckpt) >= (int)sizeof(list) ||
+	    badblocks_replay(ckpt, list, 4096, 0, 1))
+		return -1;
+	hide_name(d, name, sizeof(name));
+	memset(&dop, 0, sizeof(dop));
+	dop.dev = d->path;
+	dop.bad = list;
+	dop.bs = 4096;
+	dop.ext = hide_extent(list);
+	dop.reserve = DMBB_DEF_RESERVE;
+	dop.name = name;
+	dop.confirm = d->path;      /* the scan's own --confirm covered it */
+
+	out("\n  %s: hiding the damage this scan found behind "
+	    "/dev/mapper/%s\n", d->name, name);
+	fflush(NULL);
+	pid = fork();
+	if (pid < 0)
+		return -1;
+	if (!pid) {
+		g_nrestore = 0;
+		g_timeout_changed = 0;
+		g_la_changed = 0;
+		g_tty_raw = 0;
+		g_job_own = 0;
+		if (g_log) {
+			int fd = fileno(g_log);
+
+			dup2(fd, STDOUT_FILENO);
+			dup2(fd, STDERR_FILENO);
+			g_quiet = 1;
+		}
+		if (dmbb_cmd_create(&dop) != 0 ||
+		    (!d->is_file && dmbb_cmd_activate(&dop) != 0)) {
+			fflush(NULL);
+			_exit(2);
+		}
+		fflush(NULL);
+		_exit(0);
+	}
+	while (waitpid(pid, &st, 0) < 0 && errno == EINTR)
+		;
+	if (!WIFEXITED(st) || WEXITSTATUS(st)) {
+		out("\n  %s: the damage could not be hidden, for the reason "
+		    "above, and no second\n  pass ran over the drive either.  "
+		    "Once that is dealt with:\n    %s --hide-bad --rescan "
+		    "--confirm %s %s\n", d->name, PROG, d->name, d->path);
+		return -1;
+	}
+	if (d->is_file) {
+		if (!stand || !*stand) {
+			out("  %s is an image: the map is written, and "
+			    "activating it needs a loop device\n", d->path);
+			return 1;
+		}
+		snprintf(next, len, "%s", stand);
+	} else {
+		snprintf(next, len, "/dev/mapper/%s", name);
+	}
+	out("\n  /dev/mapper/%s is %s with its damage cut out; it is "
+	    "written and verified\n  next, as a scan of its own.  Put the "
+	    "filesystem on that, never on %s\n  itself\n", name, d->path,
+	    d->path);
 	return 0;
 }
 
@@ -13847,7 +14480,7 @@ static void rescan_opts(opts_t *o)
 	 * not pass the flag up must not turn this into a refusal */
 	o->include_ssd = 1;
 	o->hide_bad = o->rescan = 0;
-	o->repair = o->format = o->apply_only = 0;
+	o->format = o->apply_only = 0;
 	o->rescan_ok = 1;
 }
 
@@ -14422,6 +15055,34 @@ static void run_what(run_t *r, const opts_t *o, int format)
  * supervisor, the workers, every viewer -- addresses the run through these
  * files and never through this process.
  */
+/* one drive's place in a run: what the supervisor keeps, and its record */
+static void job_init(job_t *jb, const run_t *r, device_t *d,
+		     const char *outdir, int format)
+{
+	char slug[96];
+	jrec_t j;
+
+	report_slug(d->name, slug, sizeof(slug));
+	memset(jb, 0, sizeof(*jb));
+	jb->dev = d;
+	snprintf(jb->file, sizeof(jb->file), "%s/%s.job", r->dir, slug);
+	snprintf(jb->report, sizeof(jb->report), "%s/" PROG "-%s%s.txt",
+		 outdir, format ? "format-" : "", slug);
+
+	memset(&j, 0, sizeof(j));
+	snprintf(j.file, sizeof(j.file), "%s", jb->file);
+	snprintf(j.dev, sizeof(j.dev), "%s", d->name);
+	snprintf(j.path, sizeof(j.path), "%s", d->path);
+	snprintf(j.model, sizeof(j.model), "%s", d->model);
+	snprintf(j.serial, sizeof(j.serial), "%s", d->serial);
+	snprintf(j.report, sizeof(j.report), "%s", jb->report);
+	j.size = d->size;
+	j.state = JS_QUEUED;
+	j.verdict = -1;
+	j.updated = (long long)time(NULL);
+	jrec_put(&j);
+}
+
 static int run_create(run_t *r, device_t *t, int n, const opts_t *o,
 		      int format, job_t *jobs)
 {
@@ -14488,32 +15149,8 @@ static int run_create(run_t *r, device_t *t, int n, const opts_t *o,
 	snprintf(g_own_run, sizeof(g_own_run), "%s", r->id);
 	run_put(r);
 
-	for (i = 0; i < n; i++) {
-		char slug[96];
-		jrec_t j;
-
-		report_slug(t[i].name, slug, sizeof(slug));
-		memset(jobs + i, 0, sizeof(jobs[i]));
-		jobs[i].dev = &t[i];
-		snprintf(jobs[i].file, sizeof(jobs[i].file), "%s/%s.job",
-			 r->dir, slug);
-		snprintf(jobs[i].report, sizeof(jobs[i].report),
-			 "%s/" PROG "-%s%s.txt", o->outdir,
-			 format ? "format-" : "", slug);
-
-		memset(&j, 0, sizeof(j));
-		snprintf(j.file, sizeof(j.file), "%s", jobs[i].file);
-		snprintf(j.dev, sizeof(j.dev), "%s", t[i].name);
-		snprintf(j.path, sizeof(j.path), "%s", t[i].path);
-		snprintf(j.model, sizeof(j.model), "%s", t[i].model);
-		snprintf(j.serial, sizeof(j.serial), "%s", t[i].serial);
-		snprintf(j.report, sizeof(j.report), "%s", jobs[i].report);
-		j.size = t[i].size;
-		j.state = JS_QUEUED;
-		j.verdict = -1;
-		j.updated = (long long)now;
-		jrec_put(&j);
-	}
+	for (i = 0; i < n; i++)
+		job_init(&jobs[i], r, &t[i], o->outdir, format);
 	store_prune();
 	return 0;
 }
@@ -14539,15 +15176,56 @@ static void job_cancel(const job_t *j, const char *why)
  * terminal, by design -- so it blocks in waitpid() and costs nothing while
  * the drives work.
  */
-static int scan_run(const run_t *r, job_t *jobs, device_t *t, int n,
+/*
+ * --hide-and-rescan: the drive's worker hid its damage and left the device
+ * in its record.  The test of that device is a job of its own -- its own
+ * record, its own report, its own row -- because one process writing one
+ * record is what lets every viewer trust it (invariant 12).  Returns 0 with
+ * jobs[*total] made, -1 when there is nothing to add.
+ */
+static int map_job(run_t *r, const job_t *raw, device_t *slot, job_t *jb,
+		   const opts_t *o)
+{
+	jrec_t x;
+
+	if (jrec_get(raw->file, &x) < 0 || !x.map[0] || x.state != JS_DONE)
+		return -1;
+	if (map_target(x.map, raw->dev->name, slot) < 0)
+		return -1;
+	/* its passes go into the history of the drive underneath */
+	dev_uid(raw->dev, slot->uid, sizeof(slot->uid));
+	snprintf(slot->over, sizeof(slot->over), "%s", raw->dev->name);
+	job_init(jb, r, slot, o->outdir, 0);
+	r->njobs++;
+	run_put(r);
+	return 0;
+}
+
+static int scan_run(run_t *r, job_t *jobs, device_t *t, int n,
 		    const opts_t *o)
 {
 	int maxpar = o->max_parallel > 0 ? o->max_parallel : n;
 	int launched = 0, live = 0, finished = 0, worst = 0, i;
+	int total = n, nmaps = 0;
+	device_t *maps = NULL;
+	opts_t mo = *o;
 
+	/*
+	 * What the map is tested with: the predeploy test, as --rescan runs
+	 * it, without a second pass of its own -- this test *is* the drive's
+	 * second pass, so the whole drive still costs two sweeps.
+	 */
+	if (o->hide_rescan) {
+		maps = calloc((size_t)n, sizeof(*maps));
+		if (!maps)
+			die("out of memory");
+		rescan_opts(&mo);
+		mo.second_pass = 0;
+		mo.hide_rescan = 0;
+	}
 	if (maxpar > n)
 		maxpar = n;
-	while (finished < n) {
+	while (finished < total) {
 		pid_t p;
 		int st;
 
@@ -14571,12 +15249,12 @@ static int scan_run(const run_t *r, job_t *jobs, device_t *t, int n,
 		if (p < 0) {
 			if (errno == EINTR) {
 				if (g_stop)
-					forward_stop(jobs, n);
+					forward_stop(jobs, total);
 				continue;
 			}
 			break;
 		}
-		for (i = 0; i < n; i++) {
+		for (i = 0; i < total; i++) {
 			int code;
 
 			if (jobs[i].pid != p || jobs[i].done)
@@ -14587,10 +15265,25 @@ static int scan_run(const run_t *r, job_t *jobs, device_t *t, int n,
 				worst = code;
 			live--;
 			finished++;
+			/*
+			 * Straight into the slot the drive just left: this
+			 * is that drive's second pass, not a newcomer for
+			 * the back of the queue.
+			 */
+			if (maps && i < n && !g_stop && nmaps < n &&
+			    !map_job(r, &jobs[i], &maps[nmaps], &jobs[total],
+				     o)) {
+				spawn_job(jobs, total + 1, total, &mo, r);
+				nmaps++;
+				total++;
+				live++;
+			}
+			break;
 		}
 		if (g_stop)
-			forward_stop(jobs, n);
+			forward_stop(jobs, total);
 	}
+	free(maps);
 	return worst;
 }
 
@@ -14609,7 +15302,8 @@ static int scan_run(const run_t *r, job_t *jobs, device_t *t, int n,
  */
 static int run_begin(run_t *r, device_t *t, int n, const opts_t *o, int format)
 {
-	job_t *jobs = calloc((size_t)n, sizeof(job_t));
+	/* room for a map's test after each drive: --hide-and-rescan */
+	job_t *jobs = calloc((size_t)n * 2, sizeof(job_t));
 	pid_t pid;
 
 	if (!jobs)
@@ -15123,9 +15817,18 @@ int main(int argc, char **argv)
 	 * the two appear in on the command line.
 	 */
 	o.profile = "predeploy";
-	for (i = 1; i < argc; i++)
+	for (i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--profile") && i + 1 < argc)
 			o.profile = argv[++i];
+		else if (!strcmp(argv[i], "--repair"))
+			o.profile = "repair";
+	}
+	/* the profile predeploy absorbed; see the note above g_profiles */
+	if (!strcmp(o.profile, "repair")) {
+		msg(PROG ": repair is part of predeploy now, which forces a "
+		    "reallocation too; using --profile predeploy\n");
+		o.profile = "predeploy";
+	}
 	{
 		const profile_t *p = profile_by_name(o.profile);
 
@@ -15226,10 +15929,11 @@ int main(int argc, char **argv)
 			o.rewrite_weak = 1;
 		} else if (!strcmp(a, "--force-remap")) {
 			o.force_remap = 1;
+			o.force_remap_set = 1;
 		} else if (!strcmp(a, "--profile")) {
 			(void)NEXT();   /* already resolved in the pre-pass */
 		} else if (!strcmp(a, "--repair")) {
-			o.repair = 1;
+			/* already resolved in the pre-pass, as predeploy */
 		} else if (!strcmp(a, "--second-pass")) {
 			o.second_pass = 1;
 		} else if (!strcmp(a, "--skip-slow")) {
@@ -15326,6 +16030,8 @@ int main(int argc, char **argv)
 			o.hide_bad = 1;
 		} else if (!strcmp(a, "--rescan")) {
 			o.rescan = 1;
+		} else if (!strcmp(a, "--hide-and-rescan")) {
+			o.hide_rescan = 1;
 		} else if (!strcmp(a, "--fix-config") ||
 			   !strcmp(a, "--no-fix-config")) {
 			o.fix_config = !strcmp(a, "--fix-config");
@@ -15472,6 +16178,14 @@ int main(int argc, char **argv)
 	{
 		const profile_t *p = profile_by_name(o.profile);
 
+		/*
+		 * Forcing a remap destroys what an unreadable sector held.
+		 * Predeploy does it because its write pass has destroyed
+		 * everything anyway; a read pass under it may be a drive in
+		 * service, and loses it unless asked for by name.
+		 */
+		if (p && o.mode != p->mode && !o.force_remap_set)
+			o.force_remap = 0;
 		if (p && o.mode == p->mode && !o.apply_only && !o.format) {
 			if (!o.write_cache_set)
 				o.write_cache = p->write_cache;
@@ -15814,32 +16528,32 @@ tui_again:
 	}
 
 	/*
-	 * --repair is the whole sequence a drive needs to be given its best
-	 * chance, in one flag: overwrite every sector (which is what refreshes
-	 * a weak one), rewrite anything still slow afterwards, force a
-	 * reallocation on anything that will not read at all, then re-read the
-	 * entire device to prove the repair held.
-	 *
-	 * It also turns the drive's read cache off, because a repair you
-	 * verified out of the drive's DRAM is not a repair you verified.
-	 * Everything here stays overridable: a later --read-cache keep wins.
-	 */
-	if (o.repair) {
-		o.mode = MODE_WRITE;
-		o.rewrite_weak = 1;
-		o.force_remap = 1;
-		o.second_pass = 1;
-		if (o.read_cache < 0)
-			o.read_cache = 0;
-	}
-
-	/*
 	 * Settings are applied by whoever owns the run: for a scan or a
 	 * format that is the supervisor, inside run_begin(), so that they are
 	 * put back when the *run* ends rather than when some viewer of it
 	 * exits (invariant 7b).  --apply-settings has no run at all, so it
 	 * does the work here and now.
 	 */
+	/*
+	 * It needs a write pass over the whole drive, or there is no list
+	 * --hide-bad would take, and a run of its own: the test of the map is
+	 * a job the supervisor adds once the drive's worker has made it.
+	 */
+	if (o.hide_rescan) {
+		if (o.mode != MODE_WRITE)
+			die("--hide-and-rescan follows a write pass; it needs "
+			    "--mode write, which predeploy is");
+		if (o.start || o.end || o.sample > 1)
+			die("--hide-and-rescan needs the whole drive scanned: "
+			    "a list from part of it would hide only what was "
+			    "looked at");
+		if (o.hide_bad)
+			die("--hide-and-rescan scans first; --hide-bad hides "
+			    "what an earlier scan found.  Pick one");
+		if (o.sequential)
+			die("--hide-and-rescan runs as a run, a drive at a "
+			    "time with --max-parallel 1, not --sequential");
+	}
 	if (o.rescan && !o.hide_bad)
 		die("--rescan goes with --hide-bad: it tests the device that "
 		    "makes");
@@ -16070,7 +16784,8 @@ rescan_go:
 	sigaction(SIGTERM, &sa, NULL);
 	signal(SIGPIPE, SIG_IGN);
 
-	if ((ntargets > 1 || o.tui || o.detach) && !o.sequential && !o.dry_run) {
+	if ((ntargets > 1 || o.tui || o.detach || o.hide_rescan) &&
+	    !o.sequential && !o.dry_run) {
 		int st = run_dispatch(targets, ntargets, &o, 0);
 
 		/* the exit code covers every run this process made */

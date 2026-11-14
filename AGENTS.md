@@ -110,7 +110,7 @@ can be configured once and left. All of them announce what they did on stderr
 and print the exact command that undoes it. Do not "fix" them by adding a
 restore handler.
 
-The first two are defaults of the **predeploy** and **repair** profiles (with
+The first two are defaults of the **predeploy** profile (with
 `--bms-interval 168`), and that is the only place a saved setting is not typed
 by hand. A drive being prepared for service is the moment someone is
 deliberately configuring it, and a run there has already been confirmed as a
@@ -119,6 +119,10 @@ apply only while its own mode stands (`--mode read` under predeploy may be a
 drive in service, and saves nothing), never under `--apply-settings` or
 `--format`, never under `--dry-run`, and never through `--persist`, which saves
 only what was named. `--persist` stays opt-in and is never a profile default.
+Predeploy's `--force-remap` follows the same rule, on the command line and in
+the form: it destroys what an unreadable sector held, so a read pass under
+predeploy drops it unless it was named. (`repair` used to be a profile of its
+own, predeploy plus that flag; the name and `--repair` are kept as aliases.)
 
 All of it is applied by `apply_settings()` in the process that owns the run —
 the supervisor `run_begin()` forks — before the scan starts, and never inside
@@ -439,6 +443,13 @@ Two more things that follow from the store, both easy to get wrong:
   asks the store, because `O_EXCL` only covers the drive a worker currently
   holds open — not one sitting twenty-ninth in a queue — and two runs on one
   spindle time each other's seeks.
+- **The drive history is append-only and per pass.** `hist_begin()` snapshots
+  the counters and resets the pass's shadow histograms; `hist_append()`
+  writes what changed since. The last line is written after `spares_exhausted`
+  and the kernel log are settled, just before `report()`, so its verdict is
+  the report's -- the report-must-not-contradict-itself rule extends to it.
+  A pass's blocks are `find[ps.nfind..]`; adding a finding anywhere else
+  than at the end of that array would put it in the wrong pass.
 - **Composing store paths needs `STORE_MAX`, not `PATH_MAX`.** A run directory
   is root + id + slug; three `PATH_MAX` parts cannot live in a `PATH_MAX`
   buffer, and `-Wformat-truncation` (part of `-Wformat=2`, which must stay
@@ -477,6 +488,15 @@ and `msg()`. Five rules:
 
 The kernel side (`activate`, a live `remap`, the boot unit) needs root and
 has not been run. Say so rather than implying otherwise.
+
+`--hide-and-rescan` chains the two inside a run: the drive's worker hides its
+damage once the write pass is done, and the supervisor adds a job for the map.
+The rules above hold inside it -- the list comes from that scan's own
+checkpoint, judged by `ckpt_whole()` -- and two more keep it honest. The hide
+runs in a forked child with the restore list disarmed, because `dmbb_die()`
+exits and must not take the drive's verdict or the run's settings with it.
+And the map's test is a job of its own, with its own record and report, never
+a second scan written into the drive's record (invariant 12).
 
 **11. `--format` is not a scan mode and must not become one.** FORMAT UNIT
 erases the drive, runs for hours and cannot be undone, so it dispatches before
@@ -530,6 +550,12 @@ and the address taken from sysfs, both of which need root and a real drive.
 a before and an after report so counters can be seen to move. It proves the
 parser and the verdict, not smartmontools' real layout on real drives -- that
 is still what the captured fixtures are for.
+
+`HDDSCAN_MAP_IMAGE` is the device-mapper equivalent: when `--hide-and-rescan`
+has written a map onto an image, which nothing can activate without a loop
+device and root, the file it names stands in for `/dev/mapper/bb-*` and is
+what the run tests next. Everything up to the kernel is real. Keep any
+`HDDSCAN_SLOW` range clear of the stand-in's size, or it slows that too.
 
 ## When reporting results
 

@@ -159,8 +159,14 @@ order the two appear in. The report names the profile that produced it.
 .RS
 .TP
 .B predeploy
-No data on it yet: write every sector and verify it reads back, in 1M chunks
-with the write cache off for the run, and
+No data on it yet: write every sector and verify it reads back, then re-read
+the whole device
+.RB ( \-\-second\-pass ),
+rewriting what is still slow
+.RB ( \-\-rewrite\-weak )
+and forcing a reallocation of anything still unreadable
+.RB ( \-\-force\-remap ).
+In 1M chunks with the write cache off for the run, and
 .B \-\-skip\-slow
 so a region too slow to write is condemned rather than waited on. It also leaves the drive configured for
 service, which is the part that outlives the run:
@@ -182,10 +188,15 @@ Quick triage of a shelf: samples the surface, read only.
 .TP
 .B decay
 Weeks after a predeploy run: has the pattern rotted?
-.TP
-.B repair
-predeploy, plus forcing a reallocation of anything unreadable.
 .RE
+.IP
+There used to be a
+.B repair
+profile, predeploy plus
+.BR \-\-force\-remap ;
+predeploy forces the remap itself now.
+Naming it, as a profile or as the old flag of the same name, still works:
+it says so on stderr and runs predeploy.
 .IP
 The drive settings a profile carries apply only in its own mode.
 .B \-\-mode read
@@ -354,24 +365,6 @@ Required for verify, write and format. Must equal the device name (for example
 .IR sdb )
 or its serial number.
 .TP
-.B \-\-repair
-Give a drive its best chance at recovering, in one flag. Overwrites every
-sector, which is what refreshes a weakly written one; rewrites anything still
-slow after that; forces a reallocation on anything that will not read at all;
-then re-reads the whole device to prove the repair held. Equivalent to
-.BI \-\-mode " write"
-with
-.BR \-\-rewrite\-weak ,
-.B \-\-force\-remap
-and
-.BR \-\-second\-pass ,
-so it
-.B destroys all data
-and needs
-.BR \-\-confirm .
-It also turns the drive's read cache off, because a repair verified out of the
-drive's own DRAM is not a repair you verified.
-.TP
 .B \-\-second\-pass
 After
 .BI \-\-mode " write" ,
@@ -407,12 +400,11 @@ cuts the regions out with the rest of the damage, and a scan with skips still
 counts as covering the whole drive for it. Any skip makes the verdict at least
 SUSPECT. Sequential or reverse order only, and not with
 .BR \-\-sample .
-On under the predeploy and repair profiles, where it is dropped without a
+On under the predeploy profile, where it is dropped without a
 word for an order that cannot walk the drive; named by hand it complains.
 .TP
 .B \-\-no\-skip\-slow
-Read every region however slow, including under the predeploy and repair
-profiles.
+Read every region however slow, including under the predeploy profile.
 .TP
 .B \-\-rewrite\-weak
 Rewrite readable-but-slow sectors in place so the drive refreshes or remaps
@@ -422,8 +414,15 @@ enabled; see
 .BR \-\-awre .
 .TP
 .B \-\-force\-remap
-Overwrite unreadable sectors with zeros to force a reallocation. Destroys the
-contents of those sectors.
+Overwrite unreadable sectors to force a reallocation, and on a SAS drive with
+sg3_utils ask the drive to reassign them as well. The write is zeros, or under
+.BI \-\-mode " write"
+the same pattern as the rest of the device, so a sector it rescues passes the
+second pass and a later decay check. Destroys the contents of those sectors.
+On under predeploy, but only in predeploy's own write mode:
+.BI \-\-mode " read"
+under predeploy may be a drive in service, and forces nothing unless this flag
+is named.
 .SS Range and sizing
 .TP
 .BI \-\-start " SIZE"
@@ -433,7 +432,7 @@ First byte to test. Default 0.
 Last byte to test. Default is the end of the device.
 .TP
 .BI \-\-chunk " SIZE"
-Bulk read size, default 128K, or 1M under predeploy and repair. The single biggest lever on how long a scan
+Bulk read size, default 128K, or 1M under predeploy. The single biggest lever on how long a scan
 takes, and on what it can see; see
 .B Thresholds
 above.
@@ -580,7 +579,7 @@ Apply the configuration hddscan recommends for a drive going into service:
 automatic reallocation on for both reads and writes, read cache on. Only the
 parts actually wrong are touched, each is printed, and they are saved to the
 drive \(em a fix that reverted when the scan ended would not be a fix.
-On by default under predeploy and repair. A field also named on its own with
+On by default under predeploy. A field also named on its own with
 .BR \-\-awre ,
 .B \-\-arre
 or
@@ -618,7 +617,7 @@ makes it honest and much slower. Restored on exit, and saved by
 .B \-\-persist
 only when named here. Default
 .I off
-under predeploy and repair,
+under predeploy,
 .I keep
 otherwise.
 .TP
@@ -654,13 +653,13 @@ and is not undone afterwards;
 .B sdparm \-\-clear=EN_BMS \-\-save /dev/sdX
 turns it back off. Default
 .I on
-under predeploy and repair,
+under predeploy,
 .I keep
 otherwise.
 .TP
 .BI \-\-bms\-interval " HOURS"
 How often that background scan sweeps the media (the SCSI BMS_I field), saved
-with it. Default 168, weekly, under predeploy and repair; otherwise the drive's
+with it. Default 168, weekly, under predeploy; otherwise the drive's
 own. Needs
 .BR "\-\-bms on" .
 .TP
@@ -728,6 +727,38 @@ covers it; no drive setting is changed. The interactive form asks before
 doing this after hiding a drive's damage, and does nothing unless the answer
 is yes. An image file gets its map written but no
 device, so there is nothing to rescan.
+.TP
+.B \-\-hide\-and\-rescan
+Both of the above, as part of a write pass, without waiting for a person
+between them. When the first pass has covered the whole drive and found
+damage of any kind \(em unreadable, weak, wrong data, or a region
+.B \-\-skip\-slow
+condemned \(em the raw drive is not re-read. Its report is written as usual,
+then its damage is hidden from that scan's own checkpoint, and the second
+pass becomes a write and verify of
+.IR /dev/mapper/bb\-<serial> ,
+started straight away as a job of its own in the same run, with its own
+record, report and row on the dashboard. That job has no second pass of its
+own, so a damaged drive still costs two sweeps, and the second one tests the
+device that will actually hold data. A drive with no damage gets its re-read
+as usual.
+.IP
+Needs
+.BI \-\-mode " write"
+over the whole drive, which rules out
+.BR \-\-start ,
+.B \-\-end
+and
+.BR \-\-sample ,
+and root, since the map is activated with device-mapper. It always runs as a
+run, so one drive at a time is
+.B \-\-max\-parallel 1
+rather than
+.BR \-\-sequential .
+If the map cannot be made (a drive that already carries one, or damage where
+the map itself would live), the drive's report says why, and that no second
+pass ran. The form offers it as
+.BR "If damage is found" .
 .TP
 .BI \-\-badblocks\-blocksize " N"
 Unit for that list. Default 1024. Use the block size the filesystem will be
@@ -1006,6 +1037,30 @@ when not running as root, or wherever
 .B \-\-state\-dir
 says. The records are plain key-and-value text, rewritten through a temporary
 file and renamed, so reading one with grep while a scan is running is safe.
+.TP
+.I /var/lib/hddscan/drives/<model>_<serial>.jsonl
+The drive's history, one file per drive however many runs touch it, and the
+same state directory. A line of JSON is appended after every pass, a
+predeploy run's write pass and its re-read each getting their own: when and in
+which run, the mode and the pass, whether it finished, what it covered and how
+fast, that pass's own counters and read, write and sector latency, the drive's
+SMART counters as it ended, the verdict as it stood, every bad, weak and
+corrupt block it found, merged into ranges of one kind with byte offset, LBA
+and the slowest read in each, and every region
+.B \-\-skip\-slow
+condemned. A stopped pass is written too, marked as not complete. A map's
+test goes into the file of the drive underneath, marked as a map. An image is
+named by its whole path, and a drive with no serial by its kernel name, which
+says so. Read it with
+.BR jq ;
+for example, every weak range of every pass:
+.RS
+.EX
+jq \-c '.blocks[] | select(.kind == "weak")' \fIfile\fP
+.EE
+.RE
+.IP
+Nothing prunes it.
 .SH DEPENDENCIES
 hddscan links nothing beyond libc, so the binary works on a rescue system with
 no packages installed. The following are shelled out to when present and done

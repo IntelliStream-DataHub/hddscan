@@ -58,11 +58,10 @@ to derive it from.
 
 | profile | mode | for |
 |---|---|---|
-| **predeploy** *(default)* | write | No data on it yet. Writes every sector and verifies it reads back — the only way to learn whether a sector will *accept* a write. Leaves the drive configured for service. |
+| **predeploy** *(default)* | write | No data on it yet. Writes every sector and verifies it reads back — the only way to learn whether a sector will *accept* a write — forces a reallocation of anything that still will not read, and re-reads the whole device. Leaves the drive configured for service. |
 | **inservice** | read | It holds data you want to keep. Never writes anything. |
 | **survey** | read, sampled | Quick triage of a shelf. |
 | **decay** | check | Weeks after a predeploy run: has the pattern rotted? |
-| **repair** | write | predeploy, plus forcing a reallocation of anything unreadable. |
 
 The default writes, because a surface test is nearly always run before a drive
 goes into service and a read-only pass cannot tell you whether a sector will
@@ -327,7 +326,7 @@ cost minutes. Another real drive spent six and a half minutes on its first
 forty megabytes that way: 4.4% of chunks over budget, a climbing weak count,
 and an ETA of four years.
 
-`--skip-slow` (on under the predeploy and repair profiles) handles both. A region is too slow
+`--skip-slow` (on under the predeploy profile) handles both. A region is too slow
 to scan when, over a trailing window of chunks, either:
 
 - three quarters of the last 64 MiB were over budget, or
@@ -436,6 +435,29 @@ map and read back through it. That proves the surviving surface is sound and
 that the map puts every byte back where it will be found. No drive setting is
 touched, because the device is a map.
 
+`--hide-and-rescan` (the form's **If damage is found → hide it**) does both
+inside a write pass, without a person in between. Once the first pass has
+covered the whole drive and found damage of any kind, the raw drive is not
+re-read: a day spent confirming damage the map is about to cut out says
+nothing about the device that will hold data. The drive's report is written,
+then the process that owned the drive hides the damage from that scan's own
+checkpoint, judged whole by the same test `--hide-bad` uses. The supervisor
+adds a job to the run for `/dev/mapper/bb-*` and starts it in the slot the
+drive just left. It is a write and verify with no second pass of its own,
+because it *is* the drive's second pass, so a damaged drive still costs two
+sweeps. A drive with no damage gets its re-read as usual.
+
+It is a choice made before the run, not a question asked after the first
+pass, because the run belongs to a supervisor with no terminal (invariant 12).
+A drive waiting for somebody to look at a screen would be idle for however
+long that took. The map's test is a job of its own, with its own record,
+report and row, because one process writing one record is what lets every
+viewer trust it. The hide runs in a child of the drive's worker with the
+run's restore list disarmed, because the map code exits on whatever it
+refuses, and that must cost the hide, not the drive's recorded verdict or the
+run's drive settings. When the map cannot be made, the drive's report says why
+and says plainly that no second pass ran.
+
 ### The budget follows the platter
 
 A disk spins at a fixed rate, so an outer track sweeps further per revolution
@@ -510,8 +532,7 @@ scans of the same drive incomparable. **Chunk size** is a field on the form so
 the trade is one keystroke away when you want it, and `--sector-slow-ms` buys
 back the sensitivity at the cost of more drill-downs.
 
-The exception is **predeploy** (and repair, which is predeploy and more), at
-1 MiB. It writes every sector, reads it back, and reads it again, so at
+The exception is **predeploy**, at 1 MiB. It writes every sector, reads it back, and reads it again, so at
 14 MB/s a 12 TB drive would be weeks on the bench — long enough that the scan
 does not get run, which finds nothing at all. Its main question is also not
 latency: whether a sector accepts a write and returns the same bytes is
@@ -575,12 +596,12 @@ fix and reports `healed by rewrite`.
 reallocation. That sector's data is gone, but a pending sector becomes a
 reallocated one and the drive stops stalling on it.
 
-### Repairing a drive in one pass
+### Giving a drive its best chance
 
-`--repair` is the whole sequence, in order, on every sector:
+Predeploy is the whole sequence, in order, on every sector:
 
 ```sh
-sudo hddscan --repair --confirm sdc --chunk 4M \
+sudo hddscan --confirm sdc --chunk 4M \
      --recovery-time 300 --retries 3 \
      --state /var/tmp/sdc.state --resume /dev/sdc
 ```
@@ -596,12 +617,25 @@ sudo hddscan --repair --confirm sdc --chunk 4M \
 4. **Re-read the entire device** and re-verify the pattern, to prove the repair
    held rather than assuming it.
 
-It also turns the drive's read cache off, because a repair verified out of the
-drive's own DRAM is not a repair you verified.
+The drive's read cache is off for the scan, as it is for every scan, because a
+repair verified out of the drive's own DRAM is not a repair you verified.
 
-It destroys all data and needs `--confirm`, and it is three full passes over
-the device — expect roughly twice the wall clock of a plain `--mode write`.
+It destroys all data and needs `--confirm`, and it is two sweeps of the
+device: the first reads, writes and reads back each chunk, the second re-reads
+the lot. Expect roughly twice the wall clock of a plain `--mode write`.
 `--state` with `--resume` is strongly advised.
+
+There used to be a separate `repair` profile, and a `--repair` flag, that were
+predeploy plus step 3. That made the default the weaker of two destructive
+passes for nothing: a drive with no data on it loses nothing to a forced
+remap, and the extra work only ever touches a sector that has already failed.
+Both names still work and run predeploy. Step 3 is predeploy's only while its
+own write mode stands; `--mode read` under it may be a drive in service and
+forces nothing unless `--force-remap` is named.
+
+Under a write pass the forced rewrite lays down the pattern rather than zeros,
+so a sector it rescues passes the second pass, and a later decay check, as
+what it is.
 
 The report says what it achieved:
 
@@ -689,7 +723,7 @@ run-scoped unless you ask for `--persist`.
 writes, read cache on — changing only the parts actually wrong on each drive
 and printing each change. It saves what it sets, for the same reason `--bms on`
 does: a configuration fix that reverted when the scan ended would not be a fix.
-Predeploy and repair apply it by default; `--no-fix-config` opts out, and a
+Predeploy applies it by default; `--no-fix-config` opts out, and a
 field named on its own (`--awre off`) is left to that flag.
 
 `--write-cache on|off` flips WCE for the duration of a scan and puts it back
@@ -697,7 +731,7 @@ afterwards, which is how you tell those apart without committing to anything:
 measure, flip, measure again. It matters for write modes on its own account
 too — with the cache on, a write returns as soon as the drive has the data in
 DRAM, so you are timing the cache rather than the platter. `off` makes a write
-mode honest and a great deal slower. Predeploy and repair turn it off for
+mode honest and a great deal slower. Predeploy turns it off for
 exactly that reason. Like the look-ahead and unlike `--bms`, it is restored on
 exit, on `SIGINT` and on error, and `--persist` saves it only if it was named:
 off is how a write pass is measured, not how a drive should run.
@@ -788,7 +822,7 @@ writes a *saved* mode page and stays on, because a background scan that stopped
 when the scan did would be pointless: sweeping a 14 TB drive takes days of idle
 time. It says so on stderr when it happens and prints the command to reverse it
 (`sdparm --clear=EN_BMS --save /dev/sdX`). It is on by default under
-**predeploy** and **repair**, where the drive is being prepared for service and
+**predeploy**, where the drive is being prepared for service and
 leaving it off means it mostly never gets turned on, with `--bms-interval 168`
 so the drive sweeps itself weekly; `--bms keep` opts out. Every other profile
 leaves it alone unless asked, and so does predeploy once its mode is overridden
@@ -1144,6 +1178,22 @@ checkpoint, and a `log` for anything the run had to say. All of it is plain
 key-and-value text, rewritten whole through a temporary file and `rename(2)`,
 so a reader never sees half a record and `grep` is a perfectly good client.
 
+**The drive history.** Beside the runs, `drives/<model>_<serial>.jsonl` belongs
+to the drive rather than to any run: a report is named after a device, and sdb
+today is sdc after a reboot. After every pass a line of JSON is appended with
+what that pass alone found — its counters and latency (a shadow histogram fed
+alongside the scan's own, reset as each pass starts, so the report's totals
+are untouched), the drive's SMART counters as it ended, the verdict as it
+stood, and every bad, weak and corrupt block, merged into ranges of one kind so
+a drive with a million weak sectors in a few bands stays a few thousand
+entries. Following one drive's decay over months is then one `jq` away, with
+no run directory needed. A line is built in memory and written whole with
+`O_APPEND`, then synced, so a crash leaves the file ending at the last complete
+pass. The last line of a scan is written after everything the verdict depends
+on is known, so it gives the report's verdict, never an earlier guess. A
+stopped pass is written as not complete, and a map's test goes into the file
+of the drive under it.
+
 **One writer per record.** The worker that holds a drive is the only thing that
 writes that drive's record; the supervisor patches in only how the worker
 ended, by reading the record and writing it back. Progress is therefore never
@@ -1312,7 +1362,10 @@ MIT. See [LICENSE](LICENSE). Copyright (c) 2026 Olav Gjerde.
 **The device-mapper side of `hddscan dm` has not been run.** Activating a map,
 remapping on a live device (suspend, reload, resume, and putting the old map
 back when a reload fails), the boot unit, and `--rescan` of an activated
-device all need root. The suite proves
+device all need root, and so does `--hide-and-rescan` activating the map it
+writes. The suite reaches the rest of that chain with `HDDSCAN_MAP_IMAGE`, a
+file standing in for the activated device: the decision, the map written onto
+the image, the record, the job the supervisor adds and the scan of it. The suite proves
 the table arithmetic and that data survives a remap by applying each table
 with `dd`, not the kernel.
 
