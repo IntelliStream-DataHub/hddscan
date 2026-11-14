@@ -182,7 +182,14 @@ class Session:
         for _ in range(limit):
             if any(label in h for h in self.screen.highlighted()):
                 return True
-            self.send(DOWN, 0.12)
+            # wait for the cursor to move rather than for a fixed time: a
+            # frame that has not caught up yet still shows the old row, and
+            # stepping again from it walks past the label on a loaded machine
+            before = self.screen.highlighted()
+            self.send(DOWN, 0.05)
+            if not self.wait(lambda: self.screen.highlighted() != before,
+                             1.5):
+                break           # the bottom: down does not wrap
         return any(label in h for h in self.screen.highlighted())
 
     def wait(self, pred, timeout=4.0):
@@ -203,11 +210,16 @@ class Session:
         if not self.goto(label):
             return False
         for _ in range(limit):
-            if self.value_of(label) == want:
+            cur = self.value_of(label, scroll=False)
+            if cur == want:
                 return True
-            self.send(RIGHT, 0.14)
-            self.wait(lambda: self.value_of(label) is not None, 1.0)
-        return self.value_of(label) == want
+            # the same race goto() has: the old value is a value, so waiting
+            # for "any value" passed at once on a frame not yet redrawn, and
+            # the next step overshot -- a profile switch on a loaded CI runner
+            # landed on the wrong profile.  Wait for this step to show.
+            self.send(RIGHT, 0.05)
+            self.wait(lambda: self.value_of(label, scroll=False) != cur, 1.5)
+        return self.value_of(label, scroll=False) == want
 
     def on_screen(self, text):
         return any(text in l for l in self.screen.lines())
