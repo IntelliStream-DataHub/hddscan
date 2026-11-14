@@ -898,7 +898,7 @@ assert_eq "a pass counts its own reads, not the scan's" \
 assert_eq "both passes covered the drive" \
 	"$(hist_field "$hf" 2 "d['bytes'], d['complete']")" "(16777216, True)"
 # corruption at known offsets: the blocks are exact, LBAs included, and the
-# count is the report's (a chunk counts its first wrong block)
+# count is the report's
 printf 'BADBADBAD' | dd of="$f" bs=1 seek=8388608 conv=notrunc status=none
 printf 'ZZZZ' | dd of="$f" bs=1 seek=12582912 conv=notrunc status=none
 out=$(runp --profile decay "$f")
@@ -911,6 +911,21 @@ assert_eq "and the line's verdict and counts are the report's" \
 	"$(hist_field "$hf" 3 "d['verdict'], d['counts']['corrupt']")" \
 	"('failing', 2)"
 assert_has "which says the same" "$out" "sectors with wrong data              2"
+# REGRESSION: the check stopped at a chunk's first wrong word, so damage
+# further into the same chunk was never counted, listed or hidden.  Blocks
+# 4K apart are one run of two; a run of three zeroed blocks is one finding.
+printf 'X' | dd of="$f" bs=1 seek=8392704 conv=notrunc status=none
+printf 'X' | dd of="$f" bs=1 seek=8400896 conv=notrunc status=none
+dd if=/dev/zero of="$f" bs=4096 seek=3075 count=3 conv=notrunc status=none
+out=$(runp --profile decay --badblocks-list "$TMP/cor.bb" "$f")
+assert_eq "every wrong block in a chunk is listed, not only the first" \
+	"$(hist_field "$hf" 4 "[(b['offset'], b['length'], b['count']) for b in d['blocks']]")" \
+	"[(8388608, 8192, 2), (8400896, 4096, 1), (12582912, 4096, 1), (12595200, 12288, 3)]"
+assert_eq "and counted" "$(hist_field "$hf" 4 "d['counts']['corrupt']")" "7"
+assert_has "in the report too" "$out" "sectors with wrong data              7"
+assert_has "which gives a run its length" "$out" "3 blocks"
+assert_eq "and the badblocks list names every one of them" \
+	"$(wc -l < "$TMP/cor.bb")" "28"
 rm -f "$f"
 
 echo "== --hide-and-rescan: the second pass goes through the map =="

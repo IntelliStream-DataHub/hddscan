@@ -1388,6 +1388,10 @@ are the ones that would matter most if they were wrong:
   chunk a permutation skipped would show up as corrupt. None did.
 - **Silent corruption is caught at the right offset** — byte-level damage
   injected at three offsets was reported at exactly the right 4 KiB blocks.
+  Every wrong block is, not only a chunk's first: the check once stopped at
+  the first wrong word, so damage a few KiB further into the same chunk went
+  uncounted, unlisted and unhidden. Consecutive wrong blocks are one finding
+  with a length, so a chunk that is wrong throughout costs one entry.
 
 The run store was tested the same way, against sparse images — a `truncate -s
 300G` file is minutes of genuine work without writing anything, which is the

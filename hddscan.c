@@ -3971,6 +3971,50 @@ static finding_t *find_add(ctx_t *c)
 	return &c->find[c->nfind++];
 }
 
+/*
+ * Record every block of the chunk at c->pos whose data is not the pattern and
+ * return how many blocks that was.  This used to stop at the first wrong word
+ * and record one block per chunk however many were wrong, so two corruptions
+ * a few KiB apart were one block in the report, in the drive history and in
+ * the list --hide-bad builds its map from.  Consecutive wrong blocks become one
+ * finding with their length, so a chunk that is wrong throughout -- a pattern
+ * that was never written there -- costs one entry, not thousands, and cannot
+ * fill the finding list and push out the unreadable sectors behind it.
+ */
+static uint64_t corrupt_record(ctx_t *c, const uint8_t *buf, size_t len)
+{
+	uint64_t bad_at = 0, b, end = c->pos + len, run = 0, rs = 0, n = 0;
+	uint64_t bs = c->block ? c->block : DEF_BLOCK;
+
+	if (pattern_check(buf, len, c->pos, c->seed, &bad_at) == 0)
+		return 0;
+	for (b = bad_at - bad_at % bs; b < end; b += bs) {
+		uint64_t lo = b > c->pos ? b : c->pos;
+		uint64_t hi = b + bs < end ? b + bs : end;
+		int wrong = pattern_check(buf + (lo - c->pos), (size_t)(hi - lo),
+					  lo, c->seed, NULL) < 0;
+
+		if (wrong) {
+			if (!run)
+				rs = b;
+			run += bs;
+			n++;
+		}
+		if (run && (!wrong || b + bs >= end)) {
+			finding_t *f = find_add(c);
+
+			if (f) {
+				f->offset = rs;
+				f->len = (uint32_t)run;
+				f->status = ST_CORRUPT;
+				f->attempts = 1;
+			}
+			run = 0;
+		}
+	}
+	return n;
+}
+
 static int cmp_u32(const void *a, const void *b)
 {
 	uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
@@ -6136,18 +6180,10 @@ static void scan_loop(ctx_t *c, int verify_only_pass)
 		}
 
 		if (verify_only_pass && r == (ssize_t)len) {
-			uint64_t bad_at = 0;
+			uint64_t nc = corrupt_record(c, buf, len);
 
-			if (pattern_check(buf, len, c->pos, c->seed, &bad_at) < 0) {
-				finding_t *f = find_add(c);
-
-				c->blocks_corrupt++;
-				if (f) {
-					f->offset = bad_at - (bad_at % c->block);
-					f->len = (uint32_t)c->block;
-					f->status = ST_CORRUPT;
-					f->attempts = 1;
-				}
+			if (nc) {
+				c->blocks_corrupt += nc;
 				drill = 1;
 			}
 		}
@@ -6244,7 +6280,7 @@ static void scan_loop(ctx_t *c, int verify_only_pass)
 					drill = 1;
 				r = timed_pread(c->fd, buf, len, c->pos, &rus, &err);
 				if (r == (ssize_t)len) {
-					uint64_t bad_at = 0;
+					uint64_t nc;
 
 					lat_add(&c->chunk_lat, rus);
 					latwin_add(&c->latwin, rus);
@@ -6260,17 +6296,9 @@ static void scan_loop(ctx_t *c, int verify_only_pass)
 					}
 					if (rus > chunk_thr_at(c, c->pos))
 						drill = 1;
-					if (pattern_check(buf, len, c->pos,
-							  c->seed, &bad_at) < 0) {
-						finding_t *f = find_add(c);
-
-						c->blocks_corrupt++;
-						if (f) {
-							f->offset = bad_at - (bad_at % c->block);
-							f->len = (uint32_t)c->block;
-							f->status = ST_CORRUPT;
-							f->attempts = 1;
-						}
+					nc = corrupt_record(c, buf, len);
+					if (nc) {
+						c->blocks_corrupt += nc;
 						drill = 1;
 					}
 				} else {
@@ -7444,12 +7472,17 @@ no_modes:	;
 			const char *col = (f->status == ST_BAD || f->status == ST_CORRUPT)
 					  ? c_red() : c_yel();
 
-			out("    %s%-18" PRIu64 "%s %-10s %6u %6u %10.2f %10.2f %10.2f  %s%s\n",
+			char run[48] = "";
+
+			if (f->len > c->block)
+				snprintf(run, sizeof(run), "%" PRIu64 " blocks ",
+					 (uint64_t)f->len / c->block);
+			out("    %s%-18" PRIu64 "%s %-10s %6u %6u %10.2f %10.2f %10.2f  %s%s%s\n",
 			    col, f->offset, c_off(), status_name(f->status),
 			    f->attempts, f->errors,
 			    (double)f->first_us / 1000.0,
 			    (double)f->med_us / 1000.0,
-			    (double)f->max_us / 1000.0,
+			    (double)f->max_us / 1000.0, run,
 			    f->errnum ? errname(f->errnum) : "",
 			    f->fixed_by_rewrite ? " [healed by rewrite]" :
 			    f->rewritten ? " [rewritten, still weak]" : "");
@@ -8116,7 +8149,8 @@ static void hist_blocks(FILE *m, const ctx_t *c, int from)
 	for (i = 0; i < n;) {
 		uint64_t off = v[i].offset;
 		uint64_t end = off + (v[i].len ? v[i].len : c->block);
-		uint64_t worst = v[i].max_us, cnt = 1;
+		uint64_t worst = v[i].max_us, cnt = (end - off + c->block - 1) /
+						     c->block;
 		int k = i + 1;
 
 		while (k < n && v[k].status == v[i].status &&
@@ -8125,11 +8159,12 @@ static void hist_blocks(FILE *m, const ctx_t *c, int from)
 			uint64_t e = v[k].offset + (v[k].len ? v[k].len :
 							c->block);
 
+			/* blocks, not findings: a run of wrong data is one */
+			cnt += (e - v[k].offset + c->block - 1) / c->block;
 			if (e > end)
 				end = e;
 			if (v[k].max_us > worst)
 				worst = v[k].max_us;
-			cnt++;
 			k++;
 		}
 		fprintf(m, "%s{\"offset\":%" PRIu64 ",\"length\":%" PRIu64
