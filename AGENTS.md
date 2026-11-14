@@ -198,10 +198,15 @@ Anything new that starts a scan has to keep that property.
 
 Runs are testable without hardware in two ways, and both are used:
 
-- **Sparse images.** `truncate -s 300G` gives a scan that takes minutes of real
+- **Sparse images.** `truncate -s 4T` gives a scan that takes minutes of real
   work without writing anything, which is the only way to catch a run in the
   act — to assert that a drive is queued, that quitting leaves the run going,
-  or that a stopped drive still wrote its report.
+  or that a stopped drive still wrote its report. Not 300G, as it once was: a
+  sparse read runs at page-cache speed, 25 GB/s on a recent machine, and a run
+  that finishes before the test stops it has nothing to call stopped.
+  And wait for the state a test needs, never for one to go away: a live run
+  with no drive being read is `starting` or `finishing`, and "not running" is
+  true of both.
 - **Records written by hand.** A run directory plus a job record or two is
   enough to exercise every reader, including the states that need a crash to
   produce: a record that says running with a pid that does not exist is how the

@@ -117,6 +117,12 @@ class Screen:
 
 class Session:
     def __init__(self, args, rows=ROWS, cols=COLS, open=None):
+        # The budget floor, as in cli.sh: without it the budget is 25 ms,
+        # which a loaded machine's own reads exceed, and a clean image then
+        # drills, finds weak sectors and is offered for hiding.  First, so
+        # a test that needs a floor of its own still gets the last word.
+        if "-i" in args or "--no-tui" in args:
+            args = ["--floor-ms", "1000"] + args
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
             os.execv(HDDSCAN, [HDDSCAN] + args)
@@ -133,11 +139,11 @@ class Session:
         """Take the form from the drive picker to one action's options:
         enter on the drives that are already ticked, then the action's number.
         The drives have to be picked before this is called."""
-        self.wait(lambda: self.on_screen("choose drives"), 6.0)
+        self.wait(lambda: self.on_screen("choose drives"), 20.0)
         self.send(b"\n", 0.3)
-        self.wait(lambda: self.on_screen("choose an action"), 3.0)
+        self.wait(lambda: self.on_screen("choose an action"), 10.0)
         self.send({"scan": b"1", "settings": b"2", "format": b"3"}[action], 0.3)
-        return self.wait(lambda: self.on_screen("(3 of 3)"), 3.0)
+        return self.wait(lambda: self.on_screen("(3 of 3)"), 10.0)
 
     def pump(self, seconds):
         end = time.time() + seconds
@@ -178,7 +184,11 @@ class Session:
         if any(label in h for h in self.screen.highlighted()):
             return True
         os.write(self.fd, UP * limit)
-        self.pump(0.6)
+        # wait for the rewind to be drawn, not a fixed time: walking down
+        # from a frame that still shows the old row can never reach a label
+        # above it, and on a loaded machine 0.6 s was not always enough
+        self.pump(0.3)
+        self.settle()
         for _ in range(limit):
             if any(label in h for h in self.screen.highlighted()):
                 return True
@@ -188,20 +198,38 @@ class Session:
             before = self.screen.highlighted()
             self.send(DOWN, 0.05)
             if not self.wait(lambda: self.screen.highlighted() != before,
-                             1.5):
+                             3.0):
                 break           # the bottom: down does not wrap
         return any(label in h for h in self.screen.highlighted())
 
-    def wait(self, pred, timeout=4.0):
+    def wait(self, pred, timeout=10.0):
         """Poll the screen until pred holds.  Fixed sleeps race the redraw --
         the form repaints on its own 200 ms tick, so a key pressed just after
-        one repaint is not visible until the next."""
+        one repaint is not visible until the next.  The default is generous
+        because a wait that succeeds costs nothing, and the suite has to pass
+        on a machine busy scanning real drives; a wait expected to fail
+        passes a short timeout of its own."""
         end = time.time() + timeout
         while time.time() < end:
             if pred():
                 return True
             self.pump(0.12)
         return pred()
+
+    def settle(self, timeout=5.0):
+        """Wait until two looks at the screen agree.  A frame is drawn by
+        absolute position in several writes, and the header a test waits
+        for comes before the rows it then asserts on; a look between two of
+        those writes sees half a frame."""
+        end = time.time() + timeout
+        prev = self.screen.lines()
+        while time.time() < end:
+            self.pump(0.3)
+            cur = self.screen.lines()
+            if cur == prev:
+                return True
+            prev = cur
+        return False
 
     def set_choice(self, label, want, limit=12):
         """Step a choice field to a value by name.  Counting keypresses from
@@ -218,7 +246,7 @@ class Session:
             # the next step overshot -- a profile switch on a loaded CI runner
             # landed on the wrong profile.  Wait for this step to show.
             self.send(RIGHT, 0.05)
-            self.wait(lambda: self.value_of(label, scroll=False) != cur, 1.5)
+            self.wait(lambda: self.value_of(label, scroll=False) != cur, 5.0)
         return self.value_of(label, scroll=False) == want
 
     def on_screen(self, text):
@@ -228,11 +256,15 @@ class Session:
         """Devices named on the command line arrive already ticked."""
         if not self.goto(name, 14):
             return False
-        row = [h for h in self.screen.highlighted() if name in h]
-        if row and row[0].lstrip().startswith("[ ]"):
-            self.send(b" ", 0.25)
-        row = [h for h in self.screen.highlighted() if name in h]
-        return bool(row) and row[0].lstrip().startswith("[x]")
+
+        def row():
+            r = [h for h in self.screen.highlighted() if name in h]
+            return r[0].lstrip() if r else ""
+        self.settle()
+        if row().startswith("[ ]"):
+            self.send(b" ", 0.1)
+            self.wait(lambda: row().startswith("[x]"), 5.0)
+        return row().startswith("[x]")
 
     def value_of(self, label, scroll=True):
         for line in self.screen.lines():
@@ -270,7 +302,9 @@ def img(d, name, mb):
 
 
 def main():
-    tmp = tempfile.mkdtemp()
+    # /tmp, not $TMPDIR: an image path may be at most 63 characters, and a
+    # long TMPDIR would push every image here past that (see cli.sh)
+    tmp = tempfile.mkdtemp(prefix="hds.", dir="/tmp")
     try:
         a = img(tmp, "a.bin", 12)
         b = img(tmp, "b.bin", 12)
@@ -305,6 +339,7 @@ def main():
         check("enter with a drive picked reaches the action menu",
               s.wait(lambda: s.on_screen("choose an action")),
               "\n".join(l for l in s.screen.lines() if l.strip()))
+        s.settle()      # the title is drawn before the items under it
         check("the menu offers a scan, settings and a low level format",
               all(s.on_screen(t) for t in ("Scan", "Settings",
                                            "Low level format")),
@@ -379,6 +414,9 @@ def main():
               s.wait(lambda: s.value_of("Recommended config") == "yes")
               and s.value_of("Background scan") == "enable")
         s.send(b"\x1b", 0.3)
+        # ESC and the next key read together are one escape sequence,
+        # which swallows the key: wait for ESC to have been handled
+        s.wait(lambda: s.on_screen("choose an action"))
         s.send(b"2", 0.3)
         s.wait(lambda: s.on_screen("Settings (3 of 3)"))
         check("the settings screen starts with none of them",
@@ -396,6 +434,9 @@ def main():
         check("a change on the settings screen is kept there",
               s.set_choice("Write cache", "on"))
         s.send(b"\x1b", 0.3)
+        # ESC and the next key read together are one escape sequence,
+        # which swallows the key: wait for ESC to have been handled
+        s.wait(lambda: s.on_screen("choose an action"))
         s.send(b"1", 0.3)
         s.wait(lambda: s.on_screen("Scan (3 of 3)"))
         check("and the scan screen's own settings are as it left them",
@@ -404,13 +445,16 @@ def main():
               "wc %r config %r" % (s.value_of("Write cache"),
                                    s.value_of("Recommended config")))
         s.send(b"\x1b", 0.3)
+        # ESC and the next key read together are one escape sequence,
+        # which swallows the key: wait for ESC to have been handled
+        s.wait(lambda: s.on_screen("choose an action"))
         s.send(b"2", 0.3)
         s.wait(lambda: s.on_screen("Settings (3 of 3)"))
         check("and the settings come back as they were left",
               s.wait(lambda: s.value_of("Write cache") == "on"),
               "got %r" % s.value_of("Write cache"))
         s.send(b"s", 0.5)
-        s.pump(2)
+        s.wait(lambda: "would turn the write cache on" in s.text(), 20.0)
         s.close()
         check("applying a named setting needs no confirmation and does it",
               "dry run, drive settings not applied" in s.text()
@@ -695,7 +739,8 @@ def main():
               s.set_choice("Mode", "check"),
               "got %r" % s.value_of("Mode"))
         s.send(b"s", 0.5)
-        s.pump(8)
+        # the negative check below means something only once the run is over
+        s.wait(lambda: s.on_screen("finished"), 60.0)
         s.close()
         t = s.text()
         check("choosing 'check' runs a read-only re-check",
@@ -739,7 +784,7 @@ def main():
         s = Session(["-i", "--no-color", "--dry-run", "--outdir", tmp, a],
                     open="format")
         s.send(b"s", 0.45); s.send(b"y", 0.8)
-        s.pump(3)
+        s.wait(lambda: "--format is a SCSI FORMAT UNIT" in s.text(), 20.0)
         s.close()
         t = s.text()
         check("format chosen on the form reaches the format path",
@@ -760,7 +805,9 @@ def main():
                 s.send(RIGHT, 0.16)          # 128K -> 1M
             s.wait(lambda: s.value_of("Chunk size") == "1M")
             picked = s.value_of("Chunk size")
-            s.send(b"s", 0.5); s.pump(14); s.close()
+            s.send(b"s", 0.5)
+            s.wait(lambda: s.on_screen("finished"), 60.0)
+            s.close()
             rep = ""
             for fn in os.listdir(tmp):
                 if fn.startswith("hddscan-") and fn.endswith(".txt"):
@@ -823,7 +870,10 @@ def main():
         # was not yet enough to show -- so it looks only at rows that say
         # they are done, and the section on drilling drives below pins the
         # same thing with a record written by hand.
-        s.wait(lambda: s.on_screen("finished"), 12.0)
+        # a bounded wait costs nothing when it succeeds, and a loaded
+        # machine has taken half a minute over these two images
+        check("the dashboard's run reaches its summary",
+              s.wait(lambda: s.on_screen("finished"), 120.0))
         raw = bytes(s.raw)
         fin = raw.find(b"finished")
         cut = raw.rfind(b"\x1b[1;1H", 0, fin) if fin >= 0 else -1
@@ -902,8 +952,7 @@ def main():
               and s.open_form("scan") and s.on_screen("Profile"),
               "\n".join(l for l in s.screen.lines() if l.strip())[:400])
         s.send(b"q", 0.5)
-        s.pump(1.5)
-        check("q on the re-entered form exits", not s.alive)
+        check("q on the re-entered form exits", s.wait(lambda: not s.alive, 6.0))
         s.close()
 
         print("== hiding a drive's damage from the summary ==")
@@ -926,10 +975,11 @@ def main():
         s = Session(["-i", "--no-color", "--profile", "inservice", "--mode",
                      "check", "--outdir", tmp, hurt], open="scan")
         s.send(b"s", 0.6)
-        s.wait(lambda: s.on_screen("finished"), 12.0)
+        s.wait(lambda: s.on_screen("finished"), 60.0)
         check("a summary with damage on it offers h",
               s.wait(lambda: s.on_screen("h hide bad blocks")),
               "\n".join(l for l in s.screen.lines() if l.strip()))
+        s.settle()
         check("and points at the drive it would act on",
               any(l.startswith(">") and "hurt.bin" in l
                   for l in s.screen.lines()),
@@ -977,7 +1027,8 @@ def main():
         s = Session(["-i", "--no-color", "--profile", "inservice", "--mode",
                      "check", "--outdir", tmp, clean], open="scan")
         s.send(b"s", 0.6)
-        s.wait(lambda: s.on_screen("n new test"), 12.0)
+        s.wait(lambda: s.on_screen("n new test"), 60.0)
+        s.settle()
         check("a clean drive's summary offers nothing to hide",
               not s.on_screen("hide bad blocks")
               and not any(l.startswith(">") for l in s.screen.lines()),
@@ -1049,7 +1100,7 @@ def main():
         s.wait(lambda: s.on_screen("press y"), 3.0)
         s.send(b"y", 0.5)
         check("the run reaches its summary",
-              s.wait(lambda: s.on_screen("finished"), 90.0))
+              s.wait(lambda: s.on_screen("finished"), 300.0))
         check("with a row for the map's own test",
               s.on_screen("hidemap"),
               "\n".join(l for l in s.screen.lines() if l.strip()))
@@ -1070,10 +1121,11 @@ def main():
         s = Session(["-i", "--no-color", "--outdir", tmp, hr], open="scan")
         s.wait(lambda: s.on_screen("Profile"), 6.0)
         s.set_choice("If damage is found", "hide it")
-        s.set_choice("Mode", "read")
+        check("the form can be set back to a read pass",
+              s.set_choice("Mode", "read"), "Mode %r" % s.value_of("Mode"))
         s.send(b"s", 0.5)
         check("a read pass with 'hide it' chosen still runs",
-              s.wait(lambda: s.on_screen("finished"), 30.0),
+              s.wait(lambda: s.on_screen("finished"), 60.0),
               "\n".join(l for l in s.screen.lines() if l.strip()))
         s.send(b"q", 0.5)
         s.pump(1.0)
@@ -1093,7 +1145,8 @@ def main():
             check("format is selected for %s" % real,
                   s.open_form("format"))
             s.send(b"s", 0.5); s.send(b"y", 1.0)
-            s.pump(4); s.close()
+            s.wait(lambda: "erases everything" in s.text(), 20.0)
+            s.close()
             t = s.text()
             check("the format banner warns before anything runs",
                   "Low level format" in t and "erases everything" in t,
@@ -1112,7 +1165,8 @@ def main():
             s.set_choice("Sector size", "4096")
             s.set_choice("Protection info", "none")
             s.send(b"s", 0.5); s.send(b"y", 1.0)
-            s.pump(4); s.close()
+            s.wait(lambda: "--size=" in s.text(), 20.0)
+            s.close()
             t = s.text()
             check("the sector size chosen on the form reaches sg_format",
                   "--size=4096" in t, t[-300:])
@@ -1125,9 +1179,12 @@ def main():
 
         s = Session(["--no-tui", "--no-color", "--profile", "inservice",
                      "--outdir", tmp, a])
-        s.pump(4)
-        txt = s.text().replace("\r", "\n")
-        prog = [l for l in txt.splitlines() if "elapsed" in l and "%" in l]
+        def progress_lines():
+            txt = s.text().replace("\r", "\n")
+            return [l for l in txt.splitlines() if "elapsed" in l and "%" in l]
+        s.wait(lambda: any(re.search(r"last \d+s med", l)
+                           for l in progress_lines()), 30.0)
+        prog = progress_lines()
         check("the progress line reports a rolling latency window",
               any(re.search(r"last \d+s med \d+\.\d avg \d+\.\d "
                             r"min \d+\.\d max \d+\.\d ms", l)
@@ -1144,10 +1201,12 @@ def main():
         # Sparse images make a scan that takes minutes without writing
         # terabytes, so the run can be caught in the act -- which is the only
         # way to test that leaving it alone really does leave it running.
+        # A sparse read runs at page-cache speed (25 GB/s on a recent
+        # machine), so 300G was seconds; 4T is minutes, and costs no disk.
         big = [os.path.join(tmp, "sparse%d.bin" % k) for k in (1, 2, 3)]
         for path in big:
             with open(path, "wb") as f:
-                f.truncate(300 << 30)
+                f.truncate(4 << 40)
 
         def status(*args):
             return subprocess.run([HDDSCAN, "--no-color", "--status"] +
@@ -1276,7 +1335,8 @@ def main():
 
         s = Session(["--attach", "20200202-030405", "--no-color"],
                     rows=24, cols=100)
-        s.wait(lambda: s.on_screen("drives"), 5.0)
+        s.wait(lambda: sum(l.count("sdz") for l in s.screen.lines()) == 30,
+               10.0)
         shown = [l for l in s.screen.lines() if "sdz" in l]
         seen = sum(l.count("sdz") for l in shown)
         check("every drive of a thirty-drive run is on a 24-row screen",
@@ -1321,7 +1381,9 @@ def main():
 
         s = Session(["--attach", "20200404-050607", "--no-color"],
                     rows=24, cols=80)
-        s.wait(lambda: s.on_screen("to a line") or s.on_screen("DRIVE"), 5.0)
+        # the footer is drawn last, so it is the sign the frame is whole
+        s.wait(lambda: s.on_screen("page 1/"), 10.0)
+        s.settle()
         # a hundred drives is too many for the table, so it opens on the
         # overview, which pages too
         check("a shelf opens on the overview",
@@ -1329,7 +1391,10 @@ def main():
         check("the overview pages rather than dropping drives",
               s.on_screen("page 1/"),
               "\n".join(l for l in s.screen.lines() if "page" in l))
-        s.send(b"g", 0.6)
+        s.send(b"g", 0.2)
+        s.wait(lambda: any("DRIVE" in l and "STATE" in l
+                           for l in s.screen.lines()), 10.0)
+        s.settle()
         lines = s.screen.lines()
         hdr = next((i for i, l in enumerate(lines)
                     if "DRIVE" in l and "STATE" in l), -1)
@@ -1353,14 +1418,18 @@ def main():
                           for l in lines),
                   "\n".join(lines))
         page1 = [l for l in s.screen.lines() if l.lstrip().startswith("sdk")]
-        s.send(b">", 0.6)
+        s.send(b">", 0.2)
+        s.wait(lambda: s.on_screen("page 2/"), 10.0)
+        s.settle()
         page2 = [l for l in s.screen.lines() if l.lstrip().startswith("sdk")]
         check("the table pages forward", bool(page1) and page1 != page2,
               "page 1: %r\npage 2: %r" % (page1[:2], page2[:2]))
         check("the footer says which page this is",
               s.on_screen("page 2/"),
               "\n".join(l for l in s.screen.lines() if "page" in l))
-        s.send(b"<", 0.6)
+        s.send(b"<", 0.2)
+        s.wait(lambda: s.on_screen("page 1/"), 10.0)
+        s.settle()
         check("the table pages back",
               [l for l in s.screen.lines() if l.lstrip().startswith("sdk")]
               == page1, "did not return to the first page")
@@ -1372,8 +1441,11 @@ def main():
         # screen holds more drives.  Without colour there is nothing to see,
         # which is why the rule is still there in the session above.
         s = Session(["--attach", "20200404-050607"], rows=24, cols=80)
-        s.wait(lambda: s.on_screen("DRIVE") or s.on_screen("to a line"), 5.0)
-        s.send(b"g", 0.6)
+        s.wait(lambda: s.on_screen("page 1/"), 10.0)
+        s.send(b"g", 0.2)
+        s.wait(lambda: any("DRIVE" in l and "STATE" in l
+                           for l in s.screen.lines()), 10.0)
+        s.settle()
         lines = s.screen.lines()
         rows = [l for l in lines if l.lstrip().startswith("sdk")]
         check("colour separates drives without spending a line on a rule",
@@ -1395,7 +1467,9 @@ def main():
         # closing bracket of its bar on the same line.
         s = Session(["--attach", "20200202-030405", "--no-color"],
                     rows=24, cols=112)
-        s.wait(lambda: s.on_screen("to a line"), 5.0)
+        s.wait(lambda: sum(l.count("sdz") for l in s.screen.lines()) == 30,
+               10.0)
+        s.settle()
         grid = [l for l in s.screen.lines() if "sdz" in l]
         cut = [l for l in grid if l.count("%") != l.count("]")]
         check("no grid cell is cut off at the edge of a 112-column terminal",
@@ -1445,7 +1519,8 @@ def main():
 
         s = Session(["--attach", "20200606-070809", "--no-color"],
                     rows=30, cols=80)
-        s.wait(lambda: s.on_screen("DRIVE"), 5.0)
+        s.wait(lambda: s.on_screen("DRIVE"), 10.0)
+        s.settle()      # the header comes before the rows under it
         lines = s.screen.lines()
 
         def under(dev):
@@ -1493,8 +1568,8 @@ def main():
         def wide(cols):
             s = Session(["--attach", "20200606-070809", "--no-color"],
                         rows=24, cols=cols)
-            s.wait(lambda: s.on_screen("DRIVE"), 5.0)
-            s.pump(0.3)
+            s.wait(lambda: s.on_screen("DRIVE"), 10.0)
+            s.settle()  # the header comes before the rows under it
             ls, raw = s.screen.lines(), bytes(s.raw)
             s.send(b"q", 0.4)
             s.close()
@@ -1544,7 +1619,8 @@ def main():
             f.write("probing 1073741824\n")
         s = Session(["--attach", "20200606-070809", "--no-color"],
                     rows=30, cols=80)
-        s.wait(lambda: s.on_screen("probing ahead"), 5.0)
+        s.wait(lambda: s.on_screen("probing ahead"), 10.0)
+        s.settle()
         lines = s.screen.lines()
         check("a drive whose skip is probing ahead says where",
               any("skip: probing ahead at 1.00 GiB" in l for l in lines),
@@ -1569,8 +1645,8 @@ def main():
         # not zero.  Colour is separate bytes, so the padding before a
         # number sits inside the colour and the width is unchanged.
         s = Session(["--attach", "20200606-070809"], rows=24, cols=80)
-        s.wait(lambda: s.on_screen("DRIVE"), 5.0)
-        s.pump(0.4)
+        s.wait(lambda: s.on_screen("DRIVE"), 10.0)
+        s.settle()
         raw = bytes(s.raw)
         red, yel = b"\x1b[31m", b"\x1b[33m"
         check("a latency over 100 ms is red",
@@ -1623,16 +1699,16 @@ def main():
             for h in range(24, 41):
                 s = Session(["-i", "--no-color", "--outdir", tmp, a],
                             rows=h, cols=80)
-                s.wait(lambda: s.on_screen("runs on this machine"), 5.0)
+                s.wait(lambda: s.on_screen("runs on this machine"))
                 s.send(b"n", 0.3)
-                s.wait(lambda: s.on_screen("q quit"), 5.0)
+                s.wait(lambda: s.on_screen("q quit"))
                 # the drive on the command line is already ticked, so enter
                 # leaves the picker, and 1 takes the scan
                 for want, key in titles:
                     if key:
                         s.send(key, 0.3)
-                    s.wait(lambda: s.on_screen(want), 3.0)
-                    s.pump(0.4)
+                    s.wait(lambda: s.on_screen(want))
+                    s.settle()  # the title is drawn before the rest
                     lines = s.screen.lines()
                     if not (want in lines[0] and
                             "already in progress" in lines[1]):
@@ -1656,9 +1732,13 @@ def main():
         print("== --no-tui is honoured on a terminal ==")
 
         s = Session(["--no-tui"])
-        s.pump(0.8)
+        # wait for it to have answered: a picker that took longer than a
+        # fixed pause to draw would have passed a check for its absence
+        s.wait(lambda: not s.alive, 10.0)
         check("--no-tui does not open the picker even on a terminal",
-              not any("choose drives" in l for l in s.screen.lines()))
+              "no device given" in s.text() and
+              not any("choose drives" in l for l in s.screen.lines()),
+              s.text()[-200:])
         s.close()
 
     finally:

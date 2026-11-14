@@ -7,7 +7,7 @@
 set -u
 cd "$(dirname "$0")/.."
 BIN=${BIN:-./hddscan dm}
-TMP=$(mktemp -d)
+TMP=$(mktemp -d /tmp/hds.XXXXXX)     # short: see cli.sh
 trap 'rm -rf "$TMP"' EXIT
 PASS=0 FAIL=0
 

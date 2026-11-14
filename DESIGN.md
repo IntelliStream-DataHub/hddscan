@@ -1394,7 +1394,7 @@ are the ones that would matter most if they were wrong:
   with a length, so a chunk that is wrong throughout costs one entry.
 
 The run store was tested the same way, against sparse images — a `truncate -s
-300G` file is minutes of genuine work without writing anything, which is the
+4T` file is minutes of genuine work without writing anything, which is the
 only way to catch a run in the act. End to end: a run keeps going after the
 program that started it exits, a second copy of the program finds it and shows
 it mid-scan, a drive already in a live run is refused by any other, `--stop`
