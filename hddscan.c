@@ -939,14 +939,39 @@ static int run_get(const char *dir, run_t *r)
 	return 0;
 }
 
+/*
+ * Which of the runs that started in one second came later: run_create()
+ * numbers them base, base-2, base-3, ...  The number has to be compared as a
+ * number.  As a string base-10 sorts before base-9, and a machine fast enough
+ * to start ten runs in a second -- a CI runner, the suite -- then took an
+ * older run for the newest, which is what --hide-bad trusts to find the
+ * drive's last whole scan.
+ */
+static long run_seq(const char *id)
+{
+	const char *s = strchr(id, '-');
+
+	s = s ? strchr(s + 1, '-') : NULL;
+	return s ? strtol(s + 1, NULL, 10) : 1;
+}
+
 static int run_cmp(const void *a, const void *b)
 {
 	const run_t *x = a, *y = b;
+	long sx, sy;
+	int c;
 
 	if (x->live != y->live)
 		return x->live ? -1 : 1;
 	if (x->created != y->created)
 		return x->created > y->created ? -1 : 1;
+	sx = run_seq(x->id);
+	sy = run_seq(y->id);
+	c = strncmp(y->id, x->id, 15);
+	if (c)
+		return c;
+	if (sx != sy)
+		return sx > sy ? -1 : 1;
 	return strcmp(y->id, x->id);
 }
 

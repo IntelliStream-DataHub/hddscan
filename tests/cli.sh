@@ -1335,6 +1335,34 @@ assert_has "such a drive is reported as orphaned" \
 assert_has "--forget refuses nothing here and tidies it away" \
 	"$(run --forget 20200101-000000)" "forgot run"
 
+# REGRESSION: runs that start in the same second are numbered base, base-2,
+# ... and the newest was picked by comparing those as strings, so base-10
+# came out older than base-9.  CI starts ten runs in a second easily, and
+# --hide-bad, which asks the same list for the drive's newest whole scan,
+# then built its map from the clean write before the check that found the
+# damage.
+now=$(date +%s)
+for s in 9 10; do
+	d=$HDDSCAN_STATE_DIR/runs/20200202-000000-$s
+	mkdir -p "$d"
+	cat > "$d/run" <<EOF
+run 1
+id 20200202-000000-$s
+kind scan
+what read (inservice)
+detail read
+outdir $TMP
+created $(( now - 60 ))
+ended $(( now - 59 ))
+njobs 0
+EOF
+done
+assert_eq "of two runs started in one second, -10 is newer than -9" \
+	"$(run --status | grep -o '20200202-000000-[0-9]*' | head -1)" \
+	"20200202-000000-10"
+run --forget 20200202-000000-9 >/dev/null
+run --forget 20200202-000000-10 >/dev/null
+
 assert_has "--stop with no such run is an error, not a silent success" \
 	"$(run --stop nosuchrun 2>&1)" "no run matches"
 assert_eq "--stop with no such run exits 2" \
