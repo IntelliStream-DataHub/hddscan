@@ -700,6 +700,26 @@ assert_has "and says it is probing ahead while it does" "$out" \
 	"probing ahead for where it ends"
 rm -f "$f"
 
+# A slow probe after a doubled step only condemns the gap behind it once the
+# middle of that gap has been probed slow too.  Two slow patches, the second
+# under where the second forward probe lands, with 1.9 GiB of healthy surface
+# between them: taking the second probe at its word condemned all of it
+# unread, as one 3.2 GiB region.
+f=$(slowimg skipgap.bin 5G)
+out=$(slowrun 1G:1176M,4100M:200M --skip-slow --json "$TMP/skipgap.json" "$f")
+read -r nreg hit <<< "$(python3 - "$TMP/skipgap.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+M = 1 << 20
+r = [(k["offset"], k["offset"] + k["length"]) for k in d["slow_regions"]]
+print(len(r), sum(1 for a, b in r if a < 4000 * M and b > 2300 * M))
+PY
+)"
+assert_eq "healthy surface between two slow probes is not condemned with them" \
+	"$hit" "0"
+assert_eq "and each slow patch is a region of its own" "$nreg" "2"
+rm -f "$f"
+
 f=$(slowimg skiprev.bin 3G)
 out=$(slowrun 1G:1G --skip-slow --order reverse --json "$TMP/skiprev.json" "$f")
 read -r roff rend <<< "$(json_region "$TMP/skiprev.json")"
@@ -810,6 +830,19 @@ assert_has "and the report says the rest of it was never read" "$out" \
 assert_has "without --skip-slow the whole chunk is drilled" \
 	"$(HDDSCAN_SLOW=8M:1M HDDSCAN_SLOW_MS=512000 run --chunk 1M \
 		--chunk-slow-ms 1000 --retries 0 "$f")" "sectors weak                       256"
+
+# The cap is three times a healthy drill-down, and a drill-down is a read per
+# sector, so it grows with the chunk.  At a flat 10 s, a 4 MiB chunk over its
+# budget with every sector in it fine -- 1024 reads of 20 ms here -- was cut
+# short and condemned, 1024 weak sectors that were nothing of the kind.
+out=$(HDDSCAN_SLOW=8M:4M HDDSCAN_SLOW_MS=5000 run --chunk 4M \
+	--chunk-slow-ms 1000 --retries 1 --skip-slow "$f")
+assert_hasnt "a healthy drill-down of a big chunk is not cut short" "$out" \
+	"condemned it and moved on"
+assert_has "and every sector of it is read" "$out" \
+	"every sector of the device was read"
+assert_eq "and none of them is counted weak" \
+	"$(awk '/sectors weak/{print $3}' <<< "$out")" "0"
 
 # A resumed scan has to know what it skipped before, or it would call the
 # drive fully read.  Resumed at the step just past the region, from the
@@ -1063,6 +1096,50 @@ assert_has "one timeout is SUSPECT, not FAILING" "$out" "VERDICT: SUSPECT"
 assert_hasnt "an image with no log to read says nothing about one" \
 	"$(run "$f")" "Kernel log"
 
+# A drive answering its commands with Recovered Error completes every one of
+# them, so the scan sees only the time.  A real 14 TB SAS drive did it about
+# every 70 ms with a vendor warning attached (ASC 0xb, ASCQ 0x97), and its
+# scan showed weak sectors over the whole surface with nothing to say why.
+: > "$TMP/rec.log"
+for t in 700 701 702 703 704 705 706 707 708 709 710 711; do
+	printf '%s\n' \
+	"[Tue Nov 17 20:28:40 2026] sd 0:0:1:0: [sdc] tag#$t Sense Key : Recovered Error [current] [descriptor]" \
+	"[Tue Nov 17 20:28:40 2026] sd 0:0:1:0: [sdc] tag#$t ASC=0xb <<vendor>>ASCQ=0x97" \
+	>> "$TMP/rec.log"
+done
+rec() { HDDSCAN_KMSG=$TMP/rec.log HDDSCAN_KMSG_HCTL=${HCTL:-0:0:1:0} run "$@" "$f"; }
+out=$(rec --json "$TMP/rec.json")
+assert_has "recovered errors against the drive are counted" "$out" \
+	"0 medium errors, 12 recovered errors"
+assert_has "and said while the scan runs, with what the drive reported" \
+	"$out" "answered 12 commands with Recovered Error (ASC=0xb <<vendor>>ASCQ=0x97)"
+assert_has "the JSON carries them" "$(cat "$TMP/rec.json")" \
+	'"recovered_errors": 12, "recovered_sense": "ASC=0xb <<vendor>>ASCQ=0x97"'
+assert_has "recovered errors alone are not held against a drive" "$out" \
+	"VERDICT: HEALTHY"
+assert_hasnt "and a scan with nothing slow explains nothing" "$out" \
+	"Where the time went"
+out=$(HDDSCAN_SLOW=1M:1M HDDSCAN_SLOW_MS=512000 rec --chunk-slow-ms 1000 \
+	--retries 0 --json "$TMP/rec.json")
+assert_has "a slow scan beside them says the time is most likely the drive's" \
+	"$out" "Where the time went: most likely the drive itself"
+assert_has "and names what the drive reported" "$out" \
+	"(ASC=0xb <<vendor>>ASCQ=0x97)."
+assert_has "the JSON names the source" "$(cat "$TMP/rec.json")" \
+	'"slowness_source": "drive_recovered_errors"'
+out=$(HCTL=0:0:2:0 HDDSCAN_SLOW=1M:1M HDDSCAN_SLOW_MS=512000 rec \
+	--chunk-slow-ms 1000 --retries 0 --json "$TMP/rec.json")
+assert_has "another drive's recovered errors are not this one's" "$out" \
+	"0 medium errors, 0 recovered errors"
+assert_hasnt "and do not explain this drive's slowness" "$out" \
+	"Where the time went"
+assert_has "the JSON says nothing explained it" "$(cat "$TMP/rec.json")" \
+	'"slowness_source": null'
+head -n 18 "$TMP/rec.log" > "$TMP/rec9.log"
+assert_hasnt "a handful of recovered errors is not announced" \
+	"$(HDDSCAN_KMSG=$TMP/rec9.log HDDSCAN_KMSG_HCTL=0:0:1:0 run "$f")" \
+	"answered 9 commands"
+
 echo "== SMART counters that move during the scan =="
 
 # A scan reads SMART before and after.  HDDSCAN_SMARTCTL runs a stand-in that
@@ -1132,6 +1209,27 @@ assert_has "a few SAS delayed corrections are not held against a drive" \
 sas 1 1007 1000.000 0 > "$TMP/smart.1"; sas 1 1007 1010.000 2 > "$TMP/smart.2"
 assert_has "SAS uncorrected read errors growing during the scan are SUSPECT" \
 	"$(smart)" "VERDICT: SUSPECT - the drive's own counters recorded 2 uncorrectable"
+
+# Where a slow scan's time went, when the drive's counters say: a read that
+# needed a delayed correction came back right, only late.
+slowsmart() {
+	rm -f "$TMP/smart.n"
+	HDDSCAN_SLOW=1M:1M HDDSCAN_SLOW_MS=512000 HDDSCAN_SMARTCTL=$TMP/smartctl \
+		run --chunk-slow-ms 1000 --retries 0 "$@" "$f"
+}
+sas 1 1007 1000.000 0 > "$TMP/smart.1"; sas 1 1107 1010.000 0 > "$TMP/smart.2"
+out=$(slowsmart --json "$TMP/where.json")
+assert_has "a slow scan of a drive correcting with delays says that is where the time went" \
+	"$out" "Where the time went: the drive itself"
+assert_has "and how often it corrected" "$out" \
+	"delayed corrections or rereads 100 times, 10 per GB read"
+assert_has "the JSON names the source" "$(cat "$TMP/where.json")" \
+	'"slowness_source": "drive_corrections"'
+assert_hasnt "a scan with nothing slow does not explain its time" "$(smart)" \
+	"Where the time went"
+sas 1 1007 1000.000 0 > "$TMP/smart.1"; sas 1 1007 1010.000 0 > "$TMP/smart.2"
+assert_hasnt "a slow scan of a drive whose counters stay put blames nothing" \
+	"$(slowsmart)" "Where the time went"
 
 echo "== unreadable is not unrepairable =="
 

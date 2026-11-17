@@ -2968,6 +2968,10 @@ typedef struct {
 	int kmsg_ntok;
 	uint64_t kmsg_last_us;
 	uint64_t k_offline, k_resets, k_timeouts, k_medium;
+	uint64_t k_recovered;   /* commands answered with Recovered Error */
+	char k_rec_asc[64];     /* the first one's ASC/ASCQ, as logged */
+	int k_rec_pending;      /* the next line about us is its ASC */
+	int k_rec_told;         /* said so on the way past */
 
 	int dev_gone;           /* the drive left mid-scan: see dev_gone() */
 
@@ -4405,7 +4409,7 @@ static int dev_gone(ctx_t *c, ssize_t r, int err, size_t want)
 /* walk a suspicious chunk one block at a time */
 static int skip_cut_due(const ctx_t *c, uint64_t io0);
 static int skip_cut(ctx_t *c, uint64_t off, size_t len, uint64_t from);
-static int probe_cap_hit(uint64_t io0);
+static int probe_cap_hit(const ctx_t *c, uint64_t io0);
 
 /*
  * probe says a --skip-slow probe is drilling a chunk ahead of the scan:
@@ -4425,7 +4429,7 @@ static uint64_t drill_chunk(ctx_t *c, uint64_t off, size_t len, void *buf,
 		ssize_t r;
 
 		/* --skip-slow: one chunk may not eat the scan */
-		if (probe ? probe_cap_hit(io0) :
+		if (probe ? probe_cap_hit(c, io0) :
 		    skip_cut_due(c, io0) && skip_cut(c, off, len, o))
 			break;
 
@@ -5477,10 +5481,28 @@ static int kmsg_about_us(const ctx_t *c, const char *line)
 	return 0;
 }
 
+/*
+ * A Recovered Error is the drive saying a command completed, but only after
+ * a recovery action of its own -- or, with the informational exceptions page
+ * set to report that way (MRIE 4, the factory default on some SAS drives),
+ * with a warning attached.  Neither is a failure, and the scan never sees
+ * either: the data came back right.  What it does see is the time, and a
+ * drive answering most of its reads like this is slow for a reason of its
+ * own, not because of the path to it.  A real 14 TB SAS drive did exactly
+ * this, about every 70 ms, and its scan looked like weak sectors everywhere.
+ * The sense key and the ASC arrive as two lines; the ASC is kept from the
+ * first, so the report can say what the drive was reporting.
+ */
+#define KMSG_RECOVERED_TELL 10
+
 static void kmsg_line(ctx_t *c, const char *line)
 {
+	int pend = c->k_rec_pending;
+	const char *a;
+
 	if (!kmsg_about_us(c, line))
 		return;
+	c->k_rec_pending = 0;
 	if (strstr(line, "offline device") || strstr(line, "Device offlined") ||
 	    strstr(line, "rejecting I/O to dead device"))
 		c->k_offline++;
@@ -5499,6 +5521,33 @@ static void kmsg_line(ctx_t *c, const char *line)
 		 strstr(line, "error: { UNC") ||
 		 strstr(line, "critical medium error"))
 		c->k_medium++;
+	else if (strstr(line, "Recovered Error")) {
+		c->k_recovered++;
+		c->k_rec_pending = 1;
+	} else if (pend && !c->k_rec_asc[0] &&
+		   ((a = strstr(line, "ASC=")) ||
+		    (a = strstr(line, "Add. Sense: ")))) {
+		size_t n = strcspn(a, "\n");
+
+		if (n >= sizeof(c->k_rec_asc))
+			n = sizeof(c->k_rec_asc) - 1;
+		memcpy(c->k_rec_asc, a, n);
+		c->k_rec_asc[n] = 0;
+	}
+}
+
+/* once, while it is happening: a skip can probe for hours before a report */
+static void kmsg_tell(ctx_t *c)
+{
+	if (c->k_rec_told || c->k_recovered < KMSG_RECOVERED_TELL)
+		return;
+	c->k_rec_told = 1;
+	msg(PROG ": %s: %sthe drive has answered %" PRIu64 " commands with "
+	    "Recovered Error%s%s%s%s: it completes them, after a recovery "
+	    "action or with a warning of its own, and slow reads alongside "
+	    "that are the drive's doing, not the path to it\n", c->dev->name,
+	    c_yel(), c->k_recovered, c->k_rec_asc[0] ? " (" : "",
+	    c->k_rec_asc, c->k_rec_asc[0] ? ")" : "", c_off());
 }
 
 static void kmsg_poll(ctx_t *c, int now)
@@ -5524,6 +5573,7 @@ static void kmsg_poll(ctx_t *c, int now)
 		}
 		c->kmsg_fd = -1;
 		c->kmsg_state = KMSG_DONE;
+		kmsg_tell(c);
 		return;
 	}
 	/* one record per read(): "pri,seq,usec,flags;message\n KEY=value..." */
@@ -5536,6 +5586,7 @@ static void kmsg_poll(ctx_t *c, int now)
 		buf[r] = 0;
 		kmsg_line(c, buf);
 	}
+	kmsg_tell(c);
 }
 
 static void kmsg_close(ctx_t *c)
@@ -5639,6 +5690,7 @@ static void check_temperature(ctx_t *c)
 #define SKIP_RATE_MIN_CHUNKS 3          /* the rate rule, once it has these */
 #define SKIP_RATE_MIN_US (20ull * 1000000)      /* and this much I/O */
 #define SKIP_DRILL_CAP_US (10ull * 1000000)     /* one chunk's drill-down */
+#define SKIP_DRILL_CAP_BLOCKS 256               /* ... of this many sectors */
 #define MAX_SKIPS 4096
 
 /* the bytes [a, b) covers in the scan order, which only ever walks */
@@ -5760,9 +5812,26 @@ static void skip_recount(ctx_t *c, skip_t *k)
 	c->skip_weak += k->weak;
 }
 
+/*
+ * The cap is about three times what drilling a healthy chunk costs, and that
+ * cost is one lost revolution per sector read, so it grows with the sectors
+ * in a chunk.  A flat 10 s was right for 1 MiB of 4 KiB sectors and wrong
+ * for anything bigger: a healthy 4 MiB chunk is 1024 single reads, 8 to 14 s
+ * of I/O, so every one that missed its budget by a whisker was cut short and
+ * condemned whole although every sector in it was fine.  Never below 10 s.
+ */
+static uint64_t skip_drill_cap(const ctx_t *c)
+{
+	uint64_t n = c->block ? (uint64_t)c->chunk / c->block : 0;
+
+	if (n <= SKIP_DRILL_CAP_BLOCKS)
+		return SKIP_DRILL_CAP_US;
+	return SKIP_DRILL_CAP_US * n / SKIP_DRILL_CAP_BLOCKS;
+}
+
 static int skip_cut_due(const ctx_t *c, uint64_t io0)
 {
-	return c->skip_slow && !c->pass && g_io_us - io0 > SKIP_DRILL_CAP_US;
+	return c->skip_slow && !c->pass && g_io_us - io0 > skip_drill_cap(c);
 }
 
 /*
@@ -5792,7 +5861,7 @@ static int skip_cut(ctx_t *c, uint64_t off, size_t len, uint64_t from)
 		msg(PROG ": %s: %sdrilling the chunk at %s has cost over %llu s; "
 		    "condemned it and moved on%s (--skip-slow)\n", c->dev->name,
 		    c_yel(), human_size(off, b1, sizeof(b1)),
-		    (unsigned long long)(SKIP_DRILL_CAP_US / 1000000), c_off());
+		    (unsigned long long)(skip_drill_cap(c) / 1000000), c_off());
 	}
 	k->s1 = c->step + 1;
 	k->unread += unread;
@@ -5837,9 +5906,9 @@ static int skip_note(ctx_t *c, uint64_t step, int over)
 	       c->rate_floor * (double)span;
 }
 
-static int probe_cap_hit(uint64_t io0)
+static int probe_cap_hit(const ctx_t *c, uint64_t io0)
 {
-	return g_io_us - io0 > SKIP_DRILL_CAP_US;
+	return g_io_us - io0 > skip_drill_cap(c);
 }
 
 /* a probe drilled this step: its findings are in, so the scan need not */
@@ -5923,6 +5992,7 @@ static int skip_probe(ctx_t *c, uint64_t s, uint64_t n, void *buf,
 		if (r == (ssize_t)len)
 			latwin_add(&c->latwin, us);
 		progress(c, 0);
+		kmsg_poll(c, 0);
 		if (r < 0 && (err == EINVAL || err == EILSEQ))
 			continue;
 		if (dev_gone(c, r, err, len))
@@ -5967,7 +6037,7 @@ static uint64_t skip_ahead(ctx_t *c, void *buf, void *scratch)
 	uint64_t t = c->step, L = t, F = 0, p, s0, s1, unread, off;
 	uint64_t pn = skip_probe_len(c, SKIP_PROBE_BYTES);
 	uint64_t wn = skip_probe_len(c, SKIP_WIDE_BYTES);
-	uint64_t jump = SKIP_JUMP / (uint64_t)c->chunk;
+	uint64_t jump = SKIP_JUMP / (uint64_t)c->chunk, jump0;
 	uint64_t jmax = SKIP_JUMP_MAX / (uint64_t)c->chunk;
 	uint64_t res = SKIP_RES / (uint64_t)c->chunk;
 	int to_end = 0, i;
@@ -5980,6 +6050,7 @@ static uint64_t skip_ahead(ctx_t *c, void *buf, void *scratch)
 	c->probing = 1;
 	if (jump < 1)
 		jump = 1;
+	jump0 = jump;
 	if (res < pn)
 		res = pn;
 	/*
@@ -5987,8 +6058,16 @@ static uint64_t skip_ahead(ctx_t *c, void *buf, void *scratch)
 	 * each time a probe is still slow, up to 64 GiB.  At a fixed gigabyte a
 	 * drive damaged to the end took thirteen thousand probes to cross --
 	 * hours of it, with nothing on the screen; doubling crosses it in a
-	 * couple of hundred.  The price is that a healthy stretch shorter than
-	 * the step, between two slow probes, is condemned with them.
+	 * couple of hundred.  The price is that a healthy stretch between two
+	 * slow probes is condemned with them, so once the step has doubled a
+	 * slow probe is not taken at its word: the middle of the gap behind it
+	 * is probed as well, and if that comes back fast the edge is looked
+	 * for there instead.  Without it a drive slow in patches, with a patch
+	 * under each probe that happened to land in one, could lose whole 32
+	 * and 64 GiB stretches of healthy surface between them, unread.
+	 * Crossing damage to the end costs twice the probes, still a few
+	 * hundred; a healthy stretch is lost now only if it is shorter than
+	 * half the step and misses the middle of it.
 	 *
 	 * These probes are wide: damage in one chunk of twenty-five slips past
 	 * an eight-chunk probe more often than not, and the drive would be
@@ -6006,6 +6085,9 @@ static uint64_t skip_ahead(ctx_t *c, void *buf, void *scratch)
 		}
 		if (!skip_probe(c, p, wn, buf, scratch)) {
 			F = p;
+		} else if (p - L > jump0 &&
+			   !skip_probe(c, L + (p - L) / 2, wn, buf, scratch)) {
+			F = L + (p - L) / 2;
 		} else if (p + wn >= c->nchunks) {
 			to_end = 1;
 		} else {
@@ -6666,6 +6748,30 @@ static long long sas_delayed(const ctx_t *c, double *per_gb)
 	return n;
 }
 
+/*
+ * Where a slow scan's time went, when the drive's own evidence says: its
+ * error counters show it correcting reads with delays during the scan, or
+ * the kernel logged it answering commands with Recovered Error.  Only for a
+ * scan that saw slowness -- weak sectors, chunks over budget, regions
+ * skipped -- since an explanation of nothing is noise.  Without it the
+ * report shows weak sectors everywhere and leaves the reader to find the
+ * cause in dmesg, which is what happened the first time; a drive slow on
+ * every command looks like a bad path as easily as a bad drive.
+ */
+static const char *slow_source(const ctx_t *c)
+{
+	double per_gb;
+
+	if (!c->blocks_weak && !c->nskip && !c->chunks_slow)
+		return NULL;
+	if (c->smart_before.have && c->smart_after.have &&
+	    sas_delayed(c, &per_gb) >= SAS_DELAYED_MIN && per_gb >= 1.0)
+		return "drive_corrections";
+	if (c->k_recovered >= KMSG_RECOVERED_TELL)
+		return "drive_recovered_errors";
+	return NULL;
+}
+
 static int verdict_of(ctx_t *c, const char **why)
 {
 	static char buf[200];
@@ -7201,10 +7307,12 @@ static void report(ctx_t *c)
 		    "part of this verdict\n", c_yel(), c_off());
 	else if (c->kmsg_state != KMSG_OFF)
 		out("  Kernel log       %s%" PRIu64 " resets, %" PRIu64 " command "
-		    "timeouts, %" PRIu64 " medium errors%s%s against this drive\n",
+		    "timeouts, %" PRIu64 " medium errors, %" PRIu64 " recovered "
+		    "errors%s%s against this drive\n",
 		    c->k_resets || c->k_timeouts || c->k_offline ? c_red() :
-		    c->k_medium ? c_yel() : "", c->k_resets, c->k_timeouts,
-		    c->k_medium, c->k_offline ? ", taken offline" : "", c_off());
+		    c->k_medium || c->k_recovered ? c_yel() : "", c->k_resets,
+		    c->k_timeouts, c->k_medium, c->k_recovered,
+		    c->k_offline ? ", taken offline" : "", c_off());
 	if (!c->too_slow && c->slow_secs && c->rate_floor > 0)
 		out("  %sSlow stretch%s     %s under the floor over ten-minute windows, "
 		    "worst %s/s near %s\n", c_yel(), c_off(),
@@ -7554,6 +7662,37 @@ no_modes:	;
 	    v == 0 ? c_grn() : v == 1 ? c_yel() : c_red(),
 	    v == 0 ? "HEALTHY" : v == 1 ? "SUSPECT" : "FAILING",
 	    c_off(), why);
+	if (slow_source(c)) {
+		double per_gb;
+		long long n = sas_delayed(c, &per_gb);
+		int counted = !strcmp(slow_source(c), "drive_corrections");
+
+		if (counted)
+			out("\n %sWhere the time went:%s the drive itself. During this "
+			    "scan it needed\n delayed corrections or rereads %lld "
+			    "times, %.0f per GB read.\n", c_yel(), c_off(), n,
+			    per_gb);
+		else
+			out("\n %sWhere the time went:%s most likely the drive "
+			    "itself.\n", c_yel(), c_off());
+		if (c->k_recovered)
+			out(" The kernel logged %" PRIu64 " commands it answered "
+			    "with Recovered Error%s%s%s.\n", c->k_recovered,
+			    c->k_rec_asc[0] ? "\n (" : "", c->k_rec_asc,
+			    c->k_rec_asc[0] ? ")" : "");
+		if (counted)
+			out(" Those reads came back right, but only after extra "
+			    "revolutions spent\n correcting them, and that is the "
+			    "latency measured above -- not the\n cable, the HBA or "
+			    "this tool. SMART health can still read OK: it only\n "
+			    "changes once a failure-prediction threshold is "
+			    "crossed.\n");
+		else
+			out(" The drive completed those, but after a recovery action "
+			    "of its own or\n with a warning attached, and slow reads "
+			    "alongside that are the drive's\n doing, not the path to "
+			    "it.\n");
+	}
 	if (c->prot_errors) {
 		out("\n %sNot covered:%s %s of this device answered \"logical block\n"
 		    " guard check failed\" and was skipped.\n", c_yel(), c_off(),
@@ -7660,11 +7799,23 @@ static void write_json(ctx_t *c, const char *path)
 	fprintf(f, "  \"too_slow\": %s,\n", c->too_slow ? "true" : "false");
 	fprintf(f, "  \"slow_stretch_s\": %" PRIu64 ",\n", c->slow_secs);
 	if (c->kmsg_state != KMSG_OFF)
+	{
 		fprintf(f, "  \"kernel_log\": {\"read\": %s, \"resets\": %" PRIu64
 			", \"timeouts\": %" PRIu64 ", \"medium_errors\": %" PRIu64
-			", \"offline\": %" PRIu64 "},\n",
+			", \"offline\": %" PRIu64 ", \"recovered_errors\": %" PRIu64
+			", \"recovered_sense\": \"",
 			c->kmsg_state == KMSG_UNREADABLE ? "false" : "true",
-			c->k_resets, c->k_timeouts, c->k_medium, c->k_offline);
+			c->k_resets, c->k_timeouts, c->k_medium, c->k_offline,
+			c->k_recovered);
+		json_escape(f, c->k_rec_asc);
+		fprintf(f, "\"},\n");
+	}
+	{
+		const char *src = slow_source(c);
+
+		fprintf(f, "  \"slowness_source\": %s%s%s,\n", src ? "\"" : "",
+			src ? src : "null", src ? "\"" : "");
+	}
 	fprintf(f, "  \"protection_type\": %d,\n", c->dev->prot_type);
 	fprintf(f, "  \"protection_refused_bytes\": %" PRIu64 ",\n", c->prot_bytes);
 	fprintf(f, "  \"complete\": %s,\n",
@@ -8713,8 +8864,9 @@ static void usage(void)
 "                         under the --min-rate floor -- stop reading: probe\n"
 "                         1 GiB on, doubling to 64 GiB, until one is fast,\n"
 "                         bisect back to the edge, carry on there.  A chunk\n"
-"                         whose drill-down costs over 10 s is condemned\n"
-"                         whole.  What was jumped over is condemned unread;\n"
+"                         whose drill-down costs over 10 s per 256 sectors\n"
+"                         in it (never under 10 s) is condemned whole.\n"
+"                         What was jumped over is condemned unread;\n"
 "                         the report says so and --hide-bad cuts it out.\n"
 "                         Sequential or reverse order only.  On under\n"
 "                         predeploy, and dropped there without comment where\n"

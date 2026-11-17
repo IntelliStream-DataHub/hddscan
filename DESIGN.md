@@ -377,8 +377,15 @@ anything.
 The steps start at 1 GiB and double after each slow probe, up to 64 GiB.
 At a fixed gigabyte, a drive damaged to the end took thirteen thousand probes
 to cross; a real one spent minutes at it with nothing on the screen. Doubling
-crosses it in a couple of hundred. The price is that a healthy stretch shorter
-than the step, lying between two slow probes, is condemned with them.
+crosses it in a couple of hundred. The price is that a healthy stretch lying
+between two slow probes is condemned with them, so once the step has doubled
+a slow probe is not taken at its word: the middle of the gap behind it is
+probed too, and if that comes back fast the edge is bisected for there
+instead. Without it, a drive slow in patches, with a patch under each probe
+that happened to land in one, could lose 32 and 64 GiB stretches of healthy
+surface unread. Crossing damage to the end now costs twice the probes, still
+a few hundred, and a healthy stretch is lost only if it is shorter than half
+the step and misses the middle of it.
 
 While a skip is probing, the drive's STATE says `probing` and the line under
 it says where ("skip: probing ahead at 1.00 TiB for where the slow region
@@ -388,8 +395,12 @@ damage looked like a read that never came back. The checkpoint keeps the scan's 
 nothing is condemned until the skip has finished.
 
 And whatever the window says, one chunk may not eat the scan. A drill-down
-that has spent 10 s of I/O on one chunk, about three times what drilling a
-healthy 1 MiB chunk costs, stops, and the whole chunk is condemned. The
+that has spent about three times what drilling a healthy chunk costs stops,
+and the whole chunk is condemned: 10 s of I/O for a 1 MiB chunk of 4 KiB
+sectors, and in proportion for a chunk of more sectors than that, since a
+healthy drill-down is one lost revolution per sector. A flat 10 s cut short
+every over-budget 4 MiB chunk on a slower drive, where 1024 healthy sectors
+take 8 to 14 s, and condemned it whole though nothing in it was wrong. The
 sectors drilled so far stay in the findings, and the rest is recorded as
 unread. A run of such chunks becomes one region, and so does a cut chunk
 followed by a skipped region.
@@ -1116,6 +1127,29 @@ scan's own reads got past, is SUSPECT. Timeouts that smartctl's own commands
 provoke count too: a drive that will not answer those is no healthier. Reading
 `/dev/kmsg` needs root; without it the report says the log was not read rather
 than implying it was clean.
+
+A Recovered Error is counted too, but never held against the drive: the
+command completed, after a recovery action of the drive's own or with a
+warning attached (a SAS drive whose informational exceptions page has MRIE 4,
+the factory default on some, reports its warnings that way). What it explains
+is time. A 14 TB SAS drive answered a command about every 70 ms like this,
+`ASC=0xb <<vendor>>ASCQ=0x97`, and its scan showed weak sectors over the whole
+surface and a skip that probed from the first gigabyte to the last, with
+nothing in the report to say why. Its error counter log had the answer:
+millions of delayed corrections, no uncorrected errors, health OK. It returned
+every read right, just late. That looks like a bad path as easily as a bad
+drive, and the first guess at it was the path.
+
+So when a scan saw slowness — weak sectors, chunks over budget, regions
+skipped — and the drive's own evidence explains it, the report says so under
+the verdict, as **Where the time went**. Delayed corrections growing during
+the scan past the SUSPECT line above make it the drive itself, said plainly.
+Ten or more Recovered Errors without that make it most likely the drive,
+since the sense code alone does not say whether a warning or a correction
+cost the time. The JSON carries it as `slowness_source`, and the count as
+`kernel_log.recovered_errors` with the first sense line. The tenth one is also
+said on the way past, because a skip can probe for hours before there is a
+report to read.
 
 SMART is read before and after the scan, and what *moved* in between counts
 for more than any lifetime total. End-to-end errors (184) growing during the
