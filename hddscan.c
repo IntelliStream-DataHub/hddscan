@@ -2968,6 +2968,10 @@ typedef struct {
 	int kmsg_ntok;
 	uint64_t kmsg_last_us;
 	uint64_t k_offline, k_resets, k_timeouts, k_medium;
+	uint64_t k_recovered;   /* commands answered with Recovered Error */
+	char k_rec_asc[64];     /* the first one's ASC/ASCQ, as logged */
+	int k_rec_pending;      /* the next line about us is its ASC */
+	int k_rec_told;         /* said so on the way past */
 
 	int dev_gone;           /* the drive left mid-scan: see dev_gone() */
 
@@ -5477,10 +5481,28 @@ static int kmsg_about_us(const ctx_t *c, const char *line)
 	return 0;
 }
 
+/*
+ * A Recovered Error is the drive saying a command completed, but only after
+ * a recovery action of its own -- or, with the informational exceptions page
+ * set to report that way (MRIE 4, the factory default on some SAS drives),
+ * with a warning attached.  Neither is a failure, and the scan never sees
+ * either: the data came back right.  What it does see is the time, and a
+ * drive answering most of its reads like this is slow for a reason of its
+ * own, not because of the path to it.  A real 14 TB SAS drive did exactly
+ * this, about every 70 ms, and its scan looked like weak sectors everywhere.
+ * The sense key and the ASC arrive as two lines; the ASC is kept from the
+ * first, so the report can say what the drive was reporting.
+ */
+#define KMSG_RECOVERED_TELL 10
+
 static void kmsg_line(ctx_t *c, const char *line)
 {
+	int pend = c->k_rec_pending;
+	const char *a;
+
 	if (!kmsg_about_us(c, line))
 		return;
+	c->k_rec_pending = 0;
 	if (strstr(line, "offline device") || strstr(line, "Device offlined") ||
 	    strstr(line, "rejecting I/O to dead device"))
 		c->k_offline++;
@@ -5499,6 +5521,33 @@ static void kmsg_line(ctx_t *c, const char *line)
 		 strstr(line, "error: { UNC") ||
 		 strstr(line, "critical medium error"))
 		c->k_medium++;
+	else if (strstr(line, "Recovered Error")) {
+		c->k_recovered++;
+		c->k_rec_pending = 1;
+	} else if (pend && !c->k_rec_asc[0] &&
+		   ((a = strstr(line, "ASC=")) ||
+		    (a = strstr(line, "Add. Sense: ")))) {
+		size_t n = strcspn(a, "\n");
+
+		if (n >= sizeof(c->k_rec_asc))
+			n = sizeof(c->k_rec_asc) - 1;
+		memcpy(c->k_rec_asc, a, n);
+		c->k_rec_asc[n] = 0;
+	}
+}
+
+/* once, while it is happening: a skip can probe for hours before a report */
+static void kmsg_tell(ctx_t *c)
+{
+	if (c->k_rec_told || c->k_recovered < KMSG_RECOVERED_TELL)
+		return;
+	c->k_rec_told = 1;
+	msg(PROG ": %s: %sthe drive has answered %" PRIu64 " commands with "
+	    "Recovered Error%s%s%s%s: it completes them, after a recovery "
+	    "action or with a warning of its own, and slow reads alongside "
+	    "that are the drive's doing, not the path to it\n", c->dev->name,
+	    c_yel(), c->k_recovered, c->k_rec_asc[0] ? " (" : "",
+	    c->k_rec_asc, c->k_rec_asc[0] ? ")" : "", c_off());
 }
 
 static void kmsg_poll(ctx_t *c, int now)
@@ -5524,6 +5573,7 @@ static void kmsg_poll(ctx_t *c, int now)
 		}
 		c->kmsg_fd = -1;
 		c->kmsg_state = KMSG_DONE;
+		kmsg_tell(c);
 		return;
 	}
 	/* one record per read(): "pri,seq,usec,flags;message\n KEY=value..." */
@@ -5536,6 +5586,7 @@ static void kmsg_poll(ctx_t *c, int now)
 		buf[r] = 0;
 		kmsg_line(c, buf);
 	}
+	kmsg_tell(c);
 }
 
 static void kmsg_close(ctx_t *c)
@@ -5941,6 +5992,7 @@ static int skip_probe(ctx_t *c, uint64_t s, uint64_t n, void *buf,
 		if (r == (ssize_t)len)
 			latwin_add(&c->latwin, us);
 		progress(c, 0);
+		kmsg_poll(c, 0);
 		if (r < 0 && (err == EINVAL || err == EILSEQ))
 			continue;
 		if (dev_gone(c, r, err, len))
@@ -6696,6 +6748,30 @@ static long long sas_delayed(const ctx_t *c, double *per_gb)
 	return n;
 }
 
+/*
+ * Where a slow scan's time went, when the drive's own evidence says: its
+ * error counters show it correcting reads with delays during the scan, or
+ * the kernel logged it answering commands with Recovered Error.  Only for a
+ * scan that saw slowness -- weak sectors, chunks over budget, regions
+ * skipped -- since an explanation of nothing is noise.  Without it the
+ * report shows weak sectors everywhere and leaves the reader to find the
+ * cause in dmesg, which is what happened the first time; a drive slow on
+ * every command looks like a bad path as easily as a bad drive.
+ */
+static const char *slow_source(const ctx_t *c)
+{
+	double per_gb;
+
+	if (!c->blocks_weak && !c->nskip && !c->chunks_slow)
+		return NULL;
+	if (c->smart_before.have && c->smart_after.have &&
+	    sas_delayed(c, &per_gb) >= SAS_DELAYED_MIN && per_gb >= 1.0)
+		return "drive_corrections";
+	if (c->k_recovered >= KMSG_RECOVERED_TELL)
+		return "drive_recovered_errors";
+	return NULL;
+}
+
 static int verdict_of(ctx_t *c, const char **why)
 {
 	static char buf[200];
@@ -7231,10 +7307,12 @@ static void report(ctx_t *c)
 		    "part of this verdict\n", c_yel(), c_off());
 	else if (c->kmsg_state != KMSG_OFF)
 		out("  Kernel log       %s%" PRIu64 " resets, %" PRIu64 " command "
-		    "timeouts, %" PRIu64 " medium errors%s%s against this drive\n",
+		    "timeouts, %" PRIu64 " medium errors, %" PRIu64 " recovered "
+		    "errors%s%s against this drive\n",
 		    c->k_resets || c->k_timeouts || c->k_offline ? c_red() :
-		    c->k_medium ? c_yel() : "", c->k_resets, c->k_timeouts,
-		    c->k_medium, c->k_offline ? ", taken offline" : "", c_off());
+		    c->k_medium || c->k_recovered ? c_yel() : "", c->k_resets,
+		    c->k_timeouts, c->k_medium, c->k_recovered,
+		    c->k_offline ? ", taken offline" : "", c_off());
 	if (!c->too_slow && c->slow_secs && c->rate_floor > 0)
 		out("  %sSlow stretch%s     %s under the floor over ten-minute windows, "
 		    "worst %s/s near %s\n", c_yel(), c_off(),
@@ -7584,6 +7662,37 @@ no_modes:	;
 	    v == 0 ? c_grn() : v == 1 ? c_yel() : c_red(),
 	    v == 0 ? "HEALTHY" : v == 1 ? "SUSPECT" : "FAILING",
 	    c_off(), why);
+	if (slow_source(c)) {
+		double per_gb;
+		long long n = sas_delayed(c, &per_gb);
+		int counted = !strcmp(slow_source(c), "drive_corrections");
+
+		if (counted)
+			out("\n %sWhere the time went:%s the drive itself. During this "
+			    "scan it needed\n delayed corrections or rereads %lld "
+			    "times, %.0f per GB read.\n", c_yel(), c_off(), n,
+			    per_gb);
+		else
+			out("\n %sWhere the time went:%s most likely the drive "
+			    "itself.\n", c_yel(), c_off());
+		if (c->k_recovered)
+			out(" The kernel logged %" PRIu64 " commands it answered "
+			    "with Recovered Error%s%s%s.\n", c->k_recovered,
+			    c->k_rec_asc[0] ? "\n (" : "", c->k_rec_asc,
+			    c->k_rec_asc[0] ? ")" : "");
+		if (counted)
+			out(" Those reads came back right, but only after extra "
+			    "revolutions spent\n correcting them, and that is the "
+			    "latency measured above -- not the\n cable, the HBA or "
+			    "this tool. SMART health can still read OK: it only\n "
+			    "changes once a failure-prediction threshold is "
+			    "crossed.\n");
+		else
+			out(" The drive completed those, but after a recovery action "
+			    "of its own or\n with a warning attached, and slow reads "
+			    "alongside that are the drive's\n doing, not the path to "
+			    "it.\n");
+	}
 	if (c->prot_errors) {
 		out("\n %sNot covered:%s %s of this device answered \"logical block\n"
 		    " guard check failed\" and was skipped.\n", c_yel(), c_off(),
@@ -7690,11 +7799,23 @@ static void write_json(ctx_t *c, const char *path)
 	fprintf(f, "  \"too_slow\": %s,\n", c->too_slow ? "true" : "false");
 	fprintf(f, "  \"slow_stretch_s\": %" PRIu64 ",\n", c->slow_secs);
 	if (c->kmsg_state != KMSG_OFF)
+	{
 		fprintf(f, "  \"kernel_log\": {\"read\": %s, \"resets\": %" PRIu64
 			", \"timeouts\": %" PRIu64 ", \"medium_errors\": %" PRIu64
-			", \"offline\": %" PRIu64 "},\n",
+			", \"offline\": %" PRIu64 ", \"recovered_errors\": %" PRIu64
+			", \"recovered_sense\": \"",
 			c->kmsg_state == KMSG_UNREADABLE ? "false" : "true",
-			c->k_resets, c->k_timeouts, c->k_medium, c->k_offline);
+			c->k_resets, c->k_timeouts, c->k_medium, c->k_offline,
+			c->k_recovered);
+		json_escape(f, c->k_rec_asc);
+		fprintf(f, "\"},\n");
+	}
+	{
+		const char *src = slow_source(c);
+
+		fprintf(f, "  \"slowness_source\": %s%s%s,\n", src ? "\"" : "",
+			src ? src : "null", src ? "\"" : "");
+	}
 	fprintf(f, "  \"protection_type\": %d,\n", c->dev->prot_type);
 	fprintf(f, "  \"protection_refused_bytes\": %" PRIu64 ",\n", c->prot_bytes);
 	fprintf(f, "  \"complete\": %s,\n",

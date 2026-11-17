@@ -1128,6 +1128,29 @@ provoke count too: a drive that will not answer those is no healthier. Reading
 `/dev/kmsg` needs root; without it the report says the log was not read rather
 than implying it was clean.
 
+A Recovered Error is counted too, but never held against the drive: the
+command completed, after a recovery action of the drive's own or with a
+warning attached (a SAS drive whose informational exceptions page has MRIE 4,
+the factory default on some, reports its warnings that way). What it explains
+is time. A 14 TB SAS drive answered a command about every 70 ms like this,
+`ASC=0xb <<vendor>>ASCQ=0x97`, and its scan showed weak sectors over the whole
+surface and a skip that probed from the first gigabyte to the last, with
+nothing in the report to say why. Its error counter log had the answer:
+millions of delayed corrections, no uncorrected errors, health OK. It returned
+every read right, just late. That looks like a bad path as easily as a bad
+drive, and the first guess at it was the path.
+
+So when a scan saw slowness — weak sectors, chunks over budget, regions
+skipped — and the drive's own evidence explains it, the report says so under
+the verdict, as **Where the time went**. Delayed corrections growing during
+the scan past the SUSPECT line above make it the drive itself, said plainly.
+Ten or more Recovered Errors without that make it most likely the drive,
+since the sense code alone does not say whether a warning or a correction
+cost the time. The JSON carries it as `slowness_source`, and the count as
+`kernel_log.recovered_errors` with the first sense line. The tenth one is also
+said on the way past, because a skip can probe for hours before there is a
+report to read.
+
 SMART is read before and after the scan, and what *moved* in between counts
 for more than any lifetime total. End-to-end errors (184) growing during the
 scan are FAILING: that is data corrupted on the drive's own internal path, not
