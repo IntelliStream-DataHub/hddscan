@@ -700,6 +700,26 @@ assert_has "and says it is probing ahead while it does" "$out" \
 	"probing ahead for where it ends"
 rm -f "$f"
 
+# A slow probe after a doubled step only condemns the gap behind it once the
+# middle of that gap has been probed slow too.  Two slow patches, the second
+# under where the second forward probe lands, with 1.9 GiB of healthy surface
+# between them: taking the second probe at its word condemned all of it
+# unread, as one 3.2 GiB region.
+f=$(slowimg skipgap.bin 5G)
+out=$(slowrun 1G:1176M,4100M:200M --skip-slow --json "$TMP/skipgap.json" "$f")
+read -r nreg hit <<< "$(python3 - "$TMP/skipgap.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+M = 1 << 20
+r = [(k["offset"], k["offset"] + k["length"]) for k in d["slow_regions"]]
+print(len(r), sum(1 for a, b in r if a < 4000 * M and b > 2300 * M))
+PY
+)"
+assert_eq "healthy surface between two slow probes is not condemned with them" \
+	"$hit" "0"
+assert_eq "and each slow patch is a region of its own" "$nreg" "2"
+rm -f "$f"
+
 f=$(slowimg skiprev.bin 3G)
 out=$(slowrun 1G:1G --skip-slow --order reverse --json "$TMP/skiprev.json" "$f")
 read -r roff rend <<< "$(json_region "$TMP/skiprev.json")"
@@ -810,6 +830,19 @@ assert_has "and the report says the rest of it was never read" "$out" \
 assert_has "without --skip-slow the whole chunk is drilled" \
 	"$(HDDSCAN_SLOW=8M:1M HDDSCAN_SLOW_MS=512000 run --chunk 1M \
 		--chunk-slow-ms 1000 --retries 0 "$f")" "sectors weak                       256"
+
+# The cap is three times a healthy drill-down, and a drill-down is a read per
+# sector, so it grows with the chunk.  At a flat 10 s, a 4 MiB chunk over its
+# budget with every sector in it fine -- 1024 reads of 20 ms here -- was cut
+# short and condemned, 1024 weak sectors that were nothing of the kind.
+out=$(HDDSCAN_SLOW=8M:4M HDDSCAN_SLOW_MS=5000 run --chunk 4M \
+	--chunk-slow-ms 1000 --retries 1 --skip-slow "$f")
+assert_hasnt "a healthy drill-down of a big chunk is not cut short" "$out" \
+	"condemned it and moved on"
+assert_has "and every sector of it is read" "$out" \
+	"every sector of the device was read"
+assert_eq "and none of them is counted weak" \
+	"$(awk '/sectors weak/{print $3}' <<< "$out")" "0"
 
 # A resumed scan has to know what it skipped before, or it would call the
 # drive fully read.  Resumed at the step just past the region, from the

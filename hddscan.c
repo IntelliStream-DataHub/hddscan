@@ -4405,7 +4405,7 @@ static int dev_gone(ctx_t *c, ssize_t r, int err, size_t want)
 /* walk a suspicious chunk one block at a time */
 static int skip_cut_due(const ctx_t *c, uint64_t io0);
 static int skip_cut(ctx_t *c, uint64_t off, size_t len, uint64_t from);
-static int probe_cap_hit(uint64_t io0);
+static int probe_cap_hit(const ctx_t *c, uint64_t io0);
 
 /*
  * probe says a --skip-slow probe is drilling a chunk ahead of the scan:
@@ -4425,7 +4425,7 @@ static uint64_t drill_chunk(ctx_t *c, uint64_t off, size_t len, void *buf,
 		ssize_t r;
 
 		/* --skip-slow: one chunk may not eat the scan */
-		if (probe ? probe_cap_hit(io0) :
+		if (probe ? probe_cap_hit(c, io0) :
 		    skip_cut_due(c, io0) && skip_cut(c, off, len, o))
 			break;
 
@@ -5639,6 +5639,7 @@ static void check_temperature(ctx_t *c)
 #define SKIP_RATE_MIN_CHUNKS 3          /* the rate rule, once it has these */
 #define SKIP_RATE_MIN_US (20ull * 1000000)      /* and this much I/O */
 #define SKIP_DRILL_CAP_US (10ull * 1000000)     /* one chunk's drill-down */
+#define SKIP_DRILL_CAP_BLOCKS 256               /* ... of this many sectors */
 #define MAX_SKIPS 4096
 
 /* the bytes [a, b) covers in the scan order, which only ever walks */
@@ -5760,9 +5761,26 @@ static void skip_recount(ctx_t *c, skip_t *k)
 	c->skip_weak += k->weak;
 }
 
+/*
+ * The cap is about three times what drilling a healthy chunk costs, and that
+ * cost is one lost revolution per sector read, so it grows with the sectors
+ * in a chunk.  A flat 10 s was right for 1 MiB of 4 KiB sectors and wrong
+ * for anything bigger: a healthy 4 MiB chunk is 1024 single reads, 8 to 14 s
+ * of I/O, so every one that missed its budget by a whisker was cut short and
+ * condemned whole although every sector in it was fine.  Never below 10 s.
+ */
+static uint64_t skip_drill_cap(const ctx_t *c)
+{
+	uint64_t n = c->block ? (uint64_t)c->chunk / c->block : 0;
+
+	if (n <= SKIP_DRILL_CAP_BLOCKS)
+		return SKIP_DRILL_CAP_US;
+	return SKIP_DRILL_CAP_US * n / SKIP_DRILL_CAP_BLOCKS;
+}
+
 static int skip_cut_due(const ctx_t *c, uint64_t io0)
 {
-	return c->skip_slow && !c->pass && g_io_us - io0 > SKIP_DRILL_CAP_US;
+	return c->skip_slow && !c->pass && g_io_us - io0 > skip_drill_cap(c);
 }
 
 /*
@@ -5792,7 +5810,7 @@ static int skip_cut(ctx_t *c, uint64_t off, size_t len, uint64_t from)
 		msg(PROG ": %s: %sdrilling the chunk at %s has cost over %llu s; "
 		    "condemned it and moved on%s (--skip-slow)\n", c->dev->name,
 		    c_yel(), human_size(off, b1, sizeof(b1)),
-		    (unsigned long long)(SKIP_DRILL_CAP_US / 1000000), c_off());
+		    (unsigned long long)(skip_drill_cap(c) / 1000000), c_off());
 	}
 	k->s1 = c->step + 1;
 	k->unread += unread;
@@ -5837,9 +5855,9 @@ static int skip_note(ctx_t *c, uint64_t step, int over)
 	       c->rate_floor * (double)span;
 }
 
-static int probe_cap_hit(uint64_t io0)
+static int probe_cap_hit(const ctx_t *c, uint64_t io0)
 {
-	return g_io_us - io0 > SKIP_DRILL_CAP_US;
+	return g_io_us - io0 > skip_drill_cap(c);
 }
 
 /* a probe drilled this step: its findings are in, so the scan need not */
@@ -5967,7 +5985,7 @@ static uint64_t skip_ahead(ctx_t *c, void *buf, void *scratch)
 	uint64_t t = c->step, L = t, F = 0, p, s0, s1, unread, off;
 	uint64_t pn = skip_probe_len(c, SKIP_PROBE_BYTES);
 	uint64_t wn = skip_probe_len(c, SKIP_WIDE_BYTES);
-	uint64_t jump = SKIP_JUMP / (uint64_t)c->chunk;
+	uint64_t jump = SKIP_JUMP / (uint64_t)c->chunk, jump0;
 	uint64_t jmax = SKIP_JUMP_MAX / (uint64_t)c->chunk;
 	uint64_t res = SKIP_RES / (uint64_t)c->chunk;
 	int to_end = 0, i;
@@ -5980,6 +5998,7 @@ static uint64_t skip_ahead(ctx_t *c, void *buf, void *scratch)
 	c->probing = 1;
 	if (jump < 1)
 		jump = 1;
+	jump0 = jump;
 	if (res < pn)
 		res = pn;
 	/*
@@ -5987,8 +6006,16 @@ static uint64_t skip_ahead(ctx_t *c, void *buf, void *scratch)
 	 * each time a probe is still slow, up to 64 GiB.  At a fixed gigabyte a
 	 * drive damaged to the end took thirteen thousand probes to cross --
 	 * hours of it, with nothing on the screen; doubling crosses it in a
-	 * couple of hundred.  The price is that a healthy stretch shorter than
-	 * the step, between two slow probes, is condemned with them.
+	 * couple of hundred.  The price is that a healthy stretch between two
+	 * slow probes is condemned with them, so once the step has doubled a
+	 * slow probe is not taken at its word: the middle of the gap behind it
+	 * is probed as well, and if that comes back fast the edge is looked
+	 * for there instead.  Without it a drive slow in patches, with a patch
+	 * under each probe that happened to land in one, could lose whole 32
+	 * and 64 GiB stretches of healthy surface between them, unread.
+	 * Crossing damage to the end costs twice the probes, still a few
+	 * hundred; a healthy stretch is lost now only if it is shorter than
+	 * half the step and misses the middle of it.
 	 *
 	 * These probes are wide: damage in one chunk of twenty-five slips past
 	 * an eight-chunk probe more often than not, and the drive would be
@@ -6006,6 +6033,9 @@ static uint64_t skip_ahead(ctx_t *c, void *buf, void *scratch)
 		}
 		if (!skip_probe(c, p, wn, buf, scratch)) {
 			F = p;
+		} else if (p - L > jump0 &&
+			   !skip_probe(c, L + (p - L) / 2, wn, buf, scratch)) {
+			F = L + (p - L) / 2;
 		} else if (p + wn >= c->nchunks) {
 			to_end = 1;
 		} else {
@@ -8713,8 +8743,9 @@ static void usage(void)
 "                         under the --min-rate floor -- stop reading: probe\n"
 "                         1 GiB on, doubling to 64 GiB, until one is fast,\n"
 "                         bisect back to the edge, carry on there.  A chunk\n"
-"                         whose drill-down costs over 10 s is condemned\n"
-"                         whole.  What was jumped over is condemned unread;\n"
+"                         whose drill-down costs over 10 s per 256 sectors\n"
+"                         in it (never under 10 s) is condemned whole.\n"
+"                         What was jumped over is condemned unread;\n"
 "                         the report says so and --hide-bad cuts it out.\n"
 "                         Sequential or reverse order only.  On under\n"
 "                         predeploy, and dropped there without comment where\n"

@@ -377,8 +377,15 @@ anything.
 The steps start at 1 GiB and double after each slow probe, up to 64 GiB.
 At a fixed gigabyte, a drive damaged to the end took thirteen thousand probes
 to cross; a real one spent minutes at it with nothing on the screen. Doubling
-crosses it in a couple of hundred. The price is that a healthy stretch shorter
-than the step, lying between two slow probes, is condemned with them.
+crosses it in a couple of hundred. The price is that a healthy stretch lying
+between two slow probes is condemned with them, so once the step has doubled
+a slow probe is not taken at its word: the middle of the gap behind it is
+probed too, and if that comes back fast the edge is bisected for there
+instead. Without it, a drive slow in patches, with a patch under each probe
+that happened to land in one, could lose 32 and 64 GiB stretches of healthy
+surface unread. Crossing damage to the end now costs twice the probes, still
+a few hundred, and a healthy stretch is lost only if it is shorter than half
+the step and misses the middle of it.
 
 While a skip is probing, the drive's STATE says `probing` and the line under
 it says where ("skip: probing ahead at 1.00 TiB for where the slow region
@@ -388,8 +395,12 @@ damage looked like a read that never came back. The checkpoint keeps the scan's 
 nothing is condemned until the skip has finished.
 
 And whatever the window says, one chunk may not eat the scan. A drill-down
-that has spent 10 s of I/O on one chunk, about three times what drilling a
-healthy 1 MiB chunk costs, stops, and the whole chunk is condemned. The
+that has spent about three times what drilling a healthy chunk costs stops,
+and the whole chunk is condemned: 10 s of I/O for a 1 MiB chunk of 4 KiB
+sectors, and in proportion for a chunk of more sectors than that, since a
+healthy drill-down is one lost revolution per sector. A flat 10 s cut short
+every over-budget 4 MiB chunk on a slower drive, where 1024 healthy sectors
+take 8 to 14 s, and condemned it whole though nothing in it was wrong. The
 sectors drilled so far stay in the findings, and the rest is recorded as
 unread. A run of such chunks becomes one region, and so does a cut chunk
 followed by a skipped region.
