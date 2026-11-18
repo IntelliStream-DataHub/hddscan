@@ -8910,9 +8910,9 @@ static const profile_t g_profiles[] = {
 	 * forgot what was written.  The fill is flushed before it starts.
 	 */
 	{ "prepbackup",
-	  "a backup drive: fill, verify, map out what reads under 15 MiB/s",
+	  "a backup drive: fill, verify, map out what reads under 20 MiB/s",
 	  MODE_WRITE, 1, 1, 1, 0, 4096u * 1024, -1, 0, 0, 0, 1,
-	  1, 15.0, 1, 50, 5.0 },
+	  1, 20.0, 1, 50, 5.0 },
 };
 #define NPROFILES ((int)(sizeof(g_profiles) / sizeof(g_profiles[0])))
 
@@ -8963,8 +8963,8 @@ static void usage(void)
 "                           prepbackup a backup drive, empty: fill it with the\n"
 "                                      pattern in one sequential write, then\n"
 "                                      read it all back and verify it.  4M\n"
-"                                      chunks; a chunk read under 15 MiB/s\n"
-"                                      is condemned whole (--slow-rate 15),\n"
+"                                      chunks; a chunk read under 20 MiB/s\n"
+"                                      is condemned whole (--slow-rate 20),\n"
 "                                      --skip-slow, and --hide-and-rescan\n"
 "                                      with --hide-max 50 and --hide-reserve\n"
 "                                      5.  Saves nothing on the drive\n"
@@ -9095,7 +9095,7 @@ static void usage(void)
 "  --slow-rate MIB        a chunk read slower than this many MiB/s is over\n"
 "                         budget, the same everywhere on the platter, and is\n"
 "                         read once more and then condemned whole rather than\n"
-"                         drilled: speed is the chunk's, not a sector's.  15\n"
+"                         drilled: speed is the chunk's, not a sector's.  20\n"
 "                         under prepbackup; 0 uses the calibrated budget.\n"
 "                         --chunk-slow-ms wins over it\n"
 "  --min-rate MIB         a hard drive testing slower than this many MiB/s at\n"

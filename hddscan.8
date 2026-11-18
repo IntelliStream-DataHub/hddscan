@@ -194,8 +194,8 @@ A backup drive, empty, that may be slower than a production drive should be
 and still be worth keeping. It fills the drive with the pattern in one
 sequential write and then reads it all back and verifies it
 .RB ( \-\-fill\-first ),
-in 4M chunks. A chunk read slower than 15 MiB/s is condemned whole
-.RB ( "\-\-slow\-rate 15" ),
+in 4M chunks. A chunk read slower than 20 MiB/s is condemned whole
+.RB ( "\-\-slow\-rate 20" ),
 regions slow as a whole are skipped
 .RB ( \-\-skip\-slow ),
 and what was condemned or found damaged is cut out with device-mapper and the
@@ -516,7 +516,7 @@ given by hand is. An over-budget chunk is read once more, and condemned whole
 if it is still slow, rather than drilled sector by sector: speed is the
 chunk's, and drilling a slow but readable chunk only makes a weak drive crawl.
 Every block of a condemned chunk counts weak, as a skipped region's do.
-Read errors and wrong data are still found block by block. 15 under
+Read errors and wrong data are still found block by block. 20 under
 prepbackup; 0 uses the calibrated budget.
 .B \-\-chunk\-slow\-ms
 wins over it.

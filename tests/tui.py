@@ -693,7 +693,7 @@ def main():
         check("prepbackup's description fits a 24x80 terminal",
               s.wait(lambda: s.on_screen(
                   "prepbackup: a backup drive: fill, verify, map out what "
-                  "reads under 15 MiB/s"))
+                  "reads under 20 MiB/s"))
               and s.on_screen("Scan (3 of 3)") and s.on_screen("q quit"),
               "\n".join(l for l in s.screen.lines() if l.strip()))
         s.send(b"q"); s.close()

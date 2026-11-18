@@ -1067,7 +1067,7 @@ echo "== prepbackup: fill, verify, map out what reads slowly =="
 
 # A backup drive is judged on whether a region reads fast enough to keep.
 # prepbackup fills the drive in one sequential write, reads it all back and
-# verifies it, condemns a 4 MiB chunk read under 15 MiB/s whole, and maps out
+# verifies it, condemns a 4 MiB chunk read under 20 MiB/s whole, and maps out
 # what was condemned unless more than half the drive would go.  Under the
 # suite's 1 s floor a chunk's budget is the floor, so a slow chunk here is
 # one HDDSCAN_SLOW makes take 2 s (500 ms per MiB); each 4 KiB inside it
@@ -1082,7 +1082,7 @@ assert_has "then reads it all back and verifies it" "$out" \
 assert_has "its report says the first pass was a fill" "$out" \
 	"destructive fill of the whole device, then a read-back verify"
 assert_has "its budget is a rate, not a margin" "$out" \
-	"a chunk read slower than 15.0 MiB/s (--slow-rate)"
+	"a chunk read slower than 20.0 MiB/s (--slow-rate)"
 assert_has "in 4 MiB chunks" "$out" "calibrated: median 4096 KiB read"
 assert_has "a clean drive is HEALTHY" "$out" "VERDICT: HEALTHY"
 assert_has "the checkpoint says the verify was the pass it ended in" \
@@ -1101,7 +1101,7 @@ assert_has "and finds what changed since the fill, to the block" "$out" \
 out=$(HDDSCAN_SLOW=64M:16M HDDSCAN_SLOW_MS=500 \
 	pb --no-hide-and-rescan --json "$TMP/pb.json" "$f")
 assert_has "chunks read under the rate are condemned whole" "$out" \
-	"VERDICT: SUSPECT - 1 region of the surface (16.00 MiB) read slower than 15 MiB/s, 4096 weak sectors"
+	"VERDICT: SUSPECT - 1 region of the surface (16.00 MiB) read slower than 20 MiB/s, 4096 weak sectors"
 assert_has "and the report says they were read, not skipped" "$out" \
 	"Condemned:"
 assert_hasnt "nothing was skipped unread" "$out" "Not covered:"

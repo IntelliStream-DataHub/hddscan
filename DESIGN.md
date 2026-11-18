@@ -62,7 +62,7 @@ to derive it from.
 | **inservice** | read | It holds data you want to keep. Never writes anything. |
 | **survey** | read, sampled | Quick triage of a shelf. |
 | **decay** | check | Weeks after a predeploy run: has the pattern rotted? |
-| **prepbackup** | write | A backup drive: fill it, verify it, map out what reads under 15 MiB/s, unless more than half of it would go. See below. |
+| **prepbackup** | write | A backup drive: fill it, verify it, map out what reads under 20 MiB/s, unless more than half of it would go. See below. |
 
 The default writes, because a surface test is nearly always run before a drive
 goes into service and a read-only pass cannot tell you whether a sector will
@@ -1027,12 +1027,12 @@ to still be in the cache. The checkpoint records which pass it was in. A scan
 resumed inside its verify carries on verifying, and must: refilling would
 overwrite exactly what the verify is there to find.
 
-**The budget is a rate** (`--slow-rate`, 15 MiB/s). A chunk read slower than
+**The budget is a rate** (`--slow-rate`, 20 MiB/s). A chunk read slower than
 that is over budget, with the same number everywhere on the platter. That
 follows invariant 1b the way `--chunk-slow-ms` does: a threshold given by hand
 means that number, and is never bent to the platter or to what is being read.
 The sector budget is the same time, so invariant 1 still holds. At 4 MiB
-chunks it is 267 ms, against the 20 to 40 ms a healthy drive takes at either
+chunks it is 200 ms, against the 20 to 40 ms a healthy drive takes at either
 edge, so only a region that is really slow falls under it.
 
 **A slow chunk is condemned whole, not drilled.** The rate measures the
@@ -1068,7 +1068,7 @@ predeploy, and a backup drive is not being configured for service.
 
 What has not been run is the whole of it on a real drive. The fill, the
 verify, the rate, the condemned chunks, the share and the map were tested on
-images with `HDDSCAN_SLOW` and the map stand-in. Whether 15 MiB/s draws the
+images with `HDDSCAN_SLOW` and the map stand-in. Whether 20 MiB/s draws the
 line in the right place on the drive that prompted it is still to be seen.
 
 ### Useful flags
