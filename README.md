@@ -66,6 +66,7 @@ depends entirely on what you are about to do with it:
 | **inservice** | read | It holds data you want to keep. Never writes anything. |
 | **survey** | read, sampled | Quick triage of a shelf. |
 | **decay** | check | Weeks after a predeploy run: has the pattern rotted? |
+| **prepbackup** | write | A backup drive, empty, slower than production should be and still worth keeping. Fills it in one sequential write, reads it all back and verifies it, condemns any 4 MiB chunk read under 15 MiB/s, and maps out what was condemned or damaged with device-mapper (5% held back as spares) unless more than half of it would go. The map is then filled and verified too. Saves nothing on the drive. |
 
 A drive being prepared is the one moment someone is deliberately configuring
 it, so predeploy also **saves** the configuration it should run

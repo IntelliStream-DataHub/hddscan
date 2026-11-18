@@ -513,6 +513,19 @@ explicitly — `sg_format` defaults `--fmtpinfo` to 0, so a bare block size
 change would silently strip protection information, and the default here is to
 preserve whatever `prot_type` the drive reports.
 
+**16. A `--fill-first` scan judges on its verify, and a resumed verify never
+fills again.** prepbackup's first pass only writes, so everything that judges
+(`--skip-slow`'s window, its drill cap, which condemned stretches a pass
+skips) follows `c->judge_pass` and not "pass 0". The checkpoint records the
+pass. A scan resumed inside its verify carries on verifying, because refilling
+would overwrite exactly the damage the verify exists to find. There is a test
+that corrupts the image between the two and resumes. Two more rules go with
+it. `--hide-max` is decided in `scan_device()` before the report, from the
+same list, extent size and count `hide_after_scan()` builds the map from, so
+the verdict and the map cannot disagree. And a chunk condemned under
+`--slow-rate` was read: the report calls it **Condemned**, never **Not
+covered**, since every byte of it was tested (invariant 9 cuts both ways).
+
 ## Style
 
 Kernel-ish C: tabs, 80 columns, declarations at the top of a block, `static`

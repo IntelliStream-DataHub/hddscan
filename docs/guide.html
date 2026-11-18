@@ -105,6 +105,7 @@ go with it; any flag you give explicitly overrides it.</p>
 		<tr><td><b>inservice</b></td><td>read</td><td>It holds data you want to keep. Never writes anything.</td></tr>
 		<tr><td><b>survey</b></td><td>read, sampled</td><td>Quick triage of a shelf: reads one chunk in 64.</td></tr>
 		<tr><td><b>decay</b></td><td>check</td><td>Weeks after a predeploy run: has the written pattern rotted?</td></tr>
+		<tr><td><b>prepbackup</b></td><td>write</td><td>A backup drive, empty, that may be slower than production allows. Fills it in one sequential write, reads it all back and verifies it, condemns any 4 MiB chunk read under 15 MiB/s, and cuts out what was condemned or damaged with device-mapper, 5% held back as spares, unless more than half the drive would go. The map is then filled and verified too. Saves nothing on the drive.</td></tr>
 	</tbody>
 </table></div>
 <div class="callout"><p>The default writes, because a surface test is
@@ -454,6 +455,14 @@ the mode and the passes that go with it.  Default
   survey     quick triage of a shelf: samples the
              surface, read only
   decay      weeks after predeploy: has it rotted?
+  prepbackup a backup drive, empty: fill it with the
+             pattern in one sequential write, then
+             read it all back and verify it.  4M
+             chunks; a chunk read under 15 MiB/s
+             is condemned whole (<a href="#opt-slow-rate"><code>--slow-rate</code></a> 15),
+             <a href="#opt-skip-slow"><code>--skip-slow</code></a>, and <a href="#opt-hide-and-rescan"><code>--hide-and-rescan</code></a>
+             with <a href="#opt-hide-max"><code>--hide-max</code></a> 50 and <a href="#opt-hide-reserve"><code>--hide-reserve</code></a>
+             5.  Saves nothing on the drive
 Any explicit flag overrides what the profile set,
 whichever order they appear in.  The drive
 settings a profile carries apply only in its own
@@ -540,6 +549,10 @@ mode: <a href="#opt-mode"><code>--mode</code></a> read on predeploy saves nothin
 <dd>when a region is too slow to scan -- most chunks over the last 64 MiB missed their budget, or the scan there, drill-downs and retries included, ran under the <a href="#opt-min-rate"><code>--min-rate</code></a> floor -- stop reading: probe 1 GiB on, doubling to 64 GiB, until one is fast, bisect back to the edge, carry on there.  A chunk whose drill-down costs over 10 s per 256 sectors in it (never under 10 s) is condemned whole. What was jumped over is condemned unread; the report says so and <a href="#opt-hide-bad"><code>--hide-bad</code></a> cuts it out. Sequential or reverse order only.  On under predeploy, and dropped there without comment where the order cannot walk</dd>
 <dt id="opt-no-skip-slow"><code>--no-skip-slow</code></dt>
 <dd>read every region, however slow, under predeploy too</dd>
+<dt id="opt-fill-first"><code>--fill-first</code></dt>
+<dd>with <a href="#opt-mode"><code>--mode</code></a> write: write the pattern over the whole device first, in one sequential pass that reads nothing, flush it, then read everything back and verify it.  Faster than reading each chunk back as it is written, and proves what the platter kept rather than what it held a moment ago.  On under prepbackup</dd>
+<dt id="opt-no-fill-first"><code>--no-fill-first</code></dt>
+<dd>read each chunk back as it is written, under prepbackup too</dd>
 <dt id="opt-rewrite-weak"><code>--rewrite-weak</code></dt>
 <dd>rewrite readable-but-slow sectors in place to make the drive refresh or remap them (needs verify/write, or read mode plus this flag for read-modify-write)</dd>
 <dt id="opt-force-remap"><code>--force-remap</code></dt>
@@ -576,6 +589,8 @@ mode: <a href="#opt-mode"><code>--mode</code></a> read on predeploy saves nothin
 <dd>auto budget = F x measured median (default 3)</dd>
 <dt id="opt-floor-ms"><code>--floor-ms MS</code></dt>
 <dd>auto budget never goes below this (default 25)</dd>
+<dt id="opt-slow-rate"><code>--slow-rate MIB</code></dt>
+<dd>a chunk read slower than this many MiB/s is over budget, the same everywhere on the platter, and is read once more and then condemned whole rather than drilled: speed is the chunk&#x27;s, not a sector&#x27;s.  15 under prepbackup; 0 uses the calibrated budget. <a href="#opt-chunk-slow-ms"><code>--chunk-slow-ms</code></a> wins over it</dd>
 <dt id="opt-min-rate"><code>--min-rate MIB</code></dt>
 <dd>a hard drive testing slower than this many MiB/s at 4 MiB chunks is failing; scaled down for smaller chunks.  Judged after 2 minutes; 0 turns it off (default 10)</dd>
 <dt id="opt-retries"><code>--retries N</code></dt>
@@ -661,7 +676,13 @@ mode: <a href="#opt-mode"><code>--mode</code></a> read on predeploy saves nothin
 <dt id="opt-rescan"><code>--rescan</code></dt>
 <dd>with <a href="#opt-hide-bad"><code>--hide-bad</code></a>, then write and verify every sector of the new device: proves what is left is sound and that data written through the map reads back.  The form asks before doing this after hiding</dd>
 <dt id="opt-hide-and-rescan"><code>--hide-and-rescan</code></dt>
-<dd>both, as part of a write pass: if it finds damage anywhere -- bad, weak or skipped -- hide it straight away and make the second pass a write and verify of /dev/mapper/bb-&lt;serial&gt;, as a job of its own in the run, instead of a re-read of the raw drive.  A drive with no damage gets its re-read as usual.  Needs <a href="#opt-mode"><code>--mode</code></a> write over the whole drive, and root</dd>
+<dd>both, as part of a write pass: if it finds damage anywhere -- bad, weak or skipped -- hide it straight away and make the second pass a write and verify of /dev/mapper/bb-&lt;serial&gt;, as a job of its own in the run, instead of a re-read of the raw drive.  A drive with no damage gets its re-read as usual.  Needs <a href="#opt-mode"><code>--mode</code></a> write over the whole drive, and root.  On under prepbackup</dd>
+<dt id="opt-no-hide-and-rescan"><code>--no-hide-and-rescan</code></dt>
+<dd>do not, under prepbackup either</dd>
+<dt id="opt-hide-max"><code>--hide-max PCT</code></dt>
+<dd>with <a href="#opt-hide-and-rescan"><code>--hide-and-rescan</code></a>: when the map would cut out more than this share of the drive, do not make it, and call the drive FAILING.  50 under prepbackup, 0 (no limit) otherwise</dd>
+<dt id="opt-hide-reserve"><code>--hide-reserve PCT</code></dt>
+<dd>share of the drive a map holds back as spares, for damage a later test of it finds (&#x27;dm remap&#x27;). 5 under prepbackup, 0.1 otherwise</dd>
 <dt id="opt-prometheus"><code>--prometheus FILE</code></dt>
 <dd>write metrics for node_exporter&#x27;s textfile collector</dd>
 <dt id="opt-journal"><code>--journal FILE</code></dt>

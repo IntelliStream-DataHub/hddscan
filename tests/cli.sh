@@ -1063,6 +1063,100 @@ assert_has "and runs as a run" \
 	"--max-parallel 1"
 rm -f "$TMP"/hr*.bin "$TMP"/hddscan-hr*
 
+echo "== prepbackup: fill, verify, map out what reads slowly =="
+
+# A backup drive is judged on whether a region reads fast enough to keep.
+# prepbackup fills the drive in one sequential write, reads it all back and
+# verifies it, condemns a 4 MiB chunk read under 15 MiB/s whole, and maps out
+# what was condemned unless more than half the drive would go.  Under the
+# suite's 1 s floor a chunk's budget is the floor, so a slow chunk here is
+# one HDDSCAN_SLOW makes take 2 s (500 ms per MiB); each 4 KiB inside it
+# still reads in 2 ms, so drilling it would find nothing.
+pb() { runp --profile prepbackup --confirm "${@: -1}" "$@"; }
+f=$(slowimg pb.bin 256M)
+out=$(pb --no-hide-and-rescan --state "$TMP/pb.ckpt" "$f")
+assert_has "prepbackup fills the whole drive first" "$out" \
+	"fill done: 256.00 MiB written"
+assert_has "then reads it all back and verifies it" "$out" \
+	"second pass: reading the whole drive back and verifying the pattern"
+assert_has "its report says the first pass was a fill" "$out" \
+	"destructive fill of the whole device, then a read-back verify"
+assert_has "its budget is a rate, not a margin" "$out" \
+	"a chunk read slower than 15.0 MiB/s (--slow-rate)"
+assert_has "in 4 MiB chunks" "$out" "calibrated: median 4096 KiB read"
+assert_has "a clean drive is HEALTHY" "$out" "VERDICT: HEALTHY"
+assert_has "the checkpoint says the verify was the pass it ended in" \
+	"$(cat "$TMP/pb.ckpt")" "pass 1"
+# a resumed verify must not fill again: what changed on the drive since the
+# fill is exactly what it is there to find
+printf 'ZZZZ' | dd of="$f" bs=1 seek=8388608 conv=notrunc status=none
+sed -i -e 's/^step .*/step 0/' -e 's/^pos .*/pos 0/' "$TMP/pb.ckpt"
+out=$(pb --no-hide-and-rescan --state "$TMP/pb.ckpt" --resume "$f")
+assert_has "a scan resumed inside its verify carries on verifying" "$out" \
+	"resuming the verify pass; the fill was finished"
+assert_hasnt "and does not fill again" "$out" "fill done"
+assert_has "and finds what changed since the fill, to the block" "$out" \
+	"8388608            corrupt"
+
+out=$(HDDSCAN_SLOW=64M:16M HDDSCAN_SLOW_MS=500 \
+	pb --no-hide-and-rescan --json "$TMP/pb.json" "$f")
+assert_has "chunks read under the rate are condemned whole" "$out" \
+	"VERDICT: SUSPECT - 1 region of the surface (16.00 MiB) read slower than 15 MiB/s, 4096 weak sectors"
+assert_has "and the report says they were read, not skipped" "$out" \
+	"Condemned:"
+assert_hasnt "nothing was skipped unread" "$out" "Not covered:"
+read -r reg weak <<< "$(python3 - "$TMP/pb.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+r = ["%d-%d/%d" % (k["offset"] >> 20, (k["offset"] + k["length"]) >> 20,
+                  k["unread"]) for k in d["slow_regions"]]
+print(",".join(r), sum(1 for x in d["findings"] if x["status"] == "weak"))
+PY
+)"
+assert_eq "exactly the slow chunks, every one of them read" "$reg" \
+	"64-80/0"
+assert_eq "and none of them drilled into sector by sector" "$weak" "0"
+assert_has "--slow-rate 0 puts the calibrated budget back" \
+	"$(HDDSCAN_SLOW=64M:16M HDDSCAN_SLOW_MS=500 \
+		pb --no-hide-and-rescan --slow-rate 0 "$f")" \
+	"following the drive's own gradient"
+assert_hasnt "and --chunk-slow-ms wins over the rate" \
+	"$(pb --no-hide-and-rescan --chunk-slow-ms 2000 "$f")" "--slow-rate"
+assert_has "--fill-first needs a write" \
+	"$(runp --mode read --fill-first "$f" 2>&1)" "needs --mode write"
+assert_hasnt "prepbackup's own fill is dropped quietly for a read" \
+	"$(pb --mode read "$f")" "fill done"
+assert_has "--hide-max is a percentage" \
+	"$(pb --hide-max 101 "$f" 2>&1)" "percentage from 0 to 100"
+assert_has "--hide-reserve is one the map can hold" \
+	"$(pb --hide-reserve 60 "$f" 2>&1)" "percentage from 0 to 50"
+
+# The whole of it: the damage mapped out, and the map filled and verified as
+# a job of its own.  The slow range is past the stand-in's size.
+f=$(slowimg pbm.bin 512M)
+m=$(slowimg pbmap.bin 128M)
+out=$(HDDSCAN_MAP_IMAGE="$m" HDDSCAN_SLOW=300M:16M HDDSCAN_SLOW_MS=500 pb "$f")
+rep=$(cat "$TMP/hddscan-pbm.bin.txt" 2>/dev/null)
+assert_has "what read slowly is hidden after the verify" "$rep" \
+	"the damage the verify found is hidden next"
+assert_has "with 5% of the drive held back as spares" \
+	"$($HDDSCAN dm status "$f" 2>&1)" "spare"
+mrep=$(cat "$TMP/hddscan-pbmap.bin.txt" 2>/dev/null)
+assert_has "and the map is filled and verified too" "$mrep" \
+	"destructive fill of the whole device, then a read-back verify"
+assert_has "the run grew a row for it" "$out" "2 drives"
+
+# More than half the drive too slow to keep: not worth a map.
+f=$(slowimg pbbad.bin 512M)
+out=$(HDDSCAN_MAP_IMAGE="$m" HDDSCAN_SLOW=128M:320M HDDSCAN_SLOW_MS=500 pb "$f")
+rep=$(cat "$TMP/hddscan-pbbad.bin.txt" 2>/dev/null)
+assert_has "more than --hide-max of the drive is FAILING" "$rep" \
+	"VERDICT: FAILING - 62% of the drive is damaged or too slow to keep"
+assert_has "and says it was not mapped" "$rep" "It is not mapped"
+assert_hasnt "and nothing was hidden" "$rep" "created map"
+assert_has "the run did not grow a row for a map" "$out" "1 drive"
+rm -f "$TMP"/pb*.bin
+
 echo "== what the kernel logged against the drive =="
 
 # A drive that stops answering is aborted, reset and retried by the kernel,

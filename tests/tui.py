@@ -528,6 +528,22 @@ def main():
               s.set_choice("Profile", "inservice")
               and s.wait(lambda: s.value_of("Skip slow regions") == "no"),
               "got %r" % s.value_of("Skip slow regions"))
+        # prepbackup: a backup drive, filled and verified in 4 MiB chunks,
+        # its damage mapped out without being asked
+        check("prepbackup writes",
+              s.set_choice("Profile", "prepbackup")
+              and s.wait(lambda: s.value_of("Mode") == "write"),
+              "mode %r" % s.value_of("Mode"))
+        check("in 4 MiB chunks",
+              s.wait(lambda: s.value_of("Chunk size") == "4M"),
+              "chunk %r" % s.value_of("Chunk size"))
+        check("and hides the damage it finds",
+              s.wait(lambda: s.value_of("If damage is found") == "hide it"),
+              "got %r" % s.value_of("If damage is found"))
+        check("and leaving it for inservice stops hiding",
+              s.set_choice("Profile", "inservice")
+              and s.wait(lambda: s.value_of("If damage is found") == "re-read"),
+              "got %r" % s.value_of("If damage is found"))
         s.send(b"q"); s.close()
 
         print("== each screen holds the settings of what it does ==")
@@ -669,6 +685,17 @@ def main():
               and s.on_screen("Scan (3 of 3)"),
               "\n".join(l for l in s.screen.lines() if l.strip()))
         s.send(b"n", 0.2)
+        s.send(b"q"); s.close()
+
+        # the longest profile description, under the field list
+        s = Session(["-i", "--no-color", "--profile", "prepbackup",
+                     "--outdir", tmp, a], rows=24, cols=80, open="scan")
+        check("prepbackup's description fits a 24x80 terminal",
+              s.wait(lambda: s.on_screen(
+                  "prepbackup: a backup drive: fill, verify, map out what "
+                  "reads under 15 MiB/s"))
+              and s.on_screen("Scan (3 of 3)") and s.on_screen("q quit"),
+              "\n".join(l for l in s.screen.lines() if l.strip()))
         s.send(b"q"); s.close()
 
         print("== bulk selection, for a shelf rather than a drive ==")

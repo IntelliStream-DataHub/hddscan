@@ -62,6 +62,7 @@ to derive it from.
 | **inservice** | read | It holds data you want to keep. Never writes anything. |
 | **survey** | read, sampled | Quick triage of a shelf. |
 | **decay** | check | Weeks after a predeploy run: has the pattern rotted? |
+| **prepbackup** | write | A backup drive: fill it, verify it, map out what reads under 15 MiB/s, unless more than half of it would go. See below. |
 
 The default writes, because a surface test is nearly always run before a drive
 goes into service and a read-only pass cannot tell you whether a sector will
@@ -994,6 +995,81 @@ compression and checksums from the stock kernel.
 `contrib/dm-badblocks.service` runs `hddscan dm activate-all` at boot, before
 local filesystems and ZFS imports. It finds the drives by the map on them,
 not by name.
+
+### A backup drive: prepbackup
+
+predeploy asks whether a drive is fit for production, and a drive can fail
+that while still being worth keeping. Two real SAS drives, a 14 TB and a
+16 TB, did. Under predeploy each one's budget was three times its own
+calibrated median. Their 4 KiB reads came in over it across the surface,
+drilling each chunk sector by sector made the scans crawl, and `--skip-slow`
+probed from each one's first twenty megabytes to near its end. The 14 TB
+drive's error counters showed millions of delayed corrections, no uncorrected
+errors and SMART health OK: every block came back right, just late. That
+verdict was right for a production drive. For a backup drive, which only ever
+needs to read back what it was given, it was the wrong question. `prepbackup` asks a different one: *which regions read fast enough
+to keep?*
+
+**Fill first, then verify** (`--fill-first`). The first pass writes the
+pattern over the whole drive in one sequential stream and reads nothing. The
+second reads it all back and checks every 4 KiB block against the pattern its
+offset implies. A write mode that reads each chunk straight back loses a
+revolution per chunk waiting for the start to come round again. Worse, it
+proves only what the drive held a moment ago, possibly in its cache. Hours
+later and flushed (`fdatasync`, a SYNCHRONIZE CACHE on a real drive), the
+read can only come from the platter. The pattern is seeded by offset, not
+repeated, so a write that landed in the wrong place reads back as wrong data
+rather than as a copy of the right pattern. Block compare was chosen over a
+checksum per chunk: it costs no more CPU, and it names the block, which the
+map needs. The write cache is left alone, because the fill is not judged
+against a budget, and nothing the verify reads was written recently enough
+to still be in the cache. The checkpoint records which pass it was in. A scan
+resumed inside its verify carries on verifying, and must: refilling would
+overwrite exactly what the verify is there to find.
+
+**The budget is a rate** (`--slow-rate`, 15 MiB/s). A chunk read slower than
+that is over budget, with the same number everywhere on the platter. That
+follows invariant 1b the way `--chunk-slow-ms` does: a threshold given by hand
+means that number, and is never bent to the platter or to what is being read.
+The sector budget is the same time, so invariant 1 still holds. At 4 MiB
+chunks it is 267 ms, against the 20 to 40 ms a healthy drive takes at either
+edge, so only a region that is really slow falls under it.
+
+**A slow chunk is condemned whole, not drilled.** The rate measures the
+chunk, so there is nothing a sector can tell it. Drilling a slow but readable
+chunk costs a thousand single reads and finds sectors that are each fine on
+their own, which is how those two drives crawled. An over-budget chunk is read
+once more, after a cache-busting seek, because one slow read can be the
+drive busy with itself. Still slow, it becomes a condemned region, read but
+not skipped, and every block in it counts weak, as a skipped region's do. Read
+errors and wrong data are still found block by block; they are not about
+speed. The report says **Condemned** for these, not **Not covered**, because
+every byte was read. `--skip-slow` still jumps a region where most chunks are
+slow, and its probes skip drilling under a rate as well.
+
+**Map what is left, unless that is less than half** (`--hide-and-rescan`,
+`--hide-max 50`). After the verify, the damage goes into a device-mapper map
+as with predeploy. More than half the drive cut out is not a backup drive.
+Then nothing is mapped and the verdict is FAILING. The share is worked out
+before the report is written, from the same list, extent size and extent
+count the map would be built from, so the verdict, the report and the map
+cannot disagree. Spares are not damage and are not counted in the share.
+
+**Keep spares, and test the map** (`--hide-reserve 5`). Five percent of the
+drive is held back as spare extents spread through it, against 0.1% by
+default. A drive already known to be weak will grow more, and `dm remap` moves
+damage found later into the nearest spare instead of stacking a second map.
+The map is then tested the way the drive was: filled and verified as a job of
+its own, at the same rate. That makes four sweeps, two of the drive and two
+of the map, which is the price of proving the map as well as the surface.
+
+Nothing is saved on the drive. Invariant 7b keeps saved settings to
+predeploy, and a backup drive is not being configured for service.
+
+What has not been run is the whole of it on a real drive. The fill, the
+verify, the rate, the condemned chunks, the share and the map were tested on
+images with `HDDSCAN_SLOW` and the map stand-in. Whether 15 MiB/s draws the
+line in the right place on the drive that prompted it is still to be seen.
 
 ### Useful flags
 
