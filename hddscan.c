@@ -1793,6 +1793,49 @@ static void probe_protection(device_t *d)
 	closedir(dp);
 }
 
+/*
+ * A device-mapper device the picker offers: only a map hddscan made, which
+ * a scrub reads and moves damage on, named for what it is.  Every other dm
+ * device -- LVM, crypt -- stays out, as it always has.
+ */
+static int picker_map(const char *n, device_t *d)
+{
+	char p[PATH_MAX], uuid[128] = "", name[96] = "", slave[64] = "";
+	FILE *f;
+	DIR *dir;
+	struct dirent *e;
+	size_t l;
+
+	snprintf(p, sizeof(p), "/sys/block/%s/dm/uuid", n);
+	if (!(f = fopen(p, "re")))
+		return 0;
+	if (!fgets(uuid, sizeof(uuid), f))
+		uuid[0] = 0;
+	fclose(f);
+	if (strncmp(uuid, "DMBB-", 5))
+		return 0;
+	snprintf(p, sizeof(p), "/sys/block/%s/dm/name", n);
+	if ((f = fopen(p, "re"))) {
+		if (!fgets(name, sizeof(name), f))
+			name[0] = 0;
+		fclose(f);
+	}
+	l = strcspn(name, "\n");
+	name[l] = 0;
+	snprintf(p, sizeof(p), "/sys/block/%s/slaves", n);
+	if ((dir = opendir(p))) {
+		while ((e = readdir(dir)))
+			if (e->d_name[0] != '.')
+				snprintf(slave, sizeof(slave), "%.60s", e->d_name);
+		closedir(dir);
+	}
+	if (probe_device(n, d) < 0)
+		return 0;
+	snprintf(d->model, sizeof(d->model), "%.30s over %.20s",
+		 name[0] ? name : n, slave[0] ? slave : "?");
+	return 1;
+}
+
 static int enumerate_devices(device_t **out)
 {
 	DIR *dir = opendir("/sys/block");
@@ -1817,10 +1860,15 @@ static int enumerate_devices(device_t **out)
 	while ((e = readdir(dir))) {
 		device_t d;
 
-		if (e->d_name[0] == '.' || skip_blockdev(e->d_name))
+		if (e->d_name[0] == '.')
 			continue;
-		if (probe_device(e->d_name, &d) < 0)
+		if (!strncmp(e->d_name, "dm-", 3)) {
+			if (!picker_map(e->d_name, &d))
+				continue;
+		} else if (skip_blockdev(e->d_name) ||
+			   probe_device(e->d_name, &d) < 0) {
 			continue;
+		}
 		if (n == cap) {
 			cap = cap ? cap * 2 : 8;
 			v = realloc(v, (size_t)cap * sizeof(*v));
@@ -2761,6 +2809,14 @@ typedef struct {
 	uint64_t off, len;
 	uint64_t unread;
 	uint64_t weak;
+	/*
+	 * The pass that condemned it.  A later pass skips all of it, since
+	 * there is nothing left to learn; the pass that made it skips only
+	 * what it never read.  Under --fill-first a stretch the fill
+	 * condemned was written but never read back, and the verify skips it
+	 * whole.
+	 */
+	int pass;
 } skip_t;
 
 #define SKIP_WIN_MAX 1024
@@ -2856,7 +2912,6 @@ typedef struct {
 	int second_pass;
 	int skip_slow;          /* --skip-slow: see skip_ahead() */
 	int fill;               /* --fill-first: write it all, then verify */
-	int judge_pass;         /* the pass --skip-slow judges: 1 after a fill */
 	int pass_saved;         /* the pass a checkpoint was in, to resume it */
 	double slow_rate;       /* --slow-rate, bytes/s; 0 for the budget */
 	uint64_t slow_condemned;        /* chunks condemned for reading slowly */
@@ -3839,27 +3894,35 @@ static void *alloc_aligned(size_t len)
  * is exact and costs no time.  Scaling by length is what a drive whose
  * slowness is spread across the surface looks like -- a 1 MiB chunk misses
  * its budget while each 4 KiB sector inside it comes back comfortably.
+ * HDDSCAN_SLOW_WRITE does the same for writes, at the same HDDSCAN_SLOW_MS,
+ * for a fill that has to find a region slow to write.
  */
 #define SLOW_INJ_MAX 8
-static struct {
-	uint64_t off, len;
-	uint64_t every, span;   /* only [span] bytes of every [every], or 0 */
-} g_slow_inj[SLOW_INJ_MAX];
-static int g_slow_n = -1;
-static double g_slow_ms;
+typedef struct {
+	const char *env;        /* the ranges: HDDSCAN_SLOW, or _WRITE */
+	struct {
+		uint64_t off, len;
+		uint64_t every, span;   /* only [span] of every [every], or 0 */
+	} r[SLOW_INJ_MAX];
+	int n;                  /* -1 until the variable has been read */
+	double ms;
+} slow_inj_t;
+/* reads, and writes, which a fill has to be able to find slow too */
+static slow_inj_t g_slow_rd = { "HDDSCAN_SLOW", {{0, 0, 0, 0}}, -1, 0 };
+static slow_inj_t g_slow_wr = { "HDDSCAN_SLOW_WRITE", {{0, 0, 0, 0}}, -1, 0 };
 
-static uint64_t slow_injected(uint64_t off, size_t len)
+static uint64_t slow_injected(slow_inj_t *t, uint64_t off, size_t len)
 {
 	uint64_t extra = 0;
 	int i;
 
-	if (g_slow_n < 0) {
-		const char *e = getenv("HDDSCAN_SLOW"), *m;
+	if (t->n < 0) {
+		const char *e = getenv(t->env), *m;
 		char buf[512], *save = NULL, *tok;
 
-		g_slow_n = 0;
+		t->n = 0;
 		m = getenv("HDDSCAN_SLOW_MS");
-		g_slow_ms = m ? atof(m) : 200.0;
+		t->ms = m ? atof(m) : 200.0;
 		if (e && strlen(e) < sizeof(buf)) {
 			snprintf(buf, sizeof(buf), "%s", e);
 			/*
@@ -3867,7 +3930,7 @@ static uint64_t slow_injected(uint64_t off, size_t len)
 			 * through the range: SPAN bytes slow in every EVERY.
 			 */
 			for (tok = strtok_r(buf, ",", &save);
-			     tok && g_slow_n < SLOW_INJ_MAX;
+			     tok && t->n < SLOW_INJ_MAX;
 			     tok = strtok_r(NULL, ",", &save)) {
 				char *f[4], *save2 = NULL, *p;
 				uint64_t v[4] = { 0, 0, 0, 0 };
@@ -3888,31 +3951,31 @@ static uint64_t slow_injected(uint64_t off, size_t len)
 						okf = 0;
 				if (!okf || (nf == 4 && !v[2]))
 					continue;
-				g_slow_inj[g_slow_n].off = v[0];
-				g_slow_inj[g_slow_n].len = v[1];
-				g_slow_inj[g_slow_n].every = v[2];
-				g_slow_inj[g_slow_n].span = v[3];
-				g_slow_n++;
+				t->r[t->n].off = v[0];
+				t->r[t->n].len = v[1];
+				t->r[t->n].every = v[2];
+				t->r[t->n].span = v[3];
+				t->n++;
 			}
 		}
 	}
-	for (i = 0; i < g_slow_n; i++) {
-		uint64_t lo = g_slow_inj[i].off, hi = lo + g_slow_inj[i].len;
+	for (i = 0; i < t->n; i++) {
+		uint64_t lo = t->r[i].off, hi = lo + t->r[i].len;
 		uint64_t a = off > lo ? off : lo, b = off + len < hi ? off + len : hi;
 
 		if (a >= b)
 			continue;
-		if (g_slow_inj[i].every) {
-			uint64_t ev = g_slow_inj[i].every, x;
+		if (t->r[i].every) {
+			uint64_t ev = t->r[i].every, x;
 			int hit = 0;
 
 			/* does [a, b) touch a slow span?  Check each period */
 			for (x = (a - lo) / ev * ev + lo; x < b && !hit; x += ev)
-				hit = x + g_slow_inj[i].span > a;
+				hit = x + t->r[i].span > a;
 			if (!hit)
 				continue;
 		}
-		extra = (uint64_t)(g_slow_ms * 1000.0 *
+		extra = (uint64_t)(t->ms * 1000.0 *
 				   (double)len / (1024.0 * 1024.0));
 	}
 	return extra;
@@ -3935,8 +3998,8 @@ static ssize_t timed_pread(int fd, void *buf, size_t len, uint64_t off,
 
 	*us = now_us() - t0;
 	*err = (r < 0) ? errno : 0;
-	if (g_slow_n)
-		*us += slow_injected(off, len);
+	if (g_slow_rd.n)
+		*us += slow_injected(&g_slow_rd, off, len);
 	g_io_us += *us;
 	return r;
 }
@@ -3949,6 +4012,8 @@ static ssize_t timed_pwrite(int fd, const void *buf, size_t len, uint64_t off,
 
 	*us = now_us() - t0;
 	*err = (r < 0) ? errno : 0;
+	if (g_slow_wr.n)
+		*us += slow_injected(&g_slow_wr, off, len);
 	g_io_us += *us;
 	return r;
 }
@@ -4939,9 +5004,9 @@ static void state_save(ctx_t *c)
 		fprintf(f, "probed %" PRIu64 "\n", c->probed[i]);
 	for (i = 0; i < c->nskip; i++)
 		fprintf(f, "skip %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64
-			" %" PRIu64 " %" PRIu64 "\n", c->skips[i].s0,
+			" %" PRIu64 " %" PRIu64 " %d\n", c->skips[i].s0,
 			c->skips[i].k0, c->skips[i].s1, c->skips[i].off,
-			c->skips[i].len, c->skips[i].unread);
+			c->skips[i].len, c->skips[i].unread, c->skips[i].pass);
 	fprintf(f, "counters %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64
 		" %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 "\n",
 		c->chunks_read, c->chunks_slow, c->chunks_err, c->blocks_drilled,
@@ -5082,8 +5147,9 @@ static int state_load(ctx_t *c)
 
 			memset(&k, 0, sizeof(k));
 			nk = sscanf(line + 5, "%" SCNu64 " %" SCNu64 " %" SCNu64
-				    " %" SCNu64 " %" SCNu64 " %" SCNu64, &k.s0,
-				    &k.k0, &k.s1, &k.off, &k.len, &k.unread);
+				    " %" SCNu64 " %" SCNu64 " %" SCNu64 " %d", &k.s0,
+				    &k.k0, &k.s1, &k.off, &k.len, &k.unread,
+				    &k.pass);
 			if (nk == 5) {  /* before the unread count was kept */
 				uint64_t o;
 
@@ -5703,6 +5769,18 @@ static void check_temperature(ctx_t *c)
 #define SKIP_DRILL_CAP_BLOCKS 256               /* ... of this many sectors */
 #define MAX_SKIPS 4096
 
+/*
+ * Does this pass judge what it reads (or writes)?  The first pass always
+ * does.  A second pass after a write pass is a re-read, and skips whatever
+ * the first condemned.  Under --fill-first both do: the fill judges how fast
+ * the drive writes, the verify how fast it reads, and a chunk slow at
+ * either is no place for a backup.
+ */
+static int judging(const ctx_t *c)
+{
+	return c->pass == 0 || (c->fill && c->pass == 1);
+}
+
 /* the bytes [a, b) covers in the scan order, which only ever walks */
 static void steps_extent(const ctx_t *c, uint64_t a, uint64_t b,
 			 uint64_t *off, uint64_t *len)
@@ -5762,7 +5840,7 @@ static uint64_t skip_at(const ctx_t *c, uint64_t step)
 	int i;
 
 	for (i = 0; i < c->nskip; i++)
-		if (step >= (c->pass > c->judge_pass ? c->skips[i].s0 :
+		if (step >= (c->skips[i].pass < c->pass ? c->skips[i].s0 :
 			     c->skips[i].k0) &&
 		    step < c->skips[i].s1)
 			return c->skips[i].s1;
@@ -5796,6 +5874,7 @@ static skip_t *skip_add(ctx_t *c)
 		c->skipcap = cap;
 	}
 	memset(&c->skips[c->nskip], 0, sizeof(skip_t));
+	c->skips[c->nskip].pass = c->pass;
 	return &c->skips[c->nskip++];
 }
 
@@ -5817,6 +5896,20 @@ static void skip_recount(ctx_t *c, skip_t *k)
 		if (f->status != ST_OK && f->offset >= k->off &&
 		    f->offset < k->off + k->len)
 			had++;
+	}
+	/*
+	 * A region an earlier pass condemned is counted there.  The verify
+	 * after a fill never reads one, but its probes can jump across one,
+	 * and a stretch condemned that way would count those blocks twice.
+	 */
+	for (i = 0; i < c->nskip; i++) {
+		const skip_t *e = &c->skips[i];
+		uint64_t a = e->off > k->off ? e->off : k->off;
+		uint64_t b = e->off + e->len < k->off + k->len ?
+			     e->off + e->len : k->off + k->len;
+
+		if (e != k && e->pass < k->pass && b > a)
+			had += (b - a + c->block - 1) / c->block;
 	}
 	c->skip_weak -= k->weak;
 	k->weak = n > had ? n - had : 0;
@@ -5842,7 +5935,7 @@ static uint64_t skip_drill_cap(const ctx_t *c)
 
 static int skip_cut_due(const ctx_t *c, uint64_t io0)
 {
-	return c->skip_slow && c->pass == c->judge_pass &&
+	return c->skip_slow && judging(c) &&
 	       g_io_us - io0 > skip_drill_cap(c);
 }
 
@@ -5858,6 +5951,8 @@ static int skip_cut(ctx_t *c, uint64_t off, size_t len, uint64_t from)
 	uint64_t unread = off + len - from;
 	char b1[32];
 
+	if (k && k->pass != c->pass)
+		k = NULL;       /* another pass's region is not this one */
 	if (k && k->s1 == c->step && k->off + k->len == off) {
 		k->len += len;
 	} else if (k && k->s1 == c->step && off + len == k->off) {
@@ -5994,7 +6089,14 @@ static int skip_probe(ctx_t *c, uint64_t s, uint64_t n, void *buf,
 		len = (size_t)(c->end - pos < (uint64_t)c->chunk ?
 			       c->end - pos : (uint64_t)c->chunk);
 		c->probe_off = pos;
-		r = timed_pread(c->fd, buf, len, pos, &us, &err);
+		/* the fill is judged on writing, so its probes write: the
+		 * pattern, which is what the scan would have put there */
+		if (c->fill && c->pass == 0) {
+			pattern_fill(buf, len, pos, c->seed);
+			r = timed_pwrite(c->fd, buf, len, pos, &us, &err);
+		} else {
+			r = timed_pread(c->fd, buf, len, pos, &us, &err);
+		}
 		c->skip_probes++;
 		/*
 		 * A probe is reading the drive, and the screen should say so:
@@ -6152,15 +6254,20 @@ static uint64_t skip_ahead(ctx_t *c, void *buf, void *scratch)
 		if (c->sw_over[i] && c->sw_step[i] < s0 &&
 		    c->sw_step[i] + (uint64_t)c->sw_len > t)
 			s0 = c->sw_step[i];
-	if (c->nskip && s0 < c->skips[c->nskip - 1].s1)
-		s0 = c->skips[c->nskip - 1].s1;
+	for (i = c->nskip - 1; i >= 0; i--)
+		if (c->skips[i].pass == c->pass) {
+			if (s0 < c->skips[i].s1)
+				s0 = c->skips[i].s1;
+			break;
+		}
 	steps_extent(c, t + 1, s1, &off, &unread);
 	/*
 	 * Right after a stretch already condemned -- a chunk whose drill-down
 	 * was cut short, most often, which is what set this off -- it is the
 	 * same region, and is written down as one.
 	 */
-	if (c->nskip && s0 == c->skips[c->nskip - 1].s1) {
+	if (c->nskip && s0 == c->skips[c->nskip - 1].s1 &&
+	    c->skips[c->nskip - 1].pass == c->pass) {
 		uint64_t was;
 
 		k = &c->skips[c->nskip - 1];
@@ -6184,10 +6291,11 @@ static uint64_t skip_ahead(ctx_t *c, void *buf, void *scratch)
 	skip_recount(c, k);
 	memset(c->sw_over, 0, sizeof(c->sw_over));
 	msg(PROG ": %s: %s%s from %s was too slow to scan; skipped %s "
-	    "of it without reading%s (--skip-slow) and carried on %s\n",
+	    "of it without %s%s (--skip-slow) and carried on %s\n",
 	    c->dev->name, c_yel(), human_size(k->len, b1, sizeof(b1)),
 	    human_size(k->off, b2, sizeof(b2)),
-	    human_size(unread, b3, sizeof(b3)), c_off(),
+	    human_size(unread, b3, sizeof(b3)),
+	    c->fill && !c->pass ? "writing" : "reading", c_off(),
 	    to_end ? "to the end" : "past it");
 	return s1;
 }
@@ -6202,6 +6310,8 @@ static int condemn_chunk(ctx_t *c, uint64_t off, size_t len)
 {
 	skip_t *k = c->nskip ? &c->skips[c->nskip - 1] : NULL;
 
+	if (k && k->pass != c->pass)
+		k = NULL;       /* another pass's region is not this one */
 	if (k && k->s1 == c->step && k->off + k->len == off) {
 		k->len += len;
 	} else if (k && k->s1 == c->step && off + len == k->off) {
@@ -6283,14 +6393,40 @@ static void scan_loop(ctx_t *c, int verify_only_pass)
 				lat_add(&c->write_lat, wus);
 				latwin_add(&c->wlatwin, wus);
 				c->writes_done++;
-			} else {
+				/*
+				 * A chunk that writes slower than the rate
+				 * is no more use to a backup than one that
+				 * reads slower, and the verify would never
+				 * say so: written once more, and condemned
+				 * if it is still slow.  The verify skips it.
+				 * The write cache is off for the run, or the
+				 * time would belong to whichever chunk was
+				 * waiting when the cache filled.
+				 */
+				if (c->slow_rate > 0 &&
+				    wus > chunk_thr_at(c, c->pos)) {
+					c->writes_slow++;
+					over = 1;
+					w = timed_pwrite(c->fd, pat, len, c->pos,
+							 &wus, &werr);
+					if (w == (ssize_t)len &&
+					    wus <= chunk_thr_at(c, c->pos))
+						over = 0;
+					else if (w == (ssize_t)len)
+						condemn_chunk(c, c->pos, len);
+				}
+			}
+			if (w != (ssize_t)len) {
 				if (dev_gone(c, w, werr, len))
 					break;
 				c->write_errors++;
+				over = 1;
 			}
 			c->bytes_done += len;
 			check_temperature(c);
 			kmsg_poll(c, 0);
+			if (c->sw_len && skip_note(c, c->step, over))
+				c->step = skip_ahead(c, buf, scratch) - 1;
 			progress(c, 0);
 			if (c->state_path && now_us() - last_state > 15000000ull) {
 				state_save(c);
@@ -6325,7 +6461,7 @@ static void scan_loop(ctx_t *c, int verify_only_pass)
 			 * nothing a rate could use.  Read once more first: one
 			 * slow read can be the drive busy with itself.
 			 */
-			if (over && c->slow_rate > 0 && c->pass == c->judge_pass) {
+			if (over && c->slow_rate > 0 && judging(c)) {
 				uint64_t us2;
 				int e2;
 				ssize_t r2;
@@ -6565,7 +6701,7 @@ static void scan_loop(ctx_t *c, int verify_only_pass)
 		check_temperature(c);
 		kmsg_poll(c, 0);
 		rate_window(c);
-		if (c->sw_len && c->pass == c->judge_pass &&
+		if (c->sw_len && judging(c) &&
 		    skip_note(c, c->step, over))
 			c->step = skip_ahead(c, buf, scratch) - 1;
 		progress(c, 0);
@@ -6880,6 +7016,40 @@ static const char *slow_source(const ctx_t *c)
 	return NULL;
 }
 
+/*
+ * What the condemned regions failed at, for the words that describe them:
+ * after a fill, the fill condemned what wrote slowly and the verify what
+ * read slowly, and a report that said "read" of a region never read back
+ * would be describing something that did not happen.  0 read, 1 written,
+ * 2 both.
+ */
+static int cond_how(const ctx_t *c)
+{
+	int i, w = 0, r = 0;
+
+	for (i = 0; i < c->nskip; i++) {
+		if (c->fill && c->skips[i].pass == 0)
+			w = 1;
+		else
+			r = 1;
+	}
+	return w && r ? 2 : w;
+}
+
+static const char *cond_verb(const ctx_t *c)
+{
+	static const char *v[] = { "read", "wrote", "wrote or read" };
+
+	return v[cond_how(c)];
+}
+
+static const char *cond_done(const ctx_t *c)
+{
+	static const char *v[] = { "read", "written", "written or read" };
+
+	return v[cond_how(c)];
+}
+
 static int verdict_of(ctx_t *c, const char **why)
 {
 	static char buf[200];
@@ -7032,10 +7202,10 @@ static int verdict_of(ctx_t *c, const char **why)
 
 		/* every one of them read, and judged on its speed */
 		snprintf(buf, sizeof(buf), "%d region%s of the surface (%s) "
-			 "read slower than %.0f MiB/s, %" PRIu64 " weak sectors",
+			 "%s slower than %.0f MiB/s, %" PRIu64 " weak sectors",
 			 c->nskip, c->nskip == 1 ? "" : "s",
 			 human_size(c->skip_cond, b1, sizeof(b1)),
-			 c->slow_rate / 1048576.0, c->skip_weak);
+			 cond_verb(c), c->slow_rate / 1048576.0, c->skip_weak);
 		*why = buf;
 		return 1;
 	}
@@ -7044,12 +7214,13 @@ static int verdict_of(ctx_t *c, const char **why)
 
 		snprintf(buf, sizeof(buf), "%d region%s of the surface (%s) %s "
 			 "too slow to scan, %" PRIu64 " weak sectors; %s of %s "
-			 "was skipped without being read", c->nskip,
+			 "was skipped without being %s", c->nskip,
 			 c->nskip == 1 ? "" : "s",
 			 human_size(c->skip_cond, b1, sizeof(b1)),
 			 c->nskip == 1 ? "was" : "were", c->skip_weak,
 			 human_size(c->skip_bytes, b2, sizeof(b2)),
-			 c->nskip == 1 ? "it" : "them");
+			 c->nskip == 1 ? "it" : "them",
+			 cond_how(c) ? "written or read" : "read");
 		*why = buf;
 		return 1;
 	}
@@ -7838,19 +8009,21 @@ no_modes:	;
 		    " reformatting without protection ('sg_format --fmtpinfo=0').\n");
 	}
 	if (c->nskip && !c->skip_bytes)
-		out("\n %sCondemned:%s %d slow region%s, %s, read and found too "
+		out("\n %sCondemned:%s %d slow region%s, %s, %s and found too "
 		    "slow to keep.\n Every sector in %s is counted weak above, "
 		    "whether or not it was slow\n on its own: speed is the "
 		    "region's.  --hide-bad cuts %s out with the rest\n of the "
 		    "damage.\n", c_yel(), c_off(), c->nskip,
 		    c->nskip == 1 ? "" : "s",
 		    human_size(c->skip_cond, b1, sizeof(b1)),
+		    cond_done(c),
 		    c->nskip == 1 ? "it" : "them", c->nskip == 1 ? "it" : "them");
 	else if (c->nskip) {
 		out("\n %sNot covered:%s %s in %d slow region%s was skipped without "
-		    "being read.\n", c_yel(), c_off(),
+		    "being %s.\n", c_yel(), c_off(),
 		    human_size(c->skip_bytes, b1, sizeof(b1)), c->nskip,
-		    c->nskip == 1 ? "" : "s");
+		    c->nskip == 1 ? "" : "s",
+		    cond_how(c) ? "written or read" : "read");
 		out(" The scan found where each one starts and ends and condemned "
 		    "it whole,\n so every sector in it is counted weak above: "
 		    "the region read too\n slowly as a whole, whether or not a "
@@ -8742,6 +8915,12 @@ typedef struct {
 	double hide_reserve;    /* --hide-reserve: percent held as spares */
 	int fill_first;         /* --fill-first */
 	int fill_first_set;     /* named, not just the profile's default */
+	int map_round;          /* which test of a map this is, 1..MAP_ROUNDS */
+	int scrub;              /* --scrub: read a map, move its damage */
+	int slow_rate_set;      /* --slow-rate was named */
+	int chunk_set;          /* --chunk was named */
+	int mode_set;           /* --mode was named */
+	int rewrite_weak_set;   /* --rewrite-weak was named */
 	double slow_rate;       /* --slow-rate, MiB/s; 0 for the budget */
 	int rescan_ok;          /* the targets are what --hide-bad just made:
 				 * its --confirm covered writing to them */
@@ -8905,13 +9084,13 @@ static const profile_t g_profiles[] = {
 	  MODE_CHECK, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0,
 	  0, 0, 0, 0, 0 },
 	/*
-	 * The write cache is kept: the fill is not timed against a budget,
-	 * and the verify that is reads the platter long after the cache
-	 * forgot what was written.  The fill is flushed before it starts.
+	 * The write cache is off for the run, as under predeploy: the fill
+	 * is judged on how fast each chunk writes, and with the cache on a
+	 * write's time belongs to whichever chunk was waiting when it filled.
 	 */
 	{ "prepbackup",
-	  "a backup drive: fill, verify, map out what reads under 20 MiB/s",
-	  MODE_WRITE, 1, 1, 1, 0, 4096u * 1024, -1, 0, 0, 0, 1,
+	  "a backup drive: fill, verify, map out anything under 20 MiB/s",
+	  MODE_WRITE, 1, 1, 1, 0, 4096u * 1024, 0, 0, 0, 0, 1,
 	  1, 20.0, 1, 50, 5.0 },
 };
 #define NPROFILES ((int)(sizeof(g_profiles) / sizeof(g_profiles[0])))
@@ -8963,11 +9142,15 @@ static void usage(void)
 "                           prepbackup a backup drive, empty: fill it with the\n"
 "                                      pattern in one sequential write, then\n"
 "                                      read it all back and verify it.  4M\n"
-"                                      chunks; a chunk read under 20 MiB/s\n"
-"                                      is condemned whole (--slow-rate 20),\n"
-"                                      --skip-slow, and --hide-and-rescan\n"
-"                                      with --hide-max 50 and --hide-reserve\n"
-"                                      5.  Saves nothing on the drive\n"
+"                                      chunks; one written or read under\n"
+"                                      20 MiB/s is condemned whole\n"
+"                                      (--slow-rate 20), --skip-slow, and\n"
+"                                      --hide-and-rescan with --hide-max 50\n"
+"                                      and --hide-reserve 5.  The map is\n"
+"                                      tested up to 3 times, its damage\n"
+"                                      moved to spares after each.  Write\n"
+"                                      cache off for the run; saves nothing\n"
+"                                      on the drive\n"
 
 "                         Any explicit flag overrides what the profile set,\n"
 "                         whichever order they appear in.  The drive\n"
@@ -9261,6 +9444,15 @@ static void usage(void)
 "  --hide-reserve PCT     share of the drive a map holds back as spares, for\n"
 "                         damage a later test of it finds ('dm remap').\n"
 "                         5 under prepbackup, 0.1 otherwise\n"
+"  --scrub                read a dm-badblocks map (/dev/mapper/bb-*) that may\n"
+"                         hold data, and move what reads slowly or fails\n"
+"                         into its spares.  Writes nothing to the map: a\n"
+"                         remap copies each extent to its spare and checks\n"
+"                         the copy first, so what is on it is kept (only a\n"
+"                         4 KiB that cannot be read at all is lost, and\n"
+"                         named).  Judged at --slow-rate, 20 unless named,\n"
+"                         in 4M chunks.  Needs --confirm, the whole map, and\n"
+"                         the map not mounted\n"
 "  --prometheus FILE      write metrics for node_exporter's textfile collector\n"
 "  --journal FILE         crash journal for --mode verify: the original bytes\n"
 "                         are fsynced here before the pattern is written, so a\n"
@@ -9389,6 +9581,15 @@ static int open_device(device_t *d, scan_mode_t mode, int writable, int force,
  * hides that damage next instead of re-reading the raw drive.
  */
 static int g_hide_next;
+/*
+ * A map is tested this many times at most.  A test that finds damage moves
+ * it into the map's spares and asks for another, so a map that keeps
+ * finding damage stops after this many rather than testing for ever, and
+ * says so.  --scrub does the same move without the tests.
+ */
+#define MAP_ROUNDS 3
+static int g_remap_next;        /* move what this scan found into the spares */
+static int remap_after_scan(const device_t *d, const char *ckpt);
 
 /*
  * Is what the first pass found a list --hide-bad would take?  The same
@@ -9521,7 +9722,6 @@ static int scan_device(device_t *d, const opts_t *o, const char *json_path,
 	c.force_remap = o->force_remap;
 	c.second_pass = o->second_pass;
 	c.fill = o->fill_first && c.mode == MODE_WRITE;
-	c.judge_pass = c.fill;
 	/* an explicit --chunk-slow-ms is the budget, and the rate is not */
 	c.slow_rate = o->chunk_ms > 0 ? 0 : o->slow_rate * 1048576.0;
 	c.profile = o->profile;
@@ -9802,6 +10002,12 @@ static int scan_device(device_t *d, const opts_t *o, const char *json_path,
 			    human_size(slow_off, b1, sizeof(b1)),
 			    (double)slow_was / 1000.0, (double)slow_now / 1000.0,
 			    c_off());
+	} else if (c.slow_rate > 0) {
+		/* a rate was never a measurement of the drive to begin with */
+		out("  not calibrated; the budget is a rate, not a margin:\n  "
+		    "%.1f ms chunk / %.1f ms sector, a chunk read slower than "
+		    "%.1f MiB/s (--slow-rate)\n", (double)c.chunk_thr_us / 1000.0,
+		    (double)c.block_thr_us / 1000.0, o->slow_rate);
 	} else {
 		/*
 		 * Calibration read nothing it could time -- on a PI-formatted
@@ -9931,6 +10137,32 @@ static int scan_device(device_t *d, const opts_t *o, const char *json_path,
 		c.pass = 1;
 		scan_loop(&c, 1);
 	}
+	/*
+	 * A map's own test, or a scrub of one: what it found is moved into
+	 * the spares, which a remap copies to first, so what is on the map
+	 * stays.  Only the list of a scan that covered all of it, as with
+	 * every map (invariant 15).
+	 */
+	g_remap_next = 0;
+	if ((o->map_round || o->scrub) && !g_stop && hide_ready(&c)) {
+		g_remap_next = 1;
+		if (o->scrub)
+			out("\n  the damage this scrub found is moved into the "
+			    "map's spares next;\n  a remap copies each extent "
+			    "first, so what is on the map is kept\n");
+		else if (o->map_round < MAP_ROUNDS)
+			out("\n  the damage this test of the map found is moved "
+			    "into its spares next,\n  and the map is tested "
+			    "again: test %d of %d\n", o->map_round + 1,
+			    MAP_ROUNDS);
+		else
+			out("\n  the damage this test of the map found is moved "
+			    "into its spares next.\n  This was test %d of %d, "
+			    "so it is not tested again: a map that still\n  "
+			    "finds damage after that many is not settling\n",
+			    o->map_round, MAP_ROUNDS);
+	}
+
 	c.t_end_us = now_us();
 	rate_judge(&c, c.t_end_us);
 
@@ -10111,6 +10343,7 @@ typedef struct {
 	unsigned long long pidstart;
 	int started, done;
 	int stopped;            /* the stop has been passed on; see forward_stop */
+	int round;              /* 0 a drive; 1.. the tests of its map */
 	char file[STORE_MAX + 128];     /* this drive's job record */
 	char report[PATH_MAX];
 } job_t;
@@ -11193,6 +11426,8 @@ static int hide_after_scan(const device_t *d, const char *ckpt, char *next,
 			   size_t len, double reserve);
 static int map_target(const char *path, const char *over, device_t *d);
 static void rescan_opts(opts_t *o);
+static void scrub_opts(opts_t *o);
+static int map_under(const device_t *d, char *under, size_t len, int *offline);
 /* a device the summary just made, for the form to test next: --rescan */
 static mapname_t g_rescan;
 static char g_rescan_over[64];
@@ -11843,7 +12078,7 @@ static const char *derive_path(const char *base, const char *dev, int many,
  * else entirely.
  */
 enum { V_DRIVES, V_ACTION, V_FORM };
-enum { A_SCAN, A_SETTINGS, A_FORMAT, A_COUNT };
+enum { A_SCAN, A_SETTINGS, A_FORMAT, A_SCRUB, A_COUNT };
 
 typedef struct {
 	/*
@@ -11967,11 +12202,12 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 	static const char *mode_c[] = { "read", "check", "verify", "write",
 					"format", "settings", "hide bad" };
 	static const char *act_name[] = { "Scan", "Settings",
-					  "Low level format" };
+					  "Low level format", "Scrub a map" };
 	static const char *act_what[] = {
 		"find slow and failing sectors; read-only or writing",
 		"change drive cache, error recovery, background scan",
-		"erase the drive; change sector size or protection" };
+		"erase the drive; change sector size or protection",
+		"move what reads slowly on a map to spares; keeps data" };
 	int mode_sel = 0, order_sel = (int)o->order;
 	int smap[5], smsel = 0;
 	int la_sel = o->lookahead == 0 ? 0 : 1;
@@ -12004,6 +12240,7 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 	int in_was = -1;        /* Mode was the profile's own last time round */
 	long long retries = o->retries, segment_mb = (long long)(o->segment >> 20);
 	long long parallel = o->max_parallel, sample = (long long)o->sample;
+	long long scrub_rate = o->slow_rate > 0 ? (long long)o->slow_rate : 20;
 	int view = V_DRIVES, act = A_SCAN, acur = 0;
 	int dcur = 0, dtop = 0, fcur = 0, ftop = 0;
 	int arm = 0, i, rows, cols, depline = 0;
@@ -12097,6 +12334,17 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 	{ NULL, NULL, ON(A_FORMAT), "Fast format",
 	  "skip visiting every block; hours become minutes when allowed",
 	  0, 2, { "no", "yes" }, NULL, 0, 0, 0, &ffast_sel },
+
+	/*
+	 * A scrub reads a map that may hold data and moves what it finds
+	 * into the map's spares, copying it there first.  The one choice is
+	 * how slow is too slow; everything else is fixed, because everything
+	 * else would write over what is on it.
+	 */
+	{ "Scrub a map (reads it; what moves is copied first)", NULL,
+	  ON(A_SCRUB), "Too slow below (MiB/s)",
+	  "slower chunks move to a spare",
+	  1, 0, { 0 }, &scrub_rate, 1, 1000, 5, NULL },
 	};
 	int vis[32], nvis = 0;
 	int nf = (int)(sizeof(f) / sizeof(f[0]));
@@ -12235,7 +12483,8 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 				if (devs[i].no_capacity && nfd < 0)
 					nfd = i;
 			}
-		saves = act != A_FORMAT && (ds.bms || ds.persist || ds.fix);
+		saves = act != A_FORMAT && act != A_SCRUB &&
+			(ds.bms || ds.persist || ds.fix);
 
 		tui_size(&rows, &cols);
 		tui_clear();
@@ -12357,8 +12606,8 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 			printf("\n");
 			if (msg[0])
 				printf("  %s%s%s", c_yel(), msg, c_off());
-			printf("\n  up/down move  enter opens  1-3 opens  esc "
-			       "back  r runs  q quit\n");
+			printf("\n  up/down move  enter opens  1-%d opens  esc "
+			       "back  r runs  q quit\n", A_COUNT);
 		} else {
 			/*
 			 * Everything that is not a scrolling row: the banner,
@@ -12415,6 +12664,9 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 			else if (act == A_SETTINGS)
 				printf("   %sapplies the settings and stops, no "
 				       "scan%s", c_yel(), c_off());
+			else if (act == A_SCRUB)
+				printf("   %smoves damage to the map's spares%s",
+				       c_yel(), c_off());
 			else if (mode_sel == nmode + 2)
 				printf("   %shides the last scan's damage; data "
 				       "lost%s", c_red(), c_off());
@@ -12434,7 +12686,8 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 			if (arm)
 				printf("\n\n  %spress y to start a %s on %d "
 				       "drive%s%s, other keys cancel%s\n",
-				       c_red(), mode_c[mode_sel], nsel,
+				       c_red(), act == A_SCRUB ? "scrub" :
+				       mode_c[mode_sel], nsel,
 				       nsel == 1 ? "" : "s",
 				       saves ? " and save settings" : "",
 				       c_off());
@@ -12581,7 +12834,24 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 			/* a writing mode is one keystroke from destroying a
 			 * drive now that the form is the default entry point,
 			 * so make it two */
-			if (k == 's' && (act == A_FORMAT ||
+			/* a scrub reads only a map: say so here, where another
+			 * drive can still be picked, not after the form */
+			if (k == 's' && act == A_SCRUB) {
+				char u[PATH_MAX];
+				int off, bad = -1;
+
+				for (i = 0; i < ndev && bad < 0; i++)
+					if (pick[i] && !map_under(&devs[i], u,
+								  sizeof(u), &off))
+						bad = i;
+				if (bad >= 0) {
+					snprintf(msg, sizeof(msg), "%.40s is not a "
+						 "map; a scrub reads bb-* only",
+						 devs[bad].name);
+					continue;
+				}
+			}
+			if (k == 's' && (act == A_FORMAT || act == A_SCRUB ||
 					 (act == A_SCAN && mode_sel >= 2) ||
 					 saves)) {
 				arm = 1;
@@ -12669,6 +12939,21 @@ static int tui_config(device_t *devs, int ndev, int *pick, opts_t *o)
 				snprintf(msg, sizeof(msg), "nothing to apply: "
 					 "change a setting first");
 				continue;
+			}
+			/*
+			 * A scrub changes no setting: a drive holding data is
+			 * not being configured, and the settings screen's
+			 * choices are its own (invariant 7b).
+			 */
+			if (act == A_SCRUB) {
+				scrub_opts(o);
+				o->slow_rate = (double)scrub_rate;
+				o->bms = o->bms_interval = 0;
+				o->fix_config = o->persist = 0;
+				o->write_cache = o->read_cache = -1;
+				o->write_cache_set = o->read_cache_set = 0;
+				o->awre = o->arre = -1;
+				o->recovery_ms = -1;
 			}
 			return 1;
 		}
@@ -12763,11 +13048,15 @@ static void spawn_job(job_t *jobs, int n, int idx, const opts_t *o,
 		 * own without anyone having to name one.
 		 */
 		{
-			char slug[96];
+			size_t l = strlen(j->file);
 
-			report_slug(j->dev->name, slug, sizeof(slug));
-			snprintf(ck, sizeof(ck), "%s/%s.ckpt", r->dir, slug);
+			/* the job's own stem, which a map's later tests share
+			 * the device name with but not the record */
+			(void)r;
+			snprintf(ck, sizeof(ck), "%.*s.ckpt",
+				 (int)(l > 4 ? l - 4 : l), j->file);
 		}
+		wo.map_round = j->round;
 		/*
 		 * An explicit --state is one path per drive here, exactly as
 		 * --json and --csv are.  A whole parallel run sharing one
@@ -12812,6 +13101,24 @@ static void spawn_job(job_t *jobs, int n, int idx, const opts_t *o,
 					 "damage not hidden, and no second "
 					 "pass ran; see the report");
 			}
+		}
+		if (g_remap_next && st != 130) {
+			snprintf(g_job.note, sizeof(g_job.note),
+				 "moving the damage into the map's spares");
+			job_flush(JS_RUNNING);
+			if (remap_after_scan(j->dev, wo.state) < 0)
+				snprintf(g_job.note, sizeof(g_job.note),
+					 "damage not moved; see the report");
+			else if (wo.map_round && wo.map_round < MAP_ROUNDS) {
+				snprintf(g_job.map, sizeof(g_job.map), "%s",
+					 j->dev->path);
+				snprintf(g_job.note, sizeof(g_job.note),
+					 "damage moved to spares; testing the "
+					 "map again (%d of %d)",
+					 wo.map_round + 1, MAP_ROUNDS);
+			} else
+				snprintf(g_job.note, sizeof(g_job.note),
+					 "damage moved to spares");
 		}
 		if (g_log)
 			fclose(g_log);
@@ -15069,6 +15376,123 @@ static int hide_after_scan(const device_t *d, const char *ckpt, char *next,
 }
 
 /*
+ * Which drive a map is over: sysfs knows, for a real one.  An image standing
+ * in for /dev/mapper/bb-* (HDDSCAN_MAP_IMAGE) has no sysfs, so the suite
+ * names the image under it with HDDSCAN_MAP_UNDER; a remap of it is then
+ * offline, which is what it is.  Returns 1, or 0 when it is not a map.
+ */
+static int map_under(const device_t *d, char *under, size_t len, int *offline)
+{
+	const char *stand = getenv("HDDSCAN_MAP_IMAGE");
+	const char *u = getenv("HDDSCAN_MAP_UNDER");
+	char name[DMBB_NAME_MAX_LEN + 1];
+
+	*offline = 0;
+	if (hide_under(d, under, len, name, sizeof(name)) == 1)
+		return 1;
+	if (stand && *stand && u && *u && !strcmp(stand, d->path)) {
+		snprintf(under, len, "%s", u);
+		*offline = 1;
+		return 1;
+	}
+	return 0;
+}
+
+/*
+ * Move what this scan of a map found into the map's spares: the list from
+ * the scan's own checkpoint, which is in the map's offsets (--logical), and
+ * a remap, which copies each extent to its spare and checks the copy before
+ * the table points there.  In a child, as the hide is, because the map code
+ * dies on a refusal and must not take the report with it.
+ */
+static int remap_after_scan(const device_t *d, const char *ckpt)
+{
+	char list[STORE_MAX + 128], under[PATH_MAX];
+	dmbb_opts_t dop;
+	pid_t pid;
+	int st = 0, offline;
+
+	if (!map_under(d, under, sizeof(under), &offline)) {
+		out("\n  %s: not a dm-badblocks map, or the drive under it "
+		    "cannot be read from\n  sysfs; nothing was moved\n",
+		    d->name);
+		return -1;
+	}
+	if (!ckpt || !ckpt_whole(ckpt, d->size)) {
+		out("\n  %s: this scan did not cover the whole map, so its list "
+		    "could leave\n  damage behind; nothing was moved\n", d->name);
+		return -1;
+	}
+	if (hide_list_path(ckpt, list, sizeof(list)) ||
+	    badblocks_replay(ckpt, list, 4096, 0, 1))
+		return -1;
+	memset(&dop, 0, sizeof(dop));
+	dop.dev = under;
+	dop.bad = list;
+	dop.bs = 4096;
+	dop.logical = 1;
+	dop.offline = offline;
+	out("\n  %s: moving the damage this scan found into the spares of "
+	    "the map on %s\n", d->name, under);
+	fflush(NULL);
+	pid = fork();
+	if (pid < 0)
+		return -1;
+	if (!pid) {
+		g_nrestore = 0;
+		g_timeout_changed = 0;
+		g_la_changed = 0;
+		g_tty_raw = 0;
+		g_job_own = 0;
+		if (g_log) {
+			int fd = fileno(g_log);
+
+			dup2(fd, STDOUT_FILENO);
+			dup2(fd, STDERR_FILENO);
+			g_quiet = 1;
+		}
+		_exit(dmbb_cmd_remap(&dop) != 0 ? 2 : 0);
+	}
+	while (waitpid(pid, &st, 0) < 0 && errno == EINTR)
+		;
+	if (!WIFEXITED(st) || WEXITSTATUS(st)) {
+		out("\n  %s: the damage could not be moved, for the reason "
+		    "above\n", d->name);
+		return -1;
+	}
+	out("\n  %s: the map now steps around this damage too; it is still "
+	    "the one map on %s\n", d->name, under);
+	return 0;
+}
+
+/*
+ * What a scrub is, from the command line or the form: a read of the whole
+ * map, judged at prepbackup's rate in prepbackup's chunks unless those were
+ * named, and nothing that writes.  See the note in main().
+ */
+static void scrub_opts(opts_t *o)
+{
+	const profile_t *pb = profile_by_name("prepbackup");
+
+	o->scrub = 1;
+	o->profile = "scrub";
+	o->mode = MODE_READ;
+	o->rewrite_weak = o->force_remap = 0;
+	o->second_pass = 0;
+	o->skip_slow = 0;
+	o->fill_first = 0;
+	o->hide_rescan = o->hide_bad = o->rescan = 0;
+	o->format = o->apply_only = 0;
+	o->sample = 0;
+	o->start = o->end = 0;
+	o->include_ssd = 1;     /* as a map's test: see rescan_opts() */
+	if (!o->chunk_set)
+		o->chunk = pb->chunk;
+	if (!o->slow_rate_set)
+		o->slow_rate = pb->slow_rate;
+}
+
+/*
  * How a map is tested: as the profile that made it tests a drive, when that
  * profile writes -- prepbackup's map is filled and verified the way its drive
  * was, at the same rate -- and as predeploy otherwise.  Never gated by
@@ -15674,12 +16098,19 @@ static void run_what(run_t *r, const opts_t *o, int format)
  */
 /* one drive's place in a run: what the supervisor keeps, and its record */
 static void job_init(job_t *jb, const run_t *r, device_t *d,
-		     const char *outdir, int format)
+		     const char *outdir, int format, int round)
 {
 	char slug[96];
 	jrec_t j;
 
 	report_slug(d->name, slug, sizeof(slug));
+	/* a map tested again is a job of its own, with its own record and
+	 * report, never a second scan written over the first (invariant 12) */
+	if (round > 1) {
+		size_t l = strlen(slug);
+
+		snprintf(slug + l, sizeof(slug) - l, "-test%d", round);
+	}
 	memset(jb, 0, sizeof(*jb));
 	jb->dev = d;
 	snprintf(jb->file, sizeof(jb->file), "%s/%s.job", r->dir, slug);
@@ -15767,7 +16198,7 @@ static int run_create(run_t *r, device_t *t, int n, const opts_t *o,
 	run_put(r);
 
 	for (i = 0; i < n; i++)
-		job_init(&jobs[i], r, &t[i], o->outdir, format);
+		job_init(&jobs[i], r, &t[i], o->outdir, format, 0);
 	store_prune();
 	return 0;
 }
@@ -15805,14 +16236,23 @@ static int map_job(run_t *r, const job_t *raw, device_t *slot, job_t *jb,
 {
 	jrec_t x;
 
-	if (jrec_get(raw->file, &x) < 0 || !x.map[0] || x.state != JS_DONE)
+	if (raw->round >= MAP_ROUNDS || jrec_get(raw->file, &x) < 0 ||
+	    !x.map[0] || x.state != JS_DONE)
 		return -1;
-	if (map_target(x.map, raw->dev->name, slot) < 0)
+	/* a map tested again is still over the drive under the first */
+	if (map_target(x.map, raw->dev->over[0] ? raw->dev->over :
+		       raw->dev->name, slot) < 0)
 		return -1;
 	/* its passes go into the history of the drive underneath */
-	dev_uid(raw->dev, slot->uid, sizeof(slot->uid));
-	snprintf(slot->over, sizeof(slot->over), "%s", raw->dev->name);
-	job_init(jb, r, slot, o->outdir, 0);
+	if (raw->dev->over[0]) {
+		snprintf(slot->uid, sizeof(slot->uid), "%s", raw->dev->uid);
+		snprintf(slot->over, sizeof(slot->over), "%s", raw->dev->over);
+	} else {
+		dev_uid(raw->dev, slot->uid, sizeof(slot->uid));
+		snprintf(slot->over, sizeof(slot->over), "%s", raw->dev->name);
+	}
+	job_init(jb, r, slot, o->outdir, 0, raw->round + 1);
+	jb->round = raw->round + 1;
 	r->njobs++;
 	run_put(r);
 	return 0;
@@ -15836,7 +16276,7 @@ static int scan_run(run_t *r, job_t *jobs, device_t *t, int n,
 	 * four sweeps, the price of proving the map as well as the surface.
 	 */
 	if (o->hide_rescan) {
-		maps = calloc((size_t)n, sizeof(*maps));
+		maps = calloc((size_t)n * MAP_ROUNDS, sizeof(*maps));
 		if (!maps)
 			die("out of memory");
 		rescan_opts(&mo);
@@ -15884,7 +16324,7 @@ static int scan_run(run_t *r, job_t *jobs, device_t *t, int n,
 			 * is that drive's second pass, not a newcomer for
 			 * the back of the queue.
 			 */
-			if (maps && i < n && !g_stop && nmaps < n &&
+			if (maps && !g_stop && nmaps < n * MAP_ROUNDS &&
 			    !map_job(r, &jobs[i], &maps[nmaps], &jobs[total],
 				     o)) {
 				spawn_job(jobs, total + 1, total, &mo, r);
@@ -15916,8 +16356,8 @@ static int scan_run(run_t *r, job_t *jobs, device_t *t, int n,
  */
 static int run_begin(run_t *r, device_t *t, int n, const opts_t *o, int format)
 {
-	/* room for a map's test after each drive: --hide-and-rescan */
-	job_t *jobs = calloc((size_t)n * 2, sizeof(job_t));
+	/* room for a map's tests after each drive: --hide-and-rescan */
+	job_t *jobs = calloc((size_t)n * (1 + MAP_ROUNDS), sizeof(job_t));
 	pid_t pid;
 
 	if (!jobs)
@@ -16544,6 +16984,7 @@ int main(int argc, char **argv)
 		} else if (!strcmp(a, "--mode")) {
 			const char *m = NEXT();
 
+			o.mode_set = 1;
 			if (!strcmp(m, "read"))
 				o.mode = MODE_READ;
 			else if (!strcmp(m, "verify"))
@@ -16559,6 +17000,7 @@ int main(int argc, char **argv)
 			o.confirm = NEXT();
 		} else if (!strcmp(a, "--rewrite-weak")) {
 			o.rewrite_weak = 1;
+			o.rewrite_weak_set = 1;
 		} else if (!strcmp(a, "--force-remap")) {
 			o.force_remap = 1;
 			o.force_remap_set = 1;
@@ -16583,6 +17025,7 @@ int main(int argc, char **argv)
 		} else if (!strcmp(a, "--chunk")) {
 			if (parse_size(NEXT(), &o.chunk) || !o.chunk)
 				die("bad --chunk value");
+			o.chunk_set = 1;
 		} else if (!strcmp(a, "--block")) {
 			if (parse_size(NEXT(), &o.block) || !o.block)
 				die("bad --block value");
@@ -16692,6 +17135,9 @@ int main(int argc, char **argv)
 			o.slow_rate = strtod(NEXT(), &e);
 			if (*e || o.slow_rate < 0)
 				die("--slow-rate is MiB/s, 0 or more");
+			o.slow_rate_set = 1;
+		} else if (!strcmp(a, "--scrub")) {
+			o.scrub = 1;
 		} else if (!strcmp(a, "--fix-config") ||
 			   !strcmp(a, "--no-fix-config")) {
 			o.fix_config = !strcmp(a, "--fix-config");
@@ -16824,6 +17270,34 @@ int main(int argc, char **argv)
 			targets[ntargets++] = d;
 		}
 #undef NEXT
+	}
+
+	/*
+	 * --scrub reads a map that may hold data.  It never writes a pattern:
+	 * a read of every sector, judged at the rate prepbackup judges with,
+	 * and what it finds is moved into the map's spares, which a remap
+	 * copies to first.  Rewriting a weak sector or forcing a remap of an
+	 * unreadable one would put a pattern where the data was, so they are
+	 * off, and refused if asked for.  Sampling, a range or a skip would
+	 * leave damage unread and the list a guess (invariant 15).
+	 */
+	if (o.scrub) {
+		if (o.mode_set && o.mode != MODE_READ)
+			die("--scrub reads; it does not go with --mode %s",
+			    o.mode == MODE_WRITE ? "write" : o.mode == MODE_VERIFY
+			    ? "verify" : "check");
+		if (o.force_remap_set || o.rewrite_weak_set)
+			die("--scrub keeps what is on the map; --force-remap and "
+			    "--rewrite-weak would write over it");
+		if (o.start || o.end || o.sample > 1)
+			die("--scrub reads the whole map: a list from part of it "
+			    "would move only what was looked at");
+		if (o.hide_bad || o.hide_rescan_set || o.fill_first_set ||
+		    o.format || o.apply_only)
+			die("--scrub is a scan of its own; it goes with none of "
+			    "--hide-bad, --hide-and-rescan, --fill-first, --format "
+			    "or --apply-settings");
+		scrub_opts(&o);
 	}
 
 	/*
@@ -17410,6 +17884,21 @@ rescan_go:
 			    "       so a clean result here would say nothing about drive "
 			    "health. Use --include-remote if you really want to test it.",
 			    d->path, transport_name(d->transport));
+		if (o.scrub) {
+			char u[PATH_MAX];
+			int off, ok = o.tui || (o.confirm &&
+				 (!strcmp(o.confirm, d->name) ||
+				  (d->serial[0] && !strcmp(o.confirm, d->serial))));
+
+			if (!map_under(d, u, sizeof(u), &off))
+				die("%s: --scrub reads a dm-badblocks map "
+				    "(/dev/mapper/bb-*) and moves its damage into "
+				    "the map's spares; this is not one", d->path);
+			if (!ok)
+				die("%s: a scrub moves extents of the map, copying "
+				    "what is on them first; needs --confirm %s (or "
+				    "--confirm <serial>)", d->path, d->name);
+		}
 		if (mode_writes(o.mode) || o.force_remap || o.rewrite_weak) {
 			int ok = o.tui || o.rescan_ok || (o.confirm &&
 				 (!strcmp(o.confirm, d->name) ||
@@ -17544,6 +18033,11 @@ rescan_go:
 							 ntargets > 1, bb, sizeof(bb)),
 					     derive_path(o.prometheus, targets[i].name,
 							 ntargets > 1, pb, sizeof(pb)));
+			/* a scrub's move, here as in a run's worker; a move
+			 * that failed is an error a script has to see */
+			if (g_remap_next && st != 130 &&
+			    remap_after_scan(&targets[i], wo.state) < 0)
+				st = 2;
 			if (have_run) {
 				g_job.verdict = st;
 				g_job.ended = (long long)time(NULL);

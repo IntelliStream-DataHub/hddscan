@@ -105,7 +105,7 @@ go with it; any flag you give explicitly overrides it.</p>
 		<tr><td><b>inservice</b></td><td>read</td><td>It holds data you want to keep. Never writes anything.</td></tr>
 		<tr><td><b>survey</b></td><td>read, sampled</td><td>Quick triage of a shelf: reads one chunk in 64.</td></tr>
 		<tr><td><b>decay</b></td><td>check</td><td>Weeks after a predeploy run: has the written pattern rotted?</td></tr>
-		<tr><td><b>prepbackup</b></td><td>write</td><td>A backup drive, empty, that may be slower than production allows. Fills it in one sequential write, reads it all back and verifies it, condemns any 4 MiB chunk read under 20 MiB/s, and cuts out what was condemned or damaged with device-mapper, 5% held back as spares, unless more than half the drive would go. The map is then filled and verified too. Saves nothing on the drive.</td></tr>
+		<tr><td><b>prepbackup</b></td><td>write</td><td>A backup drive, empty, that may be slower than production allows. Fills it in one sequential write, reads it all back and verifies it, condemns any 4 MiB chunk written or read under 20 MiB/s, and cuts out what was condemned or damaged with device-mapper, 5% held back as spares, unless more than half the drive would go. The map is then filled and verified too, its damage moved to spares after each test, up to three tests. Saves nothing on the drive. A map already holding backups is <b>scrubbed</b> instead (<code>--scrub</code>, or <b>Scrub a map</b> in the form): read, never written, with what reads slowly moved into its spares and copied there first.</td></tr>
 	</tbody>
 </table></div>
 <div class="callout"><p>The default writes, because a surface test is
@@ -458,11 +458,15 @@ the mode and the passes that go with it.  Default
   prepbackup a backup drive, empty: fill it with the
              pattern in one sequential write, then
              read it all back and verify it.  4M
-             chunks; a chunk read under 20 MiB/s
-             is condemned whole (<a href="#opt-slow-rate"><code>--slow-rate</code></a> 20),
-             <a href="#opt-skip-slow"><code>--skip-slow</code></a>, and <a href="#opt-hide-and-rescan"><code>--hide-and-rescan</code></a>
-             with <a href="#opt-hide-max"><code>--hide-max</code></a> 50 and <a href="#opt-hide-reserve"><code>--hide-reserve</code></a>
-             5.  Saves nothing on the drive
+             chunks; one written or read under
+             20 MiB/s is condemned whole
+             (<a href="#opt-slow-rate"><code>--slow-rate</code></a> 20), <a href="#opt-skip-slow"><code>--skip-slow</code></a>, and
+             <a href="#opt-hide-and-rescan"><code>--hide-and-rescan</code></a> with <a href="#opt-hide-max"><code>--hide-max</code></a> 50
+             and <a href="#opt-hide-reserve"><code>--hide-reserve</code></a> 5.  The map is
+             tested up to 3 times, its damage
+             moved to spares after each.  Write
+             cache off for the run; saves nothing
+             on the drive
 Any explicit flag overrides what the profile set,
 whichever order they appear in.  The drive
 settings a profile carries apply only in its own
@@ -683,6 +687,8 @@ mode: <a href="#opt-mode"><code>--mode</code></a> read on predeploy saves nothin
 <dd>with <a href="#opt-hide-and-rescan"><code>--hide-and-rescan</code></a>: when the map would cut out more than this share of the drive, do not make it, and call the drive FAILING.  50 under prepbackup, 0 (no limit) otherwise</dd>
 <dt id="opt-hide-reserve"><code>--hide-reserve PCT</code></dt>
 <dd>share of the drive a map holds back as spares, for damage a later test of it finds (&#x27;dm remap&#x27;). 5 under prepbackup, 0.1 otherwise</dd>
+<dt id="opt-scrub"><code>--scrub</code></dt>
+<dd>read a dm-badblocks map (/dev/mapper/bb-*) that may hold data, and move what reads slowly or fails into its spares.  Writes nothing to the map: a remap copies each extent to its spare and checks the copy first, so what is on it is kept (only a 4 KiB that cannot be read at all is lost, and named).  Judged at <a href="#opt-slow-rate"><code>--slow-rate</code></a>, 20 unless named, in 4M chunks.  Needs <a href="#opt-confirm"><code>--confirm</code></a>, the whole map, and the map not mounted</dd>
 <dt id="opt-prometheus"><code>--prometheus FILE</code></dt>
 <dd>write metrics for node_exporter&#x27;s textfile collector</dd>
 <dt id="opt-journal"><code>--journal FILE</code></dt>

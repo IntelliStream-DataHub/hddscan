@@ -1021,9 +1021,7 @@ read can only come from the platter. The pattern is seeded by offset, not
 repeated, so a write that landed in the wrong place reads back as wrong data
 rather than as a copy of the right pattern. Block compare was chosen over a
 checksum per chunk: it costs no more CPU, and it names the block, which the
-map needs. The write cache is left alone, because the fill is not judged
-against a budget, and nothing the verify reads was written recently enough
-to still be in the cache. The checkpoint records which pass it was in. A scan
+map needs. The checkpoint records which pass it was in. A scan
 resumed inside its verify carries on verifying, and must: refilling would
 overwrite exactly what the verify is there to find.
 
@@ -1047,6 +1045,24 @@ speed. The report says **Condemned** for these, not **Not covered**, because
 every byte was read. `--skip-slow` still jumps a region where most chunks are
 slow, and its probes skip drilling under a rate as well.
 
+**The fill is judged too.** A chunk that writes slower than the rate is no
+more use to a backup than one that reads slower, and the verify would never
+see it: the first prepbackup run on a real drive showed one filling at
+3.5 MiB/s with an ETA of a month, unjudged. So the fill applies the rate to its
+writes. A slow write is written once more, then condemned, and the verify
+does not read it back. A stretch slow to write is skipped as one slow to read
+is, by probing ahead with *writes*, since that is what is being judged. Each
+condemned region carries the pass that made it. A later pass skips all of a
+region an earlier one made. The pass that made it skips only what it never
+reached, which for the fill is what it never wrote. Reading that would give
+nothing but wrong data. A region the verify condemns by probing across one
+the fill already made does not count those blocks weak twice. The report
+says *wrote*, *read* or both, from the passes that condemned. The write cache
+is off for the run, as under predeploy: with it on, a write returns once the
+drive's DRAM has it, and the time a slow region costs lands on whichever
+later chunk is waiting when the cache fills. Off, each chunk's write is
+charged to that chunk. The fill is a quarter slower for it.
+
 **Map what is left, unless that is less than half** (`--hide-and-rescan`,
 `--hide-max 50`). After the verify, the damage goes into a device-mapper map
 as with predeploy. More than half the drive cut out is not a backup drive.
@@ -1055,21 +1071,50 @@ before the report is written, from the same list, extent size and extent
 count the map would be built from, so the verdict, the report and the map
 cannot disagree. Spares are not damage and are not counted in the share.
 
-**Keep spares, and test the map** (`--hide-reserve 5`). Five percent of the
-drive is held back as spare extents spread through it, against 0.1% by
-default. A drive already known to be weak will grow more, and `dm remap` moves
-damage found later into the nearest spare instead of stacking a second map.
-The map is then tested the way the drive was: filled and verified as a job of
-its own, at the same rate. That makes four sweeps, two of the drive and two
-of the map, which is the price of proving the map as well as the surface.
+**Keep spares, and test the map until it is clean** (`--hide-reserve 5`).
+Five percent of the drive is held back as spare extents spread through it,
+against 0.1% by default. A drive already known to be weak will grow more, and
+`dm remap` moves damage found later into the nearest spare instead of stacking
+a second map. The map is then tested the way the drive was: filled and
+verified as a job of its own, at the same rate. The first real map tested
+this way still had 31,744 weak blocks, so a test that finds damage moves it
+into the spares straight away and asks for another test of the whole map, up
+to three in all (`MAP_ROUNDS`). Each test is a job of its own, with its own
+record, report and checkpoint (`bb-x-test2`, `bb-x-test3`), never a second
+scan written over the first (invariant 12). A spare that tests bad in turn is
+retired and the extent moved again. A map still finding damage after three
+tests is not settling, and the last report says so. That is up to eight
+sweeps, two of the drive and two per test of the map, which is the price of a
+map known to be clean rather than hoped to be.
+
+**Scrub a map that holds data** (`--scrub`, *Scrub a map* in the form). A
+backup drive in use cannot be filled again, but it can be read. A scrub reads
+the whole map at the same rate and moves what reads slowly or fails into its
+spares. That is a remap, which copies each extent to its spare and checks the
+copy before the table points there, so what is on the map is kept. A slow but
+readable extent moves intact. A 4 KiB unit that cannot be read at all is
+zeroed in the copy, because there is nothing to copy, and the remap names its
+bytes. Everything that would write over the data is off and refused: a write
+mode, `--rewrite-weak`, `--force-remap`, a range or a sample, since a list
+from part of the map is a guess (invariant 15). It needs `--confirm` because
+it moves extents, and the map unmounted, because the scan opens it
+exclusively. A live remap underneath it suspends the device while it copies.
+The form lists hddscan's own maps in its picker for this, and no other
+device-mapper device.
 
 Nothing is saved on the drive. Invariant 7b keeps saved settings to
 predeploy, and a backup drive is not being configured for service.
 
-What has not been run is the whole of it on a real drive. The fill, the
-verify, the rate, the condemned chunks, the share and the map were tested on
-images with `HDDSCAN_SLOW` and the map stand-in. Whether 20 MiB/s draws the
-line in the right place on the drive that prompted it is still to be seen.
+Most of this was tested on images only. The fill and its judged writes, the
+verify, the rate, the condemned chunks, the share, the map's rounds of tests
+and the scrub all ran there, with `HDDSCAN_SLOW` and `HDDSCAN_SLOW_WRITE` for
+slowness and the map stand-in (`HDDSCAN_MAP_IMAGE`, with
+`HDDSCAN_MAP_UNDER` naming the drive under it) for the map. The scrub was
+proven not to write by the stand-in's checksum. A live remap of an active map,
+the copy-and-suspend, has not run here: it needs root and a real
+device-mapper device. The first real prepbackup run is where the rounds and
+the write judging came from, and whether 20 MiB/s draws the line in the right
+place is for the drives to say.
 
 ### Useful flags
 

@@ -1146,6 +1146,82 @@ assert_has "and the map is filled and verified too" "$mrep" \
 	"destructive fill of the whole device, then a read-back verify"
 assert_has "the run grew a row for it" "$out" "2 drives"
 
+# A chunk slow to write is no more use to a backup than one slow to read,
+# and the verify would never see it: the fill judges its writes.
+f=$(slowimg pbw.bin 256M)
+out=$(HDDSCAN_SLOW_WRITE=64M:16M HDDSCAN_SLOW_MS=500 \
+	pb --no-hide-and-rescan --json "$TMP/pbw.json" "$f")
+assert_has "chunks slow to write are condemned in the fill" "$out" \
+	"1 region of the surface (16.00 MiB) wrote slower than 20 MiB/s"
+assert_eq "exactly those, all of them written" \
+	"$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(",".join("%d-%d/%d" % (k["offset"]>>20, (k["offset"]+k["length"])>>20, k["unread"]) for k in d["slow_regions"]))' "$TMP/pbw.json")" \
+	"64-80/0"
+# A stretch too slow to write is skipped the way a slow read is, found by
+# probing ahead with writes, and the verify must not read what the fill
+# never wrote: it would all be wrong data.
+f=$(slowimg pbw.bin 3G)
+out=$(HDDSCAN_SLOW_WRITE=512M:1G HDDSCAN_SLOW_MS=500 pb --no-hide-and-rescan "$f")
+assert_has "a stretch too slow to write is skipped in the fill" "$out" \
+	"skipped 992.00 MiB of it without writing"
+assert_has "and the report says it was neither written nor read" "$out" \
+	"was skipped without being written or read"
+assert_has "the verify reads none of what the fill skipped" "$out" \
+	"sectors with wrong data              0"
+rm -f "$f"
+
+# A map's test that finds damage moves it into the spares and tests the
+# map again, at most three times.  The stand-in stays slow in one place
+# whatever the remap did, so all three find it; each is a job of its own.
+f=$(slowimg pbr.bin 512M)
+m=$(slowimg pbrmap.bin 128M)
+out=$(HDDSCAN_MAP_IMAGE="$m" HDDSCAN_MAP_UNDER="$f" \
+	HDDSCAN_SLOW=300M:16M,40M:4M HDDSCAN_SLOW_MS=500 pb "$f")
+assert_has "a map that keeps finding damage is tested three times" "$out" \
+	"hddscan-pbrmap.bin-test3.txt"
+assert_hasnt "and no more" "$out" "test4"
+r1=$(cat "$TMP/hddscan-pbrmap.bin.txt" 2>/dev/null)
+r3=$(cat "$TMP/hddscan-pbrmap.bin-test3.txt" 2>/dev/null)
+assert_has "the first test moves what it found into the spares" "$r1" \
+	"the map now steps around this damage too"
+assert_has "and asks for the next" "$r1" "test 2 of 3"
+assert_has "the last says it is the last" "$r3" "This was test 3 of 3"
+assert_has "the moves are in the map on the drive" \
+	"$($HDDSCAN dm status "$f" 2>&1)" "40 -> "
+rid=$(ls -t "$HDDSCAN_STATE_DIR/runs" | head -1)
+assert_eq "every test has a record of its own" \
+	"$(ls "$HDDSCAN_STATE_DIR/runs/$rid"/pbrmap.bin*.job | wc -l)" "3"
+# a map whose first test is clean is tested once
+f=$(slowimg pbr.bin 512M)
+m=$(slowimg pbrmap.bin 128M)
+out=$(HDDSCAN_MAP_IMAGE="$m" HDDSCAN_MAP_UNDER="$f" \
+	HDDSCAN_SLOW=300M:16M HDDSCAN_SLOW_MS=500 pb "$f")
+assert_hasnt "a map whose test is clean is not tested again" "$out" "test2"
+
+# --scrub reads a map that may hold data and moves its damage into the
+# spares.  It must never write to the map: the stand-in's checksum is the
+# proof, and the move happens in the map on the drive underneath.
+dd if=/dev/urandom of="$m" bs=1M count=128 status=none
+sum=$(md5sum < "$m")
+scrub() { HDDSCAN_MAP_IMAGE="$m" HDDSCAN_MAP_UNDER="$f" run --scrub "$@"; }
+out=$(HDDSCAN_SLOW=80M:4M HDDSCAN_SLOW_MS=500 scrub --confirm "$m" "$m")
+assert_has "a scrub reads, and says what it is" "$out" "Profile          scrub"
+assert_has "it judges at prepbackup's rate" "$out" "slower than 20.0 MiB/s"
+assert_has "it moves what reads slowly into the spares" "$out" \
+	"the map now steps around this damage too"
+assert_eq "and never writes to the map" "$(md5sum < "$m")" "$sum"
+assert_hasnt "a scrub that finds nothing moves nothing" \
+	"$(scrub --confirm "$m" "$m")" "moving the damage"
+assert_has "a scrub needs a map" "$(scrub --confirm "$f" "$f" 2>&1)" \
+	"this is not one"
+assert_has "and --confirm, since it moves extents" "$(scrub "$m" 2>&1)" \
+	"needs --confirm"
+assert_has "it refuses anything that would write over the data" \
+	"$(scrub --force-remap --confirm "$m" "$m" 2>&1)" "would write over it"
+assert_has "a write mode with it" \
+	"$(scrub --mode write --confirm "$m" "$m" 2>&1)" "does not go with --mode"
+assert_has "or part of the map" \
+	"$(scrub --end 64M --confirm "$m" "$m" 2>&1)" "reads the whole map"
+
 # More than half the drive too slow to keep: not worth a map.
 f=$(slowimg pbbad.bin 512M)
 out=$(HDDSCAN_MAP_IMAGE="$m" HDDSCAN_SLOW=128M:320M HDDSCAN_SLOW_MS=500 pb "$f")

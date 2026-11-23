@@ -194,7 +194,7 @@ A backup drive, empty, that may be slower than a production drive should be
 and still be worth keeping. It fills the drive with the pattern in one
 sequential write and then reads it all back and verifies it
 .RB ( \-\-fill\-first ),
-in 4M chunks. A chunk read slower than 20 MiB/s is condemned whole
+in 4M chunks. A chunk written or read slower than 20 MiB/s is condemned whole
 .RB ( "\-\-slow\-rate 20" ),
 regions slow as a whole are skipped
 .RB ( \-\-skip\-slow ),
@@ -205,8 +205,10 @@ unless more than half the drive would go
 .RB ( "\-\-hide\-max 50" ),
 which makes it FAILING instead. The map holds 5% of the drive back as spares
 for what that test finds
-.RB ( "\-\-hide\-reserve 5" ).
-The write cache is left as it is and nothing is saved on the drive.
+.RB ( "\-\-hide\-reserve 5" ),
+and a test that finds damage moves it into them and tests the map again, up
+to three tests in all. The write cache is off for the run, so a slow write is
+charged to its own chunk, and nothing is saved on the drive.
 .RE
 .IP
 There used to be a
@@ -433,7 +435,13 @@ With
 .BR "\-\-mode write" :
 write the pattern over the whole device first, in one sequential pass that
 reads nothing, flush the drive's cache, then read everything back and verify
-it. The drive streams instead of losing a revolution to a read before and
+it. Under
+.B \-\-slow\-rate
+the fill judges its writes as the verify judges its reads: a chunk slow to
+write is condemned and not read back, and a stretch slow to write is skipped
+the way
+.B \-\-skip\-slow
+skips one slow to read, found by probing ahead with writes. The drive streams instead of losing a revolution to a read before and
 after every chunk, and the verify proves what the platter kept rather than what
 it held a moment ago. A checkpoint records which pass it was in, so a resumed
 scan carries on verifying instead of filling again. On under prepbackup.
@@ -820,9 +828,27 @@ and the drive is FAILING. 50 under prepbackup, 0 (no limit) otherwise.
 The share of the drive a map holds back as spare extents, spread through it,
 for damage a later test of the map finds
 .RB ( "hddscan dm remap" ,
+.BR \-\-scrub ,
 or
 .B h
 on the summary). 5 under prepbackup, 0.1 otherwise.
+.TP
+.B \-\-scrub
+Read a dm-badblocks map,
+.IR /dev/mapper/bb\-* ,
+that may hold data, and move what reads slowly or fails into the map's spares.
+Nothing is written to the map: a remap copies each extent to its spare and
+checks the copy before the table points at it, so what is on the map is kept.
+Only a 4 KiB unit that cannot be read at all is lost, and the remap names the
+bytes. The whole map is read in 4M chunks and judged at
+.BR \-\-slow\-rate ,
+20 unless named; nothing is skipped, sampled or rewritten, and
+.BR \-\-force\-remap ,
+.BR \-\-rewrite\-weak ,
+a write mode or a range are refused. Needs
+.BR \-\-confirm ,
+and the map not mounted. The form offers it as
+.BR "Scrub a map" .
 If the map cannot be made (a drive that already carries one, or damage where
 the map itself would live), the drive's report says why, and that no second
 pass ran. The form offers it as
