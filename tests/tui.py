@@ -142,7 +142,8 @@ class Session:
         self.wait(lambda: self.on_screen("choose drives"), 20.0)
         self.send(b"\n", 0.3)
         self.wait(lambda: self.on_screen("choose an action"), 10.0)
-        self.send({"scan": b"1", "settings": b"2", "format": b"3"}[action], 0.3)
+        self.send({"scan": b"1", "settings": b"2", "format": b"3",
+                   "scrub": b"4"}[action], 0.3)
         return self.wait(lambda: self.on_screen("(3 of 3)"), 10.0)
 
     def pump(self, seconds):
@@ -528,6 +529,22 @@ def main():
               s.set_choice("Profile", "inservice")
               and s.wait(lambda: s.value_of("Skip slow regions") == "no"),
               "got %r" % s.value_of("Skip slow regions"))
+        # prepbackup: a backup drive, filled and verified in 4 MiB chunks,
+        # its damage mapped out without being asked
+        check("prepbackup writes",
+              s.set_choice("Profile", "prepbackup")
+              and s.wait(lambda: s.value_of("Mode") == "write"),
+              "mode %r" % s.value_of("Mode"))
+        check("in 4 MiB chunks",
+              s.wait(lambda: s.value_of("Chunk size") == "4M"),
+              "chunk %r" % s.value_of("Chunk size"))
+        check("and hides the damage it finds",
+              s.wait(lambda: s.value_of("If damage is found") == "hide it"),
+              "got %r" % s.value_of("If damage is found"))
+        check("and leaving it for inservice stops hiding",
+              s.set_choice("Profile", "inservice")
+              and s.wait(lambda: s.value_of("If damage is found") == "re-read"),
+              "got %r" % s.value_of("If damage is found"))
         s.send(b"q"); s.close()
 
         print("== each screen holds the settings of what it does ==")
@@ -669,6 +686,57 @@ def main():
               and s.on_screen("Scan (3 of 3)"),
               "\n".join(l for l in s.screen.lines() if l.strip()))
         s.send(b"n", 0.2)
+        s.send(b"q"); s.close()
+
+        # a scrub is an action of its own: it reads a map that may hold
+        # data and moves what reads slowly into the map's spares
+        s = Session(["-i", "--no-color", "--outdir", tmp, a],
+                    rows=24, cols=80)
+        s.wait(lambda: s.on_screen("choose drives"), 20.0)
+        s.send(b"\n", 0.3)
+        check("the action menu offers a scrub of a map",
+              s.wait(lambda: s.on_screen("4  Scrub a map"))
+              and s.on_screen("1-4 opens"),
+              "\n".join(l for l in s.screen.lines() if l.strip()))
+        s.send(b"4", 0.3)
+        check("its screen fits a 24x80 terminal, with its one choice",
+              s.wait(lambda: s.on_screen("Scrub a map (3 of 3)"))
+              and s.on_screen("Too slow below (MiB/s)")
+              and s.on_screen("slower chunks move to a spare")
+              and s.on_screen("moves damage to the map's spares")
+              and s.on_screen("q quit"),
+              "\n".join(l for l in s.screen.lines() if l.strip()))
+        s.send(b"s", 0.2)
+        check("a drive that is not a map is refused on the form",
+              s.wait(lambda: s.on_screen("is not a map; a scrub reads bb-* only"))
+              and not s.on_screen("press y to start a scrub"),
+              "\n".join(l for l in s.screen.lines() if l.strip()))
+        s.send(b"q"); s.close()
+        # a map -- the suite's stand-in for one -- gets the confirmation
+        os.environ["HDDSCAN_MAP_IMAGE"] = a
+        os.environ["HDDSCAN_MAP_UNDER"] = a
+        try:
+            s = Session(["-i", "--no-color", "--outdir", tmp, a],
+                        rows=24, cols=80, open="scrub")
+        finally:
+            del os.environ["HDDSCAN_MAP_IMAGE"]
+            del os.environ["HDDSCAN_MAP_UNDER"]
+        s.send(b"s", 0.2)
+        check("and a map asks before it starts, since it moves extents",
+              s.wait(lambda: s.on_screen("press y to start a scrub")),
+              "\n".join(l for l in s.screen.lines() if l.strip()))
+        s.send(b"n", 0.2)
+        s.send(b"q"); s.close()
+
+        # the longest profile description, under the field list
+        s = Session(["-i", "--no-color", "--profile", "prepbackup",
+                     "--outdir", tmp, a], rows=24, cols=80, open="scan")
+        check("prepbackup's description fits a 24x80 terminal",
+              s.wait(lambda: s.on_screen(
+                  "prepbackup: a backup drive: fill, verify, map out "
+                  "anything under 20 MiB/s"))
+              and s.on_screen("Scan (3 of 3)") and s.on_screen("q quit"),
+              "\n".join(l for l in s.screen.lines() if l.strip()))
         s.send(b"q"); s.close()
 
         print("== bulk selection, for a shelf rather than a drive ==")

@@ -513,6 +513,38 @@ explicitly — `sg_format` defaults `--fmtpinfo` to 0, so a bare block size
 change would silently strip protection information, and the default here is to
 preserve whatever `prot_type` the drive reports.
 
+**16. A `--fill-first` scan judges both its passes, and a resumed verify
+never fills again.** prepbackup's fill judges its writes and its verify its
+reads, so everything that judges (`--skip-slow`'s window, its drill cap, a
+chunk condemned under `--slow-rate`) asks `judging()` and not "pass 0". The
+fill's probes write, since writing is what it judges. Each condemned region
+carries the pass that made it (`skip_t.pass`, the seventh field of a
+checkpoint's `skip` line). A later pass skips all of it, and the pass that made
+it only what it never reached. The verify must never read a stretch the fill
+skipped: that would be nothing but wrong data. Merges and the "starts after
+the last region" clamp stay within one pass. The checkpoint records the
+pass. A scan resumed inside its verify carries on verifying, because refilling
+would overwrite exactly the damage the verify exists to find. There is a test
+that corrupts the image between the two and resumes. Two more rules go with
+it. `--hide-max` is decided in `scan_device()` before the report, from the
+same list, extent size and count `hide_after_scan()` builds the map from, so
+the verdict and the map cannot disagree. And a chunk condemned under
+`--slow-rate` was read: the report calls it **Condemned**, never **Not
+covered**, since every byte of it was tested (invariant 9 cuts both ways).
+The words follow the pass: *wrote* for what the fill condemned, *read* for
+the verify.
+
+**17. A scrub never writes to the map it reads.** `--scrub` (and *Scrub a
+map* in the form, through the same `scrub_opts()`) reads a map that may hold
+data. What it finds is moved by a remap, which copies each extent to its
+spare and checks the copy, so the data stays. A write mode,
+`--rewrite-weak`, `--force-remap`, a range and a sample are refused, and the
+form clears every drive setting. There is a test that proves it by the map
+stand-in's checksum; keep it. A map's own tests are the opposite: they fill
+it, and move what they find before testing again, at most `MAP_ROUNDS`
+times, each a job of its own named `-testN` (invariant 12). The picker lists
+a device-mapper device only when its uuid says it is one of ours.
+
 ## Style
 
 Kernel-ish C: tabs, 80 columns, declarations at the top of a block, `static`
@@ -561,6 +593,13 @@ has written a map onto an image, which nothing can activate without a loop
 device and root, the file it names stands in for `/dev/mapper/bb-*` and is
 what the run tests next. Everything up to the kernel is real. Keep any
 `HDDSCAN_SLOW` range clear of the stand-in's size, or it slows that too.
+`HDDSCAN_MAP_UNDER` names the image under the stand-in, which a real map
+would get from sysfs. A remap after a map's test or a scrub then runs
+offline against it, so the moves can be seen in `hddscan dm status`. The
+stand-in itself does not follow a remap: a slow range on it stays slow, which
+is how the suite makes a map need all its tests. `HDDSCAN_SLOW_WRITE` is
+`HDDSCAN_SLOW` for writes, at the same `HDDSCAN_SLOW_MS`, for a fill that
+has to find a region slow to write.
 
 ## When reporting results
 
